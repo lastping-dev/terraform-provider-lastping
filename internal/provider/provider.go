@@ -99,6 +99,7 @@ func (p *lastpingProvider) Configure(ctx context.Context, req provider.Configure
 func (p *lastpingProvider) Resources(context.Context) []func() resource.Resource {
 	return []func() resource.Resource{
 		NewMonitorResource,
+		NewDestinationResource,
 	}
 }
 
