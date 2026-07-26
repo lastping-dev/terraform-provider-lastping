@@ -1,0 +1,3053 @@
+openapi: 3.1.0
+info:
+  title: LastPing Management API
+  version: "1.0"
+  description: |
+    The LastPing Management API lets you create, configure, and manage uptime
+    checks for your project.  All mutating endpoints require a valid API key
+    supplied in the `X-Api-Key` request header.
+
+    ## MCP server for AI agents
+
+    LastPing ships an MCP (Model Context Protocol) server so AI agents can
+    create and manage monitors, query incidents, and set up their own
+    dead-man's-switch — all in one conversation.  The hosted server is at
+    `https://mcp.lastping.dev`; connect with `Authorization: Bearer <api-key>`.
+    See [lastping.dev/mcp/](https://lastping.dev/mcp/) for setup instructions
+    and the full tool list.
+  contact:
+    url: https://lastping.dev
+
+servers:
+  - url: /
+    description: Management API (relative path — prepend your host)
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Api-Key
+      description: Project API key.  Obtain from your LastPing project settings.
+    BearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Project API key presented as a Bearer token.
+        Accepted as an alternative to the X-Api-Key header, specifically
+        to allow Prometheus scrape_config `authorization: { credentials: … }`.
+
+  responses:
+    RateLimited:
+      description: |
+        Too many requests.  The per-key fixed-window rate limit has been exceeded.
+        Retry after the number of seconds indicated by the `Retry-After` response header.
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying.
+          schema:
+            type: integer
+            example: 30
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+
+  schemas:
+    CheckCreate:
+      type: object
+      description: |
+        Body for creating or updating a check (POST /api/v1/checks or PATCH /api/v1/checks/{id}).
+
+        **Monitor types:**
+        - `heartbeat` (default) — expects your service to ping the `ping_url` on schedule.
+        - `ci` — like heartbeat but semantically used for CI/CD pipeline pings.
+        - `http` — LastPing actively probes the `probe_url` on the given interval.
+          When `monitor_type` is `http` the `probe_*` fields configure the probe;
+          `schedule_kind`/`period_s`/`cron_expr` are ignored (schedule is driven by `probe_interval_s`).
+
+        **Upsert:** if `slug` is non-empty and a check with that slug already
+        exists in the project, the config is updated and 200 is returned instead of 201.
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          description: Human-readable name for the check.
+          example: "Daily backup job"
+        slug:
+          type: string
+          description: |
+            Optional stable identifier.  If provided and a check with this slug
+            already exists in the project, the request performs an upsert (config
+            update) and returns 200 instead of 201.
+
+            Input is trimmed and lowercased before validation and before the
+            uniqueness lookup, so `"  Nightly-Backup  "` and `"nightly-backup"`
+            are the same slug. Must then match
+            `^[a-z0-9][a-z0-9-]{1,48}[a-z0-9]$` (3-50 chars, lowercase
+            alphanumeric and hyphens, starting and ending alphanumeric); a 400
+            is returned otherwise. A UUID-shaped slug is rejected — the
+            Terraform provider resolves an import ID by trying `uuid.Parse`
+            first, so a UUID-shaped slug could never be imported by slug and
+            could collide with another monitor's real id.
+
+            An empty slug means "no slug" — it is exempt from the uniqueness
+            check, is not validated, and multiple unslugged monitors are
+            allowed in the same project.
+          example: "daily-backup"
+        monitor_type:
+          type: string
+          enum: [heartbeat, ci, http]
+          description: |
+            Monitor mode.  Defaults to `heartbeat` when omitted.
+            Use `http` to have LastPing actively probe a URL instead of waiting
+            for an inbound ping.
+          example: "heartbeat"
+        schedule_kind:
+          type: string
+          enum: [simple, cron]
+          description: |
+            `simple` uses a fixed period; `cron` uses a cron expression.
+            Required for `heartbeat` and `ci` monitor types.
+            Ignored when `monitor_type` is `http` (schedule is driven by `probe_interval_s`).
+          example: "simple"
+        period_s:
+          type: integer
+          format: int64
+          description: Expected ping interval in seconds.  Required when schedule_kind is `simple`.
+          example: 86400
+        cron_expr:
+          type: string
+          description: Cron expression (5-field).  Required when schedule_kind is `cron`.
+          example: "0 3 * * *"
+        tz:
+          type: string
+          description: IANA timezone for cron evaluation.  Defaults to `UTC`.
+          example: "Europe/London"
+        grace_s:
+          type: integer
+          format: int64
+          description: Grace period in seconds after a ping is due before the check is considered late.
+          example: 600
+        monitor_from:
+          type: [string, "null"]
+          format: date-time
+          description: |
+            RFC 3339 timestamp.  Deadlines are not computed before this time,
+            useful for checks that should start alerting only from a future date.
+          example: "2026-01-01T00:00:00Z"
+        probe_url:
+          type: string
+          format: uri
+          description: |
+            Absolute `http` or `https` URL for LastPing to probe.
+            Required when `monitor_type` is `http`.
+          example: "https://example.com/healthz"
+        probe_method:
+          type: string
+          enum: [GET, HEAD, POST]
+          description: |
+            HTTP method for the probe request.  Defaults to `GET` when omitted.
+            Valid values: `GET`, `HEAD`, `POST`.
+          example: "GET"
+        probe_expected_body:
+          type: string
+          description: |
+            Substring that must appear in the response body for the probe to be
+            considered successful.  Leave empty to skip body matching.
+          example: "\"status\":\"ok\""
+        probe_interval_s:
+          type: integer
+          format: int64
+          description: |
+            How often (in seconds) LastPing should probe the URL.
+            Must be between 30 and 86400.  Required when `monitor_type` is `http`.
+          example: 60
+        probe_expected_status:
+          type: integer
+          format: int64
+          description: |
+            HTTP status code the probe must receive to count as success.
+            Defaults to 200 when omitted.
+          example: 200
+        probe_timeout_s:
+          type: integer
+          format: int64
+          description: |
+            Probe HTTP request timeout in seconds.  Must be between 1 and 30.
+            Defaults to 10 when omitted.
+          example: 10
+        probe_follow_redirects:
+          type: boolean
+          description: |
+            Whether the probe should follow HTTP redirects.  Defaults to `false`.
+          example: false
+        ci_provider:
+          type: string
+          enum: [github, gitlab, jenkins]
+          description: |
+            CI provider to bind on create.  When supplied (and valid), LastPing generates
+            a webhook secret and binds it.  The secret is returned ONCE in the `201`
+            response (`ci_secret`) and is NEVER returned again — use the
+            `POST /api/v1/checks/{id}/ci/regenerate` endpoint to rotate it.
+          example: "github"
+        ci_workflow:
+          type: string
+          description: |
+            Optional CI workflow name to filter inbound webhooks by (provider-specific).
+            Has no effect when `ci_provider` is not set.
+          example: "ci.yml"
+        ci_branch:
+          type: string
+          description: |
+            Optional branch name to filter inbound webhooks by.
+            Has no effect when `ci_provider` is not set.
+          example: "main"
+        runaway_ceiling:
+          type: [integer, "null"]
+          format: int64
+          description: |
+            Maximum pings allowed in a rolling 1-hour window. Exceeding it opens a
+            `runaway`-cause incident, which detects a looping agent or job pinging
+            abnormally fast. Null or omitted disables the check.
+          example: 20
+        tags:
+          type: array
+          items:
+            type: string
+          maxItems: 20
+          description: |
+            Optional labels for namespace scoping and auditing.
+            Max 20 tags; each tag max 50 characters. Duplicate tags are silently
+            deduplicated. The `agent:` prefix is a convention for AI-provisioned monitors.
+          example: ["agent:claude", "env:prod"]
+
+    Check:
+      type: object
+      description: A check resource returned by the API.
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Unique check identifier.
+          example: "550e8400-e29b-41d4-a716-446655440000"
+        name:
+          type: string
+          description: Human-readable name.
+          example: "Daily backup job"
+        slug:
+          type: string
+          description: Stable project-scoped identifier (may be empty string if not set).
+          example: "daily-backup"
+        schedule_kind:
+          type: string
+          enum: [simple, cron]
+          example: "simple"
+        period_s:
+          type: integer
+          format: int64
+          description: Period in seconds (only meaningful for schedule_kind=simple).
+          example: 86400
+        cron_expr:
+          type: string
+          description: Cron expression (only present when schedule_kind=cron).
+          example: "0 3 * * *"
+        tz:
+          type: string
+          description: IANA timezone.
+          example: "UTC"
+        grace_s:
+          type: integer
+          format: int64
+          description: Grace period in seconds.
+          example: 600
+        monitor_from:
+          type: [string, "null"]
+          format: date-time
+          description: RFC 3339 timestamp from which deadlines are computed.
+          example: "2026-01-01T00:00:00Z"
+        status:
+          type: string
+          enum: [new, up, late, down]
+          description: Current check status derived from ping history.
+          example: "up"
+        last_ping_at:
+          type: [string, "null"]
+          format: date-time
+          description: RFC 3339 timestamp of the most recent ping received.
+          example: "2026-07-10T03:00:05Z"
+        due_at:
+          type: [string, "null"]
+          format: date-time
+          description: RFC 3339 timestamp when the next ping is expected.
+          example: "2026-07-11T03:00:00Z"
+        alert_after:
+          type: [string, "null"]
+          format: date-time
+          description: RFC 3339 timestamp after which an alert is sent if no ping arrives.
+          example: "2026-07-11T03:10:00Z"
+        paused:
+          type: boolean
+          description: When true the check does not alert regardless of ping status.
+          example: false
+        created_at:
+          type: string
+          format: date-time
+          description: RFC 3339 UTC timestamp when the check was created.
+          example: "2026-07-01T12:00:00Z"
+        ping_url:
+          type: string
+          format: uri
+          description: The URL your service should HTTP-GET to record a successful ping.
+          example: "https://ingest.lastping.dev/550e8400-e29b-41d4-a716-446655440000"
+        monitor_type:
+          type: string
+          enum: [heartbeat, ci, http]
+          description: Monitor mode.  Omitted on responses when the value is the default `heartbeat`.
+          example: "http"
+        probe_url:
+          type: string
+          format: uri
+          description: URL being probed (HTTP monitors only; omitted otherwise).
+          example: "https://example.com/healthz"
+        probe_method:
+          type: string
+          enum: [GET, HEAD, POST]
+          description: HTTP method used for the probe (HTTP monitors only; omitted otherwise).
+          example: "GET"
+        probe_expected_body:
+          type: string
+          description: Expected response body substring (HTTP monitors only; omitted otherwise).
+          example: "\"status\":\"ok\""
+        probe_interval_s:
+          type: integer
+          format: int64
+          description: Probe interval in seconds (HTTP monitors only; omitted otherwise).
+          example: 60
+        probe_expected_status:
+          type: integer
+          format: int32
+          description: Expected HTTP status code (HTTP monitors only; omitted otherwise).
+          example: 200
+        probe_timeout_s:
+          type: integer
+          format: int32
+          description: Probe timeout in seconds (HTTP monitors only; omitted otherwise).
+          example: 10
+        probe_follow_redirects:
+          type: boolean
+          description: Whether the probe follows redirects (HTTP monitors only; omitted otherwise).
+          example: false
+        next_probe_at:
+          type: [string, "null"]
+          format: date-time
+          description: RFC 3339 UTC timestamp when the next probe is scheduled (HTTP monitors only; omitted otherwise).
+          example: "2026-07-13T03:01:00Z"
+        ci_provider:
+          type: string
+          enum: [github, gitlab, jenkins]
+          description: CI provider bound to this check (omitted when no CI binding is set).
+          example: "github"
+        ci_configured:
+          type: boolean
+          description: True when a CI binding is set on this check (omitted when false).
+          example: true
+        ci_webhook_url:
+          type: string
+          format: uri
+          description: |
+            Webhook URL for this CI check (omitted when no CI binding is set).
+            POST this URL from your CI provider with the `ci_secret` as the HMAC secret.
+          example: "https://ingest.lastping.dev/ci/github/550e8400-e29b-41d4-a716-446655440000"
+        ci_secret:
+          type: string
+          description: |
+            **WRITE-ONCE** — returned ONLY in the `201` create response and the
+            `POST /api/v1/checks/{id}/ci/regenerate` response.  NEVER returned on GET
+            or list.  Copy it immediately; it cannot be retrieved again (use regenerate to rotate).
+          example: "a3f8c2d1e4b7a9f0c3d2e1b4a7f8c0d3e2b1a4f7"
+        runaway_ceiling:
+          type: [integer, "null"]
+          format: int64
+          description: |
+            Maximum pings allowed in a rolling 1-hour window. Exceeding it opens a
+            `runaway`-cause incident, which detects a looping agent or job pinging
+            abnormally fast. Omitted from the response when disabled for this monitor.
+          example: 20
+        tags:
+          type: array
+          items:
+            type: string
+          description: |
+            Labels attached to this monitor. Always returned as an array
+            (never null); empty array when no tags are set.
+          example: ["agent:claude", "env:prod"]
+
+    ChannelCreate:
+      type: object
+      description: |
+        Body for POST /api/v1/channels.  `kind` must be one of:
+        `webhook`, `telegram`, `discord`, `slack`, `ntfy`, `pushover`,
+        `msteams`, `googlechat`, or `email`.
+
+        The `config` object carries kind-specific fields:
+
+        | kind | required config fields | write-only (never returned) |
+        |------|------------------------|----------------------------|
+        | `webhook` | `url`, `secret` | `secret` |
+        | `telegram` | `bot_token`, `chat_id` | `bot_token` |
+        | `discord` | `webhook_url` | `webhook_url` |
+        | `slack` | `webhook_url` | `webhook_url` |
+        | `ntfy` | `topic_url` | — |
+        | `pushover` | `token`, `user_key` | `token`, `user_key` |
+        | `msteams` | `webhook_url` | `webhook_url` |
+        | `googlechat` | `webhook_url` | `webhook_url` |
+        | `email` | `address` | — |
+
+        **Write-only fields** (`secret`, `bot_token`, `webhook_url` for discord/slack/msteams/
+        googlechat, and `token`/`user_key` for pushover) are stored server-side but are
+        **never returned** in any API response.
+
+        **Email channels** are created **unverified** — a verification email is sent to `address`;
+        the channel will not send alerts until the recipient clicks the verification link.
+        Other channel kinds are verified immediately upon creation.
+      required:
+        - kind
+        - name
+        - config
+      properties:
+        kind:
+          type: string
+          enum: [webhook, telegram, discord, slack, ntfy, pushover, msteams, googlechat, email]
+          description: Channel type.
+          example: "webhook"
+        name:
+          type: string
+          description: Human-readable label for the channel.
+          example: "Ops webhook"
+        config:
+          type: object
+          description: |
+            Kind-specific configuration object.
+
+            **webhook** — `{"url": "https://…", "secret": "…"}`.
+            `secret` is WRITE-ONLY and never returned.
+
+            **telegram** — `{"bot_token": "…", "chat_id": "…"}`.
+            `bot_token` is WRITE-ONLY and never returned.
+
+            **discord** — `{"webhook_url": "https://discord.com/api/webhooks/…"}`.
+            `webhook_url` is WRITE-ONLY and never returned.
+
+            **slack** — `{"webhook_url": "https://hooks.slack.com/services/…"}`.
+            `webhook_url` is WRITE-ONLY and never returned.
+
+            **ntfy** — `{"topic_url": "https://ntfy.sh/my-topic"}`.
+            `topic_url` is not a credential and IS returned as `target`.
+
+            **pushover** — `{"token": "…", "user_key": "…"}`.
+            Both `token` and `user_key` are WRITE-ONLY and never returned.
+
+            **msteams** — `{"webhook_url": "https://…webhook.office.com/…"}`.
+            `webhook_url` is WRITE-ONLY and never returned.
+
+            **googlechat** — `{"webhook_url": "https://chat.googleapis.com/v1/spaces/…"}`.
+            `webhook_url` is WRITE-ONLY and never returned.
+
+            **email** — `{"address": "alerts@example.com"}`.
+            Channel is created unverified; a verification email is sent to the address.
+          additionalProperties: true
+          example: {"url": "https://example.com/hook", "secret": "s3cr3t"}
+
+    ChannelUpdate:
+      type: object
+      description: |
+        Body for PATCH /api/v1/channels/{id}.  All fields are optional; an
+        omitted field is left unchanged.  `kind` is accepted only so that an
+        attempt to change it can be rejected explicitly (400) rather than
+        silently ignored — changing kind would invalidate the config shape
+        and any routes pointing at this channel.  To change kind, delete the
+        destination and create a new one.
+
+        `config`, when present, replaces the channel's config wholesale and is
+        validated with the same per-kind rules as POST /api/v1/channels
+        (`webhook` requires `url`+`secret`, `slack`/`discord`/`msteams`/`googlechat`
+        require `webhook_url`, `telegram` requires `bot_token`+`chat_id`, `ntfy`
+        requires `topic_url`, `pushover` requires `token`+`user_key`, `email`
+        requires `address`).
+
+        **Email re-verification:** changing an email channel's `address` resets
+        `verified` to `false` and sends a fresh verification email to the new
+        address.  Any other change (including a name-only PATCH) preserves the
+        existing verification state.
+
+        Write-only fields (`secret`, `bot_token`, and the discord/slack/msteams/
+        googlechat `webhook_url`) are stored but never returned in the response.
+      properties:
+        kind:
+          type: string
+          description: Present only to be rejected — kind is immutable.
+          example: "webhook"
+        name:
+          type: string
+          description: New human-readable label for the channel.
+          example: "Ops webhook (renamed)"
+        config:
+          type: object
+          description: Replacement kind-specific configuration object (see description above).
+          additionalProperties: true
+          example: {"url": "https://example.com/hook", "secret": "new-s3cr3t"}
+
+    Channel:
+      type: object
+      description: |
+        A notification channel returned by the API.  Secrets (`secret`, `bot_token`,
+        `webhook_url` for discord/slack/msteams/googlechat, and `token`/`user_key` for
+        pushover) are NEVER included — only a non-secret `target` hint is provided.
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Unique channel identifier.
+          example: "c1d2e3f4-0000-0000-0000-000000000001"
+        kind:
+          type: string
+          enum: [webhook, telegram, discord, slack, ntfy, pushover, msteams, googlechat, email]
+          description: Channel type.
+          example: "webhook"
+        name:
+          type: string
+          description: Human-readable label.
+          example: "Ops webhook"
+        target:
+          type: string
+          description: |
+            Non-secret hint about the channel destination.
+            - **webhook**: the webhook URL.
+            - **telegram**: `"chat <chat_id>"`.
+            - **discord**: the fixed string `"discord webhook"` (the actual URL is write-only).
+            - **slack**: the fixed string `"slack webhook"` (the actual URL is write-only).
+            - **ntfy**: the topic URL (not a credential, so it is returned in full).
+            - **pushover**: the fixed string `"pushover"` (token and user_key are write-only).
+            - **msteams**: the fixed string `"teams webhook"` (the actual URL is write-only).
+            - **googlechat**: the fixed string `"google chat webhook"` (the actual URL is write-only).
+            - **email**: the email address.
+          example: "https://example.com/hook"
+        verified:
+          type: boolean
+          description: |
+            Whether the channel has been verified.  Always `true` for webhook, telegram,
+            discord, slack, ntfy, pushover, msteams, and googlechat channels (verified on
+            creation).  For `email` channels, `false` until the recipient clicks the
+            verification link; unverified email channels do not send alerts.
+          example: true
+        disabled:
+          type: boolean
+          description: Whether the channel has been disabled (e.g. after repeated delivery failures).
+          example: false
+        disable_reason:
+          type: string
+          description: Human-readable reason the channel was disabled (omitted when not disabled).
+          example: "too many delivery failures"
+        created_at:
+          type: string
+          format: date-time
+          description: RFC 3339 UTC timestamp when the channel was created.
+          example: "2026-07-01T12:00:00Z"
+
+    ApiKeyCreate:
+      type: object
+      description: Body for POST /api/v1/api-keys.
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          description: Human-readable label for the key, e.g. "github-actions".
+          example: "github-actions"
+        expires_at:
+          type: string
+          format: date-time
+          description: |
+            Optional RFC 3339 expiry. Must be in the future — a past `expires_at`
+            is rejected with 400, since minting an already-dead key is always a
+            caller error. Omit for a key that never expires.
+          example: "2026-12-31T00:00:00Z"
+
+    ApiKey:
+      type: object
+      description: |
+        An API key returned by the API. The plaintext key value is NEVER
+        included here — only the non-secret `prefix` is returned, so this
+        shape is used for both list and the non-secret half of create.
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Unique API key identifier.
+          example: "e1d2c3b4-0000-0000-0000-000000000001"
+        name:
+          type: string
+          description: Human-readable label for the key.
+          example: "github-actions"
+        prefix:
+          type: string
+          description: First 10 characters of the key — a non-secret identifier shown in place of the full value.
+          example: "lp_Wwut111"
+        created_at:
+          type: string
+          format: date-time
+          description: RFC 3339 UTC timestamp when the key was created.
+          example: "2026-07-01T12:00:00Z"
+        expires_at:
+          type: string
+          format: date-time
+          description: RFC 3339 UTC expiry timestamp, or omitted for a key that never expires.
+          example: "2026-12-31T00:00:00Z"
+
+    ApiKeyCreated:
+      type: object
+      description: |
+        Response for POST /api/v1/api-keys. The `key` field carries the
+        plaintext credential and is returned EXACTLY ONCE — it is never
+        retrievable again, from this endpoint or any other.
+      allOf:
+        - $ref: "#/components/schemas/ApiKey"
+        - type: object
+          properties:
+            key:
+              type: string
+              description: The plaintext API key. Store it immediately — it cannot be retrieved again.
+              example: "lp_Wwut111f_jHpogymaQLg5L19-MuWcVVY"
+
+    Route:
+      type: object
+      description: A routing rule that maps a check event type to a list of notification channels.
+      properties:
+        event_type:
+          type: string
+          enum: [down, recovery, fail]
+          description: The check event that triggers this route.
+          example: "down"
+        channel_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: Ordered list of channel UUIDs to notify (never null; may be empty).
+          example: ["c1d2e3f4-0000-0000-0000-000000000001"]
+
+    Ping:
+      type: object
+      description: A single ping event received for a check.
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Unique ping identifier.
+          example: "a0b1c2d3-0000-0000-0000-000000000001"
+        kind:
+          type: string
+          description: Ping kind (e.g. `success`, `start`, `fail`).
+          example: "success"
+        rid:
+          type: string
+          description: Optional run identifier supplied by the sender (omitted when empty).
+          example: "job-42"
+        body_excerpt:
+          type: string
+          description: First 500 bytes of the ping request body (omitted when empty).
+          example: "backup finished ok"
+        received_at:
+          type: string
+          format: date-time
+          description: RFC 3339 UTC timestamp when the ping was received.
+          example: "2026-07-10T03:00:05Z"
+
+    Incident:
+      type: object
+      description: A single downtime incident for a check.
+      properties:
+        opened_at:
+          type: string
+          format: date-time
+          description: RFC 3339 UTC timestamp when the incident was opened.
+          example: "2026-07-10T03:10:00Z"
+        closed_at:
+          type: [string, "null"]
+          format: date-time
+          description: RFC 3339 UTC timestamp when the incident was resolved, or null if still open.
+          example: "2026-07-10T04:00:00Z"
+        cause:
+          type: string
+          description: Machine-readable cause string (e.g. `late`, `fail`).
+          example: "late"
+        detail:
+          type: string
+          description: |
+            CI failure detail attached to this incident via `POST /ci/{id}/detail`.
+            Omitted when empty.  Contains the bounded log excerpt (≤ 64 KB) posted
+            by the CI workflow's failure-capture step.
+          example: "STEP failed: go test ./... exited with code 1\n..."
+
+    CIRun:
+      type: object
+      description: |
+        A single CI/CD run entry with structured failure context decoded from ci_meta
+        and the nearest correlated incident. Designed for agent consumption: all
+        fields are flat (no nesting) so failure triage does not require link-following.
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Ping UUID that represents this CI run.
+          example: "a0b1c2d3-0000-0000-0000-000000000001"
+        kind:
+          type: string
+          description: Ping kind (`success`, `fail`, `start`, etc.).
+          example: "fail"
+        received_at:
+          type: string
+          format: date-time
+          description: RFC 3339 UTC timestamp when the ping was received.
+          example: "2026-07-20T10:00:00Z"
+        run_url:
+          type: string
+          description: Direct URL to the CI/CD run page (omitted when unavailable).
+          example: "https://github.com/acme/repo/actions/runs/9876543210"
+        commit_sha:
+          type: string
+          description: Full or abbreviated commit SHA that triggered the run (omitted when unavailable).
+          example: "deadbeefcafe0000"
+        branch:
+          type: string
+          description: Branch name that triggered the run (omitted when unavailable).
+          example: "main"
+        actor:
+          type: string
+          description: Username or identity that triggered the run (omitted when unavailable).
+          example: "octocat"
+        failing_stage:
+          type: string
+          description: Name of the failing step or job (omitted when unavailable).
+          example: "go test ./..."
+        duration_s:
+          type: integer
+          format: int64
+          description: Run duration in seconds (omitted when unavailable or zero).
+          example: 120
+        outcome:
+          type: string
+          description: Normalised run outcome string from the CI provider (e.g. `failure`, `success`).
+          example: "failure"
+        incident_cause:
+          type: string
+          description: |
+            Cause from the correlated incident (e.g. `late`, `fail`) if one was
+            opened within ±10 minutes of this run. Empty when no incident correlates.
+          example: "fail"
+        incident_detail:
+          type: string
+          description: |
+            Log excerpt attached to the correlated incident via the `/ci/{id}/detail`
+            endpoint. Empty when no detail has been posted or no incident correlates.
+          example: "STEP failed: go test ./... exited with code 1"
+        incident_resolved:
+          type: boolean
+          description: |
+            True when the correlated incident has been closed (resolved). False when
+            the incident is still open or when no incident correlates.
+          example: false
+
+    StatusPageCreate:
+      type: object
+      description: Body for POST /api/v1/status-pages (create). See StatusPageUpdate for PATCH.
+      required:
+        - title
+      properties:
+        slug:
+          type: string
+          description: |
+            URL-safe slug for the status page.  If supplied, must match
+            `^[a-z0-9][a-z0-9-]{1,48}[a-z0-9]$` (3–50 chars, lowercase alphanumeric
+            with hyphens, start/end alphanumeric).
+
+            The slug namespace is **global across all LastPing accounts**
+            (it backs the public `/status/{slug}` URL), so an explicitly supplied
+            slug may collide with another account's and return 409.
+
+            `slug` is optional on create: omitting it generates a random,
+            collision-free slug in the same format, so this hazard only
+            applies to callers who deliberately choose a name.
+          example: "my-services"
+        title:
+          type: string
+          description: Human-readable display title for the status page.
+          example: "My Services"
+        check_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: |
+            Ordered list of check UUIDs to display on the page.  All checks must
+            belong to the authenticated project.  Duplicates are silently deduped.
+            Omit or pass an empty array for a page with no checks.
+          example: ["550e8400-e29b-41d4-a716-446655440000"]
+        visibility:
+          type: string
+          enum: [public, private]
+          description: |
+            `public` pages are accessible without authentication at `/status/{slug}`.
+            `private` pages are visible only in the dashboard.
+            Defaults to `private` on create if omitted.
+          example: "public"
+
+    StatusPageUpdate:
+      type: object
+      description: |
+        Body for PATCH /api/v1/status-pages/{id} (update). Unlike
+        StatusPageCreate, `slug` is required here — PATCH replaces the
+        resource's full config, so every mutable field must be supplied.
+      required:
+        - slug
+        - title
+      properties:
+        slug:
+          type: string
+          description: |
+            URL-safe slug for the status page, must match
+            `^[a-z0-9][a-z0-9-]{1,48}[a-z0-9]$` (3–50 chars, lowercase alphanumeric
+            with hyphens, start/end alphanumeric).
+
+            The slug namespace is **global across all LastPing accounts**
+            (it backs the public `/status/{slug}` URL), so changing it to a
+            name already taken returns 409 — possibly another account's.
+
+            Required on update: PATCH is a full replacement of the resource's
+            config, so the current slug must be supplied even when unchanged.
+          example: "my-services"
+        title:
+          type: string
+          description: Human-readable display title for the status page.
+          example: "My Services"
+        check_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: |
+            Ordered list of check UUIDs to display on the page.  All checks must
+            belong to the authenticated project.  Duplicates are silently deduped.
+            Omit or pass an empty array for a page with no checks.
+          example: ["550e8400-e29b-41d4-a716-446655440000"]
+        visibility:
+          type: string
+          enum: [public, private]
+          description: |
+            `public` pages are accessible without authentication at `/status/{slug}`.
+            `private` pages are visible only in the dashboard.
+            Required on update — no default is applied.
+          example: "public"
+
+    StatusPage:
+      type: object
+      description: A status page resource returned by the API.
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Unique status page identifier.
+          example: "d1e2f3a4-0000-0000-0000-000000000001"
+        slug:
+          type: string
+          description: URL-safe slug for the page.
+          example: "my-services"
+        title:
+          type: string
+          description: Human-readable display title.
+          example: "My Services"
+        check_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: Ordered list of check UUIDs displayed on this page (never null; may be empty).
+          example: ["550e8400-e29b-41d4-a716-446655440000"]
+        visibility:
+          type: string
+          enum: [public, private]
+          description: Page visibility.
+          example: "public"
+        public_url:
+          type: string
+          description: |
+            Full URL of the public status page (e.g. `https://app.lastping.dev/status/my-services`).
+            Empty string when `visibility` is `private`.
+          example: "https://app.lastping.dev/status/my-services"
+        created_at:
+          type: string
+          format: date-time
+          description: RFC 3339 UTC timestamp when the status page was created.
+          example: "2026-07-01T12:00:00Z"
+
+    Problem:
+      type: object
+      description: RFC 7807 problem detail returned on errors (Content-Type application/problem+json).
+      properties:
+        type:
+          type: string
+          description: URI identifying the problem type.  Currently always "about:blank".
+          example: "about:blank"
+        title:
+          type: string
+          description: Short human-readable summary of the problem type.
+          example: "Not Found"
+        status:
+          type: integer
+          description: HTTP status code.
+          example: 404
+        detail:
+          type: string
+          description: Human-readable explanation specific to this occurrence.
+          example: "check not found"
+        engine:
+          type: string
+          description: Always "lastping".
+          example: "lastping"
+        service_version:
+          type: string
+          description: Running version of the api service.
+          example: "dev"
+        request_id:
+          type: string
+          description: Echo of X-Request-Id header (or a generated UUID when absent).
+          example: "b5d3f2a1-0c7e-4b8d-a991-f3e0c2d1a4b7"
+
+    AlertTemplatesResponse:
+      type: object
+      description: Custom alert message templates for a check, keyed by event type or event-type/cause.
+      required:
+        - templates
+      properties:
+        templates:
+          type: object
+          description: |
+            Map of template key → custom template body.
+
+            **Key format:**
+            - Event-type-wide: `"down"`, `"fail"`, `"recovery"`, `"every-run"`.
+            - Per-cause override: `"event_type/cause"`, e.g. `"down/silence"`,
+              `"down/overrun"`, `"down/never_started"`, `"fail/runaway"`.
+              Per-cause keys take priority over the event-type-wide key.
+
+            Only keys with a custom template are included; absent keys fall back to
+            the per-cause built-in default, then to the event-type-wide custom
+            template, then to the built-in default text.
+          additionalProperties:
+            type: string
+          example:
+            down: "[LastPing] {check_name} is down."
+            "down/silence": "[LastPing] {check_name} hasn't checked in — last seen {last_ping}."
+            fail: "{failing_stage} failed on {branch} — {run_url}."
+
+security: []
+
+paths:
+  /healthz:
+    get:
+      operationId: getHealthz
+      summary: Health check
+      description: Returns 200 {"status":"ok"} when the api service is healthy.  No auth required.
+      tags: [Health]
+      security: []
+      responses:
+        "200":
+          description: Service is healthy.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "ok"
+              example:
+                status: "ok"
+
+  /api/v1/whoami:
+    get:
+      operationId: getWhoami
+      summary: Auth smoke-test
+      description: Returns the authenticated project_id.  Useful for verifying the API key is valid.
+      tags: [Auth]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: API key is valid; returns the associated project_id.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  project_id:
+                    type: string
+                    format: uuid
+                    example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+              example:
+                project_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/checks:
+    post:
+      operationId: createCheck
+      summary: Create or upsert a check
+      description: |
+        Creates a new check and returns 201.
+
+        **Upsert:** if `slug` is non-empty and a check with that slug already
+        exists in the project, the existing check's config is updated and 200 is
+        returned instead of 201.
+
+        **Create-only (`If-None-Match: *`):** send the request header
+        `If-None-Match: *` to opt out of the upsert behaviour above (RFC 9110
+        §13.1.2 — apply only if the resource does not already exist). If a
+        check with the given `slug` already exists, the request is rejected
+        with `412 Precondition Failed` and the existing check is left
+        completely unmodified, instead of being silently adopted/updated.
+        This is intended for IaC clients (e.g. a Terraform provider) where a
+        slug collision must surface as an error rather than take over a
+        monitor the client did not create. The header is opt-in: omitting it
+        preserves the upsert behaviour above for existing callers (dashboard,
+        MCP tools). Any other `If-None-Match` value (e.g. an ETag) is ignored.
+      tags: [Checks]
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: If-None-Match
+          in: header
+          required: false
+          schema:
+            type: string
+          description: |
+            Set to `*` for create-only semantics: reject with 412 instead of
+            upserting when `slug` already exists. Any other value is ignored.
+          example: "*"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CheckCreate"
+            example:
+              name: "Daily backup job"
+              slug: "daily-backup"
+              schedule_kind: "simple"
+              period_s: 86400
+              grace_s: 600
+      responses:
+        "201":
+          description: Check created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Check"
+        "200":
+          description: Existing check (matched by slug) updated; config replaced.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Check"
+        "400":
+          description: Invalid request body or schedule validation failed.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "412":
+          description: |
+            `If-None-Match: *` was sent and a check with the given `slug`
+            already exists. The existing check is left unmodified.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+    get:
+      operationId: listChecks
+      summary: List checks
+      description: |
+        Returns all checks for the authenticated project as a JSON array (never null).
+        Use `?tag=` to filter by a single tag (containment match).
+      tags: [Checks]
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: tag
+          in: query
+          required: false
+          schema:
+            type: string
+          description: |
+            Filter monitors by tag. Only monitors that have this exact tag are returned.
+            Example: `?tag=agent:claude`
+          example: "agent:claude"
+      responses:
+        "200":
+          description: Array of checks (may be empty).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Check"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/checks/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: UUID of the check.
+        schema:
+          type: string
+          format: uuid
+        example: "550e8400-e29b-41d4-a716-446655440000"
+
+    get:
+      operationId: getCheck
+      summary: Get a check
+      description: Returns the check for the authenticated project.  404 if not found (or belongs to another project).
+      tags: [Checks]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: The check.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Check"
+        "400":
+          description: id is not a valid UUID.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: Check not found in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+    patch:
+      operationId: updateCheck
+      summary: Update a check
+      description: |
+        Replaces the check's schedule configuration.  The `slug` is preserved from
+        creation and cannot be changed via PATCH.
+      tags: [Checks]
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CheckCreate"
+            example:
+              name: "Daily backup job"
+              schedule_kind: "simple"
+              period_s: 43200
+              grace_s: 300
+      responses:
+        "200":
+          description: Updated check.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Check"
+        "400":
+          description: Invalid request body or schedule validation failed.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: Check not found in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+    delete:
+      operationId: deleteCheck
+      summary: Delete a check
+      description: Permanently removes the check from the project.  Returns 204 No Content on success.
+      tags: [Checks]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "204":
+          description: Check deleted.
+        "400":
+          description: id is not a valid UUID.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: Check not found in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/checks/{id}/pause:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: UUID of the check.
+        schema:
+          type: string
+          format: uuid
+        example: "550e8400-e29b-41d4-a716-446655440000"
+
+    post:
+      operationId: pauseCheck
+      summary: Pause a check
+      description: Sets `paused=true` on the check.  A paused check does not alert.
+      tags: [Checks]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: Check with paused=true.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Check"
+        "400":
+          description: id is not a valid UUID.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: Check not found in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/checks/{id}/resume:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: UUID of the check.
+        schema:
+          type: string
+          format: uuid
+        example: "550e8400-e29b-41d4-a716-446655440000"
+
+    post:
+      operationId: resumeCheck
+      summary: Resume a check
+      description: Sets `paused=false` on the check.  Alerting resumes on the next missed ping.
+      tags: [Checks]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: Check with paused=false.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Check"
+        "400":
+          description: id is not a valid UUID.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: Check not found in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/checks/{id}/snooze:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: UUID of the check.
+        schema:
+          type: string
+          format: uuid
+        example: "550e8400-e29b-41d4-a716-446655440000"
+
+    post:
+      operationId: snoozeCheck
+      summary: Set or clear a maintenance window
+      description: |
+        Sets `maintenance_until` on the check.  While a maintenance window is
+        active (`now < maintenance_until`) the check will not generate alerts.
+
+        Exactly one of `duration`, `until`, or `clear` must be provided:
+
+        - `duration` — a Go duration string (e.g. `"1h"`, `"24h"`, `"72h"`).
+        - `until` — an RFC 3339 timestamp for a custom end time.
+        - `clear` — set to `true` to remove the maintenance window immediately.
+      tags: [Checks]
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                duration:
+                  type: string
+                  description: Go duration string (e.g. "1h", "24h").
+                  example: "1h"
+                until:
+                  type: string
+                  format: date-time
+                  description: RFC 3339 end timestamp.
+                  example: "2026-07-17T00:00:00Z"
+                clear:
+                  type: boolean
+                  description: Set to true to remove the active maintenance window.
+                  example: false
+      responses:
+        "200":
+          description: Check with maintenance_until updated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Check"
+        "400":
+          description: Invalid or missing body fields.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: Check not found in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/checks/{id}/ci/regenerate:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: UUID of the check.
+        schema:
+          type: string
+          format: uuid
+        example: "550e8400-e29b-41d4-a716-446655440000"
+
+    post:
+      operationId: regenerateCISecret
+      summary: Regenerate CI webhook secret
+      description: |
+        Generates a new CI webhook secret for the check and invalidates the old one.
+        The new secret is returned **write-once** — copy it immediately; it cannot be
+        retrieved again.  If the check has no `ci_provider` set, returns 400.
+
+        To create a CI binding, supply `ci_provider` (and optionally `ci_workflow`,
+        `ci_branch`) when calling `POST /api/v1/checks`.
+      tags: [Checks]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: New CI secret generated.  Copy `ci_secret` now — it will not be returned again.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ci_secret, ci_webhook_url]
+                properties:
+                  ci_secret:
+                    type: string
+                    description: The newly generated HMAC secret.  WRITE-ONCE — never returned again.
+                    example: "a3f8c2d1e4b7a9f0c3d2e1b4a7f8c0d3e2b1a4f7"
+                  ci_webhook_url:
+                    type: string
+                    format: uri
+                    description: The webhook URL to configure in your CI provider.
+                    example: "https://ingest.lastping.dev/ci/github/550e8400-e29b-41d4-a716-446655440000"
+              example:
+                ci_secret: "a3f8c2d1e4b7a9f0c3d2e1b4a7f8c0d3e2b1a4f7"
+                ci_webhook_url: "https://ingest.lastping.dev/ci/github/550e8400-e29b-41d4-a716-446655440000"
+        "400":
+          description: id is not a valid UUID, or the check has no ci_provider set (not a CI monitor).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: Check not found in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  # ── Alert templates ──────────────────────────────────────────────────────────
+
+  /api/v1/checks/{id}/templates:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: UUID of the check.
+        schema:
+          type: string
+          format: uuid
+        example: "550e8400-e29b-41d4-a716-446655440000"
+
+    get:
+      operationId: getAlertTemplates
+      summary: Get alert templates for a check
+      description: |
+        Returns the custom alert message templates configured for the check.
+        Returns an empty `templates` map when no custom templates are set — the
+        built-in plain-language defaults are used.
+
+        **Key format:** keys are either a bare event type (`down`, `recovery`,
+        `fail`, `every-run`) or an `event_type/cause` pair for a per-cause
+        override (e.g. `down/silence`, `down/overrun`, `down/never_started`,
+        `fail/runaway`).  Per-cause entries take priority over the event-type-wide
+        entry at notification time.
+
+        Template bodies may reference allowlisted `{variable}` placeholders:
+        `{check_name}`, `{event}`, `{status}`, `{cause}`, `{last_ping}`,
+        `{schedule}`, `{incident_url}`, `{run_url}`, `{branch}`, `{commit}`,
+        `{actor}`, `{failing_stage}`, `{duration}`, `{latency}`, `{status_code}`,
+        `{url}`.  Unknown placeholders are **rejected** at write time.
+      tags: [Checks]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: Current custom templates for this check (may be an empty map).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AlertTemplatesResponse"
+              example:
+                templates:
+                  down: "[LastPing] {check_name} is down."
+                  "down/silence": "[LastPing] {check_name} hasn't checked in — last seen {last_ping}."
+                  fail: "{failing_stage} failed on {branch} — {run_url}."
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: Check not found in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+    put:
+      operationId: putAlertTemplates
+      summary: Replace alert templates for a check
+      description: |
+        Replaces the complete set of custom alert message templates for the check
+        (**replace-the-set** semantics).
+
+        - Keys present in the body with a non-empty string → stored as the custom
+          template for that key.
+        - Keys absent from the body or mapped to an empty string → the custom
+          template is **deleted** and the built-in default text is used instead.
+
+        All entries are validated before any writes: if any key is invalid or any
+        template body references an unknown `{variable}`, the entire request is
+        rejected with `400` and **nothing is written**.
+
+        **Key format:** bare event type (`down`, `recovery`, `fail`, `every-run`)
+        or `event_type/cause` for a per-cause override (e.g. `"down/silence"`,
+        `"down/overrun"`, `"down/never_started"`, `"fail/runaway"`).  Per-cause
+        entries take priority over the event-type-wide entry for that event.
+
+        Returns the resulting set (same shape as `GET`) on success.
+      tags: [Checks]
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - templates
+              properties:
+                templates:
+                  type: object
+                  description: |
+                    Map of template key → template body.
+
+                    Keys are a bare event type (`down`, `recovery`, `fail`,
+                    `every-run`) or `event_type/cause` (e.g. `"down/silence"`,
+                    `"down/overrun"`, `"down/never_started"`, `"fail/runaway"`).
+
+                    Absent keys or empty-string values reset that key to the
+                    built-in plain-language default.
+                  additionalProperties:
+                    type: string
+                  example:
+                    down: "[LastPing] {check_name} is down."
+                    "down/silence": "[LastPing] {check_name} hasn't checked in — last seen {last_ping}."
+            examples:
+              set_two:
+                summary: Set event-type-wide templates for down and fail
+                value:
+                  templates:
+                    down: "[LastPing] {check_name} is down."
+                    fail: "{failing_stage} failed on {branch} — {run_url}."
+              set_per_cause:
+                summary: Set per-cause overrides for specific down reasons
+                value:
+                  templates:
+                    "down/silence": "[LastPing] {check_name} hasn't checked in — last seen {last_ping}."
+                    "down/overrun": "[LastPing] {check_name} started but hasn't finished."
+                    "fail/runaway": "[LastPing] {check_name} is firing too frequently — possible runaway job."
+              reset_all:
+                summary: Reset all templates to built-in defaults
+                value:
+                  templates: {}
+      responses:
+        "200":
+          description: Resulting custom templates after applying the replace-the-set operation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AlertTemplatesResponse"
+              example:
+                templates:
+                  down: "[LastPing] {check_name} is down."
+                  "down/silence": "[LastPing] {check_name} hasn't checked in — last seen {last_ping}."
+        "400":
+          description: |
+            Invalid request — one of:
+            - Invalid key: event type part must be `down`, `recovery`, `fail`, or `every-run`
+              (e.g. `"down"` or `"down/silence"`).
+            - Template body references an unknown `{variable}`.
+            - Malformed JSON body.
+            Nothing is written when any entry fails validation.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: Check not found in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  # ── Channels ─────────────────────────────────────────────────────────────────
+
+  /api/v1/channels:
+    post:
+      operationId: createChannel
+      summary: Create a notification channel
+      description: |
+        Creates a new notification channel for the authenticated project.
+        Secrets (`secret` for webhooks, `bot_token` for Telegram, `webhook_url` for
+        Discord/Slack/MS Teams/Google Chat, `token`+`user_key` for Pushover) are stored
+        server-side but are **never returned** in any API response.
+        Email channels are created unverified; a verification email is sent to the address
+        and the channel will not alert until verified.
+      tags: [Channels]
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChannelCreate"
+            examples:
+              webhook:
+                summary: Webhook channel
+                value:
+                  kind: "webhook"
+                  name: "Ops webhook"
+                  config:
+                    url: "https://example.com/hook"
+                    secret: "s3cr3t"
+              telegram:
+                summary: Telegram channel
+                value:
+                  kind: "telegram"
+                  name: "Ops Telegram"
+                  config:
+                    bot_token: "123456:ABC-DEF"
+                    chat_id: "-100123456"
+              discord:
+                summary: Discord channel
+                value:
+                  kind: "discord"
+                  name: "Ops Discord"
+                  config:
+                    webhook_url: "https://discord.com/api/webhooks/123456/abcdef"
+              slack:
+                summary: Slack channel
+                value:
+                  kind: "slack"
+                  name: "Ops Slack"
+                  config:
+                    webhook_url: "https://hooks.slack.com/services/T00/B00/xxx"
+              ntfy:
+                summary: ntfy channel
+                value:
+                  kind: "ntfy"
+                  name: "Ops ntfy"
+                  config:
+                    topic_url: "https://ntfy.sh/my-topic"
+              pushover:
+                summary: Pushover channel
+                value:
+                  kind: "pushover"
+                  name: "Ops Pushover"
+                  config:
+                    token: "azGDORePK8gMaC0QOYAMyEEuzJnyUi"
+                    user_key: "uQiRzpo4DXghDmr9QzzfQu27cmVRsG"
+              msteams:
+                summary: Microsoft Teams channel
+                value:
+                  kind: "msteams"
+                  name: "Ops Teams"
+                  config:
+                    webhook_url: "https://example.webhook.office.com/webhookb2/…"
+              googlechat:
+                summary: Google Chat channel
+                value:
+                  kind: "googlechat"
+                  name: "Ops Google Chat"
+                  config:
+                    webhook_url: "https://chat.googleapis.com/v1/spaces/AAA/messages?key=…"
+              email:
+                summary: Email channel (created unverified)
+                value:
+                  kind: "email"
+                  name: "Alerts email"
+                  config:
+                    address: "alerts@example.com"
+      responses:
+        "201":
+          description: Channel created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Channel"
+        "400":
+          description: Invalid request body, unknown kind, or missing required config fields.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+    get:
+      operationId: listChannels
+      summary: List notification channels
+      description: Returns all notification channels for the authenticated project as a JSON array (never null).
+      tags: [Channels]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: Array of channels (may be empty).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Channel"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /api/v1/channels/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: UUID of the channel.
+        schema:
+          type: string
+          format: uuid
+        example: "c1d2e3f4-0000-0000-0000-000000000001"
+
+    get:
+      operationId: getChannel
+      summary: Get a notification channel
+      description: Returns the channel for the authenticated project.  404 if not found (or belongs to another project).
+      tags: [Channels]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: The channel (no secrets).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Channel"
+        "400":
+          description: id is not a valid UUID.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: Channel not found in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+    patch:
+      operationId: updateChannel
+      summary: Update a notification channel
+      description: |
+        Partially updates a channel's name and/or config in place, preserving its
+        id and all route assignments.  This lets IaC clients (e.g. a Terraform
+        provider) edit a destination without destroying and recreating it, which
+        would otherwise discard email-verification state and cascade into routes.
+
+        `kind` is immutable — attempting to change it returns 400.
+
+        Changing an email channel's `address` resets `verified` to `false` and
+        sends a fresh verification email; any other change preserves verification.
+      tags: [Channels]
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChannelUpdate"
+      responses:
+        "200":
+          description: The updated channel (no secrets).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Channel"
+        "400":
+          description: id is not a valid UUID, body is malformed, kind was changed, or config failed per-kind validation.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: Channel not found in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+    delete:
+      operationId: deleteChannel
+      summary: Delete a notification channel
+      description: Permanently removes the channel from the project.  Returns 204 No Content on success.
+      tags: [Channels]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "204":
+          description: Channel deleted.
+        "400":
+          description: id is not a valid UUID.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: Channel not found in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /api/v1/channels/{id}/test:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: UUID of the channel.
+        schema:
+          type: string
+          format: uuid
+        example: "c1d2e3f4-0000-0000-0000-000000000001"
+
+    post:
+      operationId: testChannel
+      summary: Send a test alert to a channel
+      description: |
+        Delivers a synthetic "down" test event through the real delivery pipeline for
+        the specified channel.  Useful for verifying that the channel is correctly
+        configured before relying on it for real alerts.
+
+        **Security:** channel secrets are never logged or returned.
+        Delivery errors are surfaced in the Problem `detail` field to help debugging.
+      tags: [Channels]
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Test alert delivered successfully.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  delivered:
+                    type: boolean
+                    example: true
+              example:
+                delivered: true
+        "400":
+          description: id is not a valid UUID, or the channel kind does not support test delivery.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: Channel not found in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "502":
+          description: Delivery to the channel destination failed.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /api/v1/channels/{id}/resend-verification:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: UUID of the channel.
+        schema:
+          type: string
+          format: uuid
+        example: "c1d2e3f4-0000-0000-0000-000000000001"
+
+    post:
+      operationId: resendChannelVerification
+      summary: Resend email channel verification
+      description: |
+        Re-sends the verification email for an unverified `email` channel using its
+        existing verify token (the token is NOT rotated).
+
+        - If the channel is already verified, responds `200` with `verified: true`
+          and sends no email (idempotent).
+        - If `kind != "email"`, responds `400` with a Problem.
+        - Channel address and token are never logged.
+      tags: [Channels]
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: |
+            Verification email re-sent (`resent: true`), or channel was already
+            verified (`resent: false, verified: true`).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  resent:
+                    type: boolean
+                    description: True when the email was actually re-sent.
+                    example: true
+                  verified:
+                    type: boolean
+                    description: |
+                      Present and `true` when the channel was already verified
+                      (no email was sent in this case).
+                    example: true
+              examples:
+                resent:
+                  summary: Email re-sent
+                  value:
+                    resent: true
+                already_verified:
+                  summary: Already verified (idempotent)
+                  value:
+                    resent: false
+                    verified: true
+        "400":
+          description: Channel is not an email channel.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: Channel not found in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "500":
+          description: Mailer error or internal config problem.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "503":
+          description: Mailer not configured on this server.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  # ── Routes ───────────────────────────────────────────────────────────────────
+
+  /api/v1/checks/{id}/routes:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: UUID of the check.
+        schema:
+          type: string
+          format: uuid
+        example: "550e8400-e29b-41d4-a716-446655440000"
+
+    get:
+      operationId: listRoutes
+      summary: List routes for a check
+      description: |
+        Returns all routing rules for the check.  Each rule maps an event type
+        (`down`, `recovery`, `fail`) to a list of channel UUIDs.
+        Always returns a JSON array (never null).
+      tags: [Routes]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: Array of routes (may be empty).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Route"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: Check not found in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /api/v1/checks/{id}/routes/{event_type}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: UUID of the check.
+        schema:
+          type: string
+          format: uuid
+        example: "550e8400-e29b-41d4-a716-446655440000"
+      - name: event_type
+        in: path
+        required: true
+        description: Event type to route.
+        schema:
+          type: string
+          enum: [down, recovery, fail]
+        example: "down"
+
+    put:
+      operationId: upsertRoute
+      summary: Upsert a route
+      description: |
+        Creates or replaces the routing rule for the given event type on a check.
+        `channel_ids` is the complete new list (empty list removes all channels for
+        this event type).  Duplicate channel IDs in the request are silently deduped.
+        All referenced channels must belong to the authenticated project.
+      tags: [Routes]
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - channel_ids
+              properties:
+                channel_ids:
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+                  description: Ordered list of channel UUIDs to notify for this event type.
+                  example: ["c1d2e3f4-0000-0000-0000-000000000001"]
+            example:
+              channel_ids: ["c1d2e3f4-0000-0000-0000-000000000001"]
+      responses:
+        "200":
+          description: Route upserted; returns the stored state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Route"
+        "400":
+          description: Invalid request body, invalid event_type, or unknown/cross-tenant channel ID.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: Check not found in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+    delete:
+      operationId: deleteRoute
+      summary: Delete a route
+      description: Removes the routing rule for the given event type.  Returns 204 No Content on success.
+      tags: [Routes]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "204":
+          description: Route deleted.
+        "400":
+          description: id is not a valid UUID, or event_type is not one of down/recovery/fail.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: Check or route not found in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  # ── Pings & Incidents ─────────────────────────────────────────────────────────
+
+  /api/v1/checks/{id}/pings:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: UUID of the check.
+        schema:
+          type: string
+          format: uuid
+        example: "550e8400-e29b-41d4-a716-446655440000"
+
+    get:
+      operationId: listPings
+      summary: List pings for a check
+      description: |
+        Returns the most recent pings received for the check (newest first).
+        Always returns a JSON array (never null).  Privacy-sensitive fields
+        (`source_ip_hash`, `ua`) are never included.
+      tags: [Events]
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of pings to return (default 50, max 200).
+          schema:
+            type: integer
+            default: 50
+            maximum: 200
+            example: 50
+      responses:
+        "200":
+          description: Array of pings (may be empty).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Ping"
+        "400":
+          description: id is not a valid UUID.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: Check not found in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /api/v1/me:
+    get:
+      operationId: getMe
+      summary: Get authenticated principal
+      description: |
+        Returns the authenticated principal's project ID and auth method.
+        For API-key-authenticated requests only `project_id` and `auth` are
+        present.  For session-authenticated requests `user_id`, `email`, and
+        `provider` are also included.
+      tags: [Auth]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: Authenticated principal details.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [project_id, auth]
+                properties:
+                  project_id:
+                    type: string
+                    format: uuid
+                    description: Project the credential belongs to.
+                    example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+                  auth:
+                    type: string
+                    enum: [apikey, session]
+                    description: "`apikey` for API-key requests; `session` for cookie-authenticated requests."
+                    example: "apikey"
+                  user_id:
+                    type: string
+                    format: uuid
+                    description: "User ID (session-authenticated only)."
+                    example: "d4c3b2a1-f6e5-0987-dcba-fe4321098765"
+                  email:
+                    type: string
+                    format: email
+                    description: "Verified email address (session-authenticated only)."
+                    example: "user@example.com"
+                  provider:
+                    type: string
+                    description: "OAuth provider or empty string for email/password (session-authenticated only)."
+                    example: "github"
+              examples:
+                apikey:
+                  summary: API key authentication
+                  value:
+                    project_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+                    auth: "apikey"
+                session:
+                  summary: Session authentication
+                  value:
+                    project_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+                    auth: "session"
+                    user_id: "d4c3b2a1-f6e5-0987-dcba-fe4321098765"
+                    email: "user@example.com"
+                    provider: "github"
+        "401":
+          description: Missing or invalid credentials.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  # ── Status Pages ─────────────────────────────────────────────────────────────
+
+  /api/v1/status-pages:
+    post:
+      operationId: createStatusPage
+      summary: Create a status page
+      description: |
+        Creates a new status page for the authenticated project.
+
+        **Free-tier limit:** at most one `public` status page per project.
+        Attempting to create a second public page returns 403.
+
+        `slug` is optional. Omit it to have one generated automatically. The
+        slug namespace is global across all LastPing accounts (it backs the
+        public `/status/{slug}` URL); a 409 is returned only if an explicitly
+        supplied slug is already taken — a generated slug cannot collide with
+        another account's page.
+      tags: [StatusPages]
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StatusPageCreate"
+            example:
+              title: "My Services"
+              check_ids: ["550e8400-e29b-41d4-a716-446655440000"]
+              visibility: "public"
+      responses:
+        "201":
+          description: Status page created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusPage"
+        "400":
+          description: Invalid request body, bad slug, missing title, or invalid visibility.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "403":
+          description: Free-tier public status page limit reached (max 1 per project).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "409":
+          description: |
+            The supplied `slug` is already taken. Since the slug namespace is
+            global, this can be another account's page, not just your own.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+    get:
+      operationId: listStatusPages
+      summary: List status pages
+      description: Returns all status pages for the authenticated project as a JSON array (never null).
+      tags: [StatusPages]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: Array of status pages (may be empty).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/StatusPage"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/status-pages/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: UUID of the status page.
+        schema:
+          type: string
+          format: uuid
+        example: "d1e2f3a4-0000-0000-0000-000000000001"
+
+    get:
+      operationId: getStatusPage
+      summary: Get a status page
+      description: Returns the status page for the authenticated project.  404 if not found (or belongs to another project).
+      tags: [StatusPages]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: The status page.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusPage"
+        "400":
+          description: id is not a valid UUID.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: Status page not found in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+    patch:
+      operationId: updateStatusPage
+      summary: Update a status page
+      description: |
+        Replaces all mutable fields of the status page.  All fields (`slug`,
+        `title`, `visibility`, `check_ids`) must be supplied; this is a full
+        replacement of the resource's config. Unlike create, `slug` is
+        required here — it is not auto-generated on update.
+
+        **Free-tier limit:** upgrading `visibility` from `private` to `public`
+        counts against the 1-public-page limit; returns 403 if already at limit.
+
+        Changing `slug` to one already taken returns 409. The slug namespace
+        is global across all LastPing accounts, so this can be another
+        account's page.
+      tags: [StatusPages]
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StatusPageUpdate"
+            example:
+              slug: "my-services-v2"
+              title: "My Services (updated)"
+              check_ids: []
+              visibility: "private"
+      responses:
+        "200":
+          description: Updated status page.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusPage"
+        "400":
+          description: Invalid request body, bad slug, missing title, or invalid visibility.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "403":
+          description: Free-tier public status page limit reached.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: Status page not found in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "409":
+          description: |
+            The supplied `slug` is already taken. Since the slug namespace is
+            global, this can be another account's page, not just your own.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+    delete:
+      operationId: deleteStatusPage
+      summary: Delete a status page
+      description: Permanently removes the status page from the project.  Returns 204 No Content on success.
+      tags: [StatusPages]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "204":
+          description: Status page deleted.
+        "400":
+          description: id is not a valid UUID.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: Status page not found in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  # ── API keys ─────────────────────────────────────────────────────────────────
+
+  /api/v1/api-keys:
+    post:
+      operationId: createAPIKey
+      summary: Create an API key
+      description: |
+        Creates a new API key for the authenticated project. The plaintext
+        `key` is returned **exactly once**, in this response — it is never
+        stored, logged, or retrievable again through any other endpoint.
+        Store it immediately.
+
+        `expires_at`, when supplied, must be in the future; a past value is
+        rejected with 400 rather than silently minting an already-dead key.
+      tags: [ApiKeys]
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ApiKeyCreate"
+            examples:
+              never_expires:
+                summary: A key with no expiry
+                value:
+                  name: "ci"
+              short_lived:
+                summary: A key with an explicit expiry
+                value:
+                  name: "short"
+                  expires_at: "2026-12-31T00:00:00Z"
+      responses:
+        "201":
+          description: API key created. `key` is the plaintext credential — shown exactly once.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiKeyCreated"
+        "400":
+          description: Missing `name`, or `expires_at` is not in the future.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+    get:
+      operationId: listAPIKeys
+      summary: List API keys
+      description: |
+        Returns all API keys for the authenticated project as a JSON array
+        (never null). The plaintext key value is never included — only the
+        non-secret `prefix`.
+      tags: [ApiKeys]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: Array of API keys (may be empty).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ApiKey"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /api/v1/api-keys/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: UUID of the API key.
+        schema:
+          type: string
+          format: uuid
+        example: "e1d2c3b4-0000-0000-0000-000000000001"
+
+    delete:
+      operationId: revokeAPIKey
+      summary: Revoke an API key
+      description: |
+        Permanently deletes the API key from the project. Returns 204 No
+        Content on success. A key belonging to another project is
+        indistinguishable from a missing one — both return 404.
+      tags: [ApiKeys]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "204":
+          description: API key revoked.
+        "400":
+          description: id is not a valid UUID.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: API key not found in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /api/v1/export/terraform:
+    get:
+      operationId: exportTerraform
+      summary: Export monitors, destinations, routes, templates and status pages as Terraform HCL
+      description: |
+        Renders the authenticated project's resources as ready-to-commit
+        Terraform HCL, with an `import {}` block paired to every resource so
+        it is **adopted** rather than recreated. This is the primary way to
+        bring monitors created imperatively — via the dashboard or the MCP
+        server — under Terraform management.
+
+        **Secrets are never exported.** The API never returns channel
+        secrets (webhook URLs, bot tokens, etc.), so the corresponding HCL
+        attribute is emitted as a `var.<kind>_<attr>_<label>` reference
+        instead of an empty string, together with a matching `variable`
+        block (`sensitive = true`) and a `# TODO` comment. Omitting the
+        secret silently would ship a broken destination; the variable
+        indirection makes the gap visible and forces it to be filled in
+        before `terraform apply`.
+
+        **Query parameters:**
+        - `tag` — optional. Only export monitors carrying this tag (and
+          their routes/templates).
+        - `monitor_slug` — optional. Narrows the export to the single
+          monitor with this exact slug. If `tag` is also given, `tag` is
+          applied first and `monitor_slug` filters *within* that
+          tag-filtered set — the two combine as an AND, not an override. If
+          the named monitor doesn't carry the given tag, the result is an
+          empty export, not an error.
+        - `include` — optional comma-separated subset of
+          `monitors,destinations,routes,templates,status_pages`. Omit to
+          export everything.
+
+        A route, alert template, or status page referencing a monitor or
+        destination that was excluded from the export (by `include`, or
+        because it just isn't in this project) is skipped rather than
+        emitted with a dangling reference.
+      tags: [Export]
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: tag
+          in: query
+          required: false
+          description: Only export monitors carrying this tag.
+          schema:
+            type: string
+          example: "env:prod"
+        - name: monitor_slug
+          in: query
+          required: false
+          description: |
+            Narrow the export to a single monitor by its exact slug.
+            Combines with `tag` as an AND (both must match); does not
+            override it. Matches at most one monitor.
+          schema:
+            type: string
+          example: "nightly-backup"
+        - name: include
+          in: query
+          required: false
+          description: |
+            Comma-separated subset of monitors,destinations,routes,templates,status_pages.
+            Empty means all. An unrecognised value is a 400.
+          schema:
+            type: string
+          example: "monitors,routes"
+      responses:
+        "200":
+          description: |
+            Terraform HCL as plain text. Content-Type is
+            `text/plain; charset=utf-8`.
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: |
+                # Generated by LastPing.
+                # Secrets are not exported — the API never returns them. Every `var.`
+                # reference below has a matching variable block you must fill in.
+                # Import blocks adopt your existing resources instead of recreating them.
+
+                import {
+                  to = lastping_monitor.nightly_backup
+                  id = "nightly-backup"
+                }
+
+                resource "lastping_monitor" "nightly_backup" {
+                  name          = "Nightly backup"
+                  slug          = "nightly-backup"
+                  schedule_kind = "cron"
+                  cron_expr     = "0 3 * * *"
+                }
+        "400":
+          description: Unrecognised `include` value.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /api/v1/metrics:
+    get:
+      operationId: getMetrics
+      summary: Prometheus metrics scrape endpoint
+      description: |
+        Returns the authenticated project's checks as Prometheus gauges in
+        [Prometheus text exposition format 0.0.4](https://prometheus.io/docs/instrumenting/exposition_formats/#text-based-format).
+
+        **Metrics emitted (per check, labelled `id`, `name`, `slug`):**
+        - `lastping_check_up` — 1 if status is `up`, else 0
+        - `lastping_check_state{state="up|late|down|new"}` — one-hot gauge for current state
+        - `lastping_check_last_ping_timestamp_seconds` — unix seconds of last ping (omitted when never pinged)
+        - `lastping_check_due_timestamp_seconds` — unix seconds of next expected ping (omitted if null)
+        - `lastping_check_grace_seconds` — grace period in seconds
+        - `lastping_check_paused` — 1 if paused, else 0
+        - `lastping_checks` — count of checks in the project
+
+        **Authentication:** accepts either `X-Api-Key: lp_…` or `Authorization: Bearer lp_…`
+        (the Bearer form is provided specifically for Prometheus `scrape_config`).
+
+        **Example Prometheus `scrape_config`:**
+        ```yaml
+        scrape_configs:
+          - job_name: lastping
+            scrape_interval: 60s
+            authorization:
+              credentials: lp_YOUR_API_KEY
+            static_configs:
+              - targets: [app.lastping.dev]
+            metrics_path: /api/v1/metrics
+            scheme: https
+        ```
+      tags: [Metrics]
+      security:
+        - ApiKeyAuth: []
+        - BearerAuth: []
+      responses:
+        "200":
+          description: |
+            Prometheus text exposition (format 0.0.4). Content-Type is
+            `text/plain; version=0.0.4; charset=utf-8`.
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: |
+                # HELP lastping_checks Total number of checks in the project.
+                # TYPE lastping_checks gauge
+                lastping_checks 2
+                # HELP lastping_check_up 1 if the check status is up, else 0.
+                # TYPE lastping_check_up gauge
+                lastping_check_up{id="…",name="web heartbeat",slug="web"} 1
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /api/v1/checks/{id}/incidents:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: UUID of the check.
+        schema:
+          type: string
+          format: uuid
+        example: "550e8400-e29b-41d4-a716-446655440000"
+
+    get:
+      operationId: listIncidents
+      summary: List incidents for a check
+      description: |
+        Returns the most recent incidents for the check (newest first).
+        An incident is open when `closed_at` is null.
+        Always returns a JSON array (never null).
+      tags: [Events]
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of incidents to return (default 50, max 200).
+          schema:
+            type: integer
+            default: 50
+            maximum: 200
+            example: 50
+      responses:
+        "200":
+          description: Array of incidents (may be empty).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Incident"
+        "400":
+          description: id is not a valid UUID.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: Check not found in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /api/v1/checks/{id}/runs:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: UUID of the check.
+        schema:
+          type: string
+          format: uuid
+        example: "550e8400-e29b-41d4-a716-446655440000"
+
+    get:
+      operationId: listCIRuns
+      summary: List CI/CD run history for a check
+      description: |
+        Returns the last N CI/CD runs for the check that carry structured
+        `ci_meta` (pings received from a CI/CD provider webhook), newest first.
+
+        Each entry includes the full failure context decoded from `ci_meta`:
+        `run_url`, `commit_sha`, `branch`, `actor`, `failing_stage`, `duration_s`,
+        and `outcome`. When a matching incident (opened within ±10 minutes of the
+        ping) exists, `incident_cause`, `incident_detail`, and `incident_resolved`
+        are populated — enabling unattended failure triage without following links
+        to the CI provider.
+
+        Always returns a JSON array (never null).
+      tags: [CI]
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of CI runs to return (default 20, max 100).
+          schema:
+            type: integer
+            default: 20
+            maximum: 100
+            example: 20
+      responses:
+        "200":
+          description: Array of CI runs (may be empty).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/CIRun"
+        "400":
+          description: id is not a valid UUID.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: Check not found in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /ci/{id}/detail:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: |
+          Check UUID.  Acts as a capability token — no additional authentication
+          is required.  Keep this UUID confidential.
+        schema:
+          type: string
+          format: uuid
+        example: "550e8400-e29b-41d4-a716-446655440000"
+
+    post:
+      operationId: attachCIFailureDetail
+      summary: Attach CI failure detail to the open incident
+      description: |
+        Stores a bounded (<=64 KB) failure log excerpt on the check's most recent
+        open incident.  Intended to be called from a CI workflow's if: failure()
+        step so the failure reason is visible inside LastPing without needing to
+        follow a link to the CI provider.
+
+        Authentication: the check UUID in the path is the capability token (same
+        model as ping ingest URLs).  No X-Api-Key header is required or checked.
+
+        Idempotency / race: if there is no open incident when this request arrives
+        the request is accepted as a no-op and 200 OK is returned.
+
+        Privacy: the detail body is never logged on the server side.
+      tags: [CI]
+      requestBody:
+        required: true
+        description: |
+          Raw text body containing the failure log excerpt.  Truncated server-side
+          to 64 KB if longer.
+        content:
+          text/plain:
+            schema:
+              type: string
+            example: "STEP failed: go test ./... exited with code 1"
+      responses:
+        "200":
+          description: |
+            Detail accepted.  Returns 200 OK whether or not an open incident
+            existed (no open incident = accepted no-op).
+        "404":
+          description: The id path segment is not a valid UUID.
+          content:
+            text/plain:
+              schema:
+                type: string
