@@ -100,6 +100,7 @@ func (p *lastpingProvider) Resources(context.Context) []func() resource.Resource
 	return []func() resource.Resource{
 		NewMonitorResource,
 		NewDestinationResource,
+		NewRouteResource,
 	}
 }
 
