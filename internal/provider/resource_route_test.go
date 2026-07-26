@@ -48,6 +48,16 @@ func importStateAttrFunc(addr, attr string) resource.ImportStateIdFunc {
 	}
 }
 
+// captureAttr stashes an applied attribute so a later check — or an
+// out-of-band API call standing in for the dashboard — can use it. Server-side
+// ids are not known until apply, so there is no other way to address them.
+func captureAttr(addr, attr string, into *string) resource.TestCheckFunc {
+	return resource.TestCheckResourceAttrWith(addr, attr, func(v string) error {
+		*into = v
+		return nil
+	})
+}
+
 // importStateIDFunc builds the composite "<monitor_id>:<event_type>" import ID
 // from the applied state, since the monitor's UUID is not known until apply.
 func importStateIDFunc(routeAddr string) resource.ImportStateIdFunc {
@@ -331,6 +341,152 @@ resource "lastping_route" "down" {
 				ImportState:   true,
 				ImportStateId: "3f7c1f5a-1a2b-4c3d-8e9f-0a1b2c3d4e5f:sideways",
 				ExpectError:   regexp.MustCompile(`(?s)not one of down, recovery, fail`),
+			},
+		},
+	})
+}
+
+// TestAccRoute_refusesToAdoptAnExistingRoute is the adoption guard.
+//
+// PUT replaces the whole destination list and the API has no create-only mode
+// for routes, so before this guard a `terraform apply` against an event type
+// somebody had already routed — in the dashboard, or over MCP — silently took
+// it over. Nothing failed, nothing was logged, and the discovery channel was
+// the next incident: the page went to Terraform's destinations instead of the
+// ones actually on call. Create must refuse, and must leave the route alone.
+func TestAccRoute_refusesToAdoptAnExistingRoute(t *testing.T) {
+	var monitorID, firstID string
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				// Fixtures only. The route is then written behind Terraform's
+				// back, which is exactly what a dashboard user would do.
+				Config: routeFixtures,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					captureAttr("lastping_monitor.m", "id", &monitorID),
+					captureAttr("lastping_destination.first", "id", &firstID),
+					func(*terraform.State) error {
+						_, err := testAccDirectClient(t).UpsertRoute(t.Context(),
+							monitorID, "down", []string{firstID})
+						return err
+					},
+				),
+			},
+			{
+				// Same (monitor_id, event_type), different destinations.
+				Config: routeFixtures + `
+resource "lastping_route" "down" {
+  monitor_id      = lastping_monitor.m.id
+  event_type      = "down"
+  destination_ids = [lastping_destination.second.id]
+}`,
+				ExpectError: regexp.MustCompile(
+					`(?s)Route already exists.*terraform import lastping_route\.<name> [0-9a-f-]+:down`),
+			},
+			{
+				// Assert against the server, not state: a refusal that had
+				// already written would still leave state looking correct,
+				// because the resource never entered state at all.
+				Config: routeFixtures,
+				Check: func(*terraform.State) error {
+					rt, err := testAccDirectClient(t).GetRoute(t.Context(), monitorID, "down")
+					if err != nil {
+						return fmt.Errorf("the pre-existing route is gone: %w", err)
+					}
+					if len(rt.ChannelIDs) != 1 || rt.ChannelIDs[0] != firstID {
+						return fmt.Errorf("the refusal still overwrote the route: got %v, want [%s]",
+							rt.ChannelIDs, firstID)
+					}
+					return nil
+				},
+			},
+		},
+	})
+}
+
+// TestAccRoute_createsOverAnIdenticalRoute: the guard must not fire when the
+// write would change nothing. Re-creating a route after losing the state file
+// is a legitimate, common recovery, and failing it would be worse than the
+// hazard the guard exists for.
+func TestAccRoute_createsOverAnIdenticalRoute(t *testing.T) {
+	var monitorID, firstID string
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: routeFixtures,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					captureAttr("lastping_monitor.m", "id", &monitorID),
+					captureAttr("lastping_destination.first", "id", &firstID),
+					func(*terraform.State) error {
+						_, err := testAccDirectClient(t).UpsertRoute(t.Context(),
+							monitorID, "down", []string{firstID})
+						return err
+					},
+				),
+			},
+			{
+				Config: routeFixtures + `
+resource "lastping_route" "down" {
+  monitor_id      = lastping_monitor.m.id
+  event_type      = "down"
+  destination_ids = [lastping_destination.first.id]
+}`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrPair("lastping_route.down", "destination_ids.0",
+						"lastping_destination.first", "id"),
+					func(*terraform.State) error {
+						rt, err := testAccDirectClient(t).GetRoute(t.Context(), monitorID, "down")
+						if err != nil {
+							return err
+						}
+						if len(rt.ChannelIDs) != 1 || rt.ChannelIDs[0] != firstID {
+							return fmt.Errorf("server holds %v, want [%s]", rt.ChannelIDs, firstID)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// TestAccRoute_createsWhenNoRouteExists: the ordinary path, pinned separately
+// so a guard that read the wrong key — or treated a 404 as a conflict — could
+// not pass the two tests above while breaking every first apply.
+func TestAccRoute_createsWhenNoRouteExists(t *testing.T) {
+	var monitorID, firstID string
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: routeFixtures + `
+resource "lastping_route" "down" {
+  monitor_id      = lastping_monitor.m.id
+  event_type      = "down"
+  destination_ids = [lastping_destination.first.id]
+}`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					captureAttr("lastping_monitor.m", "id", &monitorID),
+					captureAttr("lastping_destination.first", "id", &firstID),
+					func(*terraform.State) error {
+						rt, err := testAccDirectClient(t).GetRoute(t.Context(), monitorID, "down")
+						if err != nil {
+							return err
+						}
+						if len(rt.ChannelIDs) != 1 || rt.ChannelIDs[0] != firstID {
+							return fmt.Errorf("server holds %v, want [%s]", rt.ChannelIDs, firstID)
+						}
+						return nil
+					},
+				),
 			},
 		},
 	})

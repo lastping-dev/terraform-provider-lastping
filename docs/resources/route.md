@@ -5,7 +5,7 @@ subcategory: ""
 description: |-
   Routes one monitor's alerts for a single event type to a list of destinations.
   The API endpoint (PUT /api/v1/checks/{id}/routes/{event_type}) replaces the whole destination list on every write, so this resource owns destination_ids outright — there is no add-one/remove-one operation, and a second resource pointing at the same (monitor_id, event_type) pair would silently overwrite the first on every apply. Use one resource per event type.
-  ~> Creating a route that already exists takes it over. Unlike lastping_monitor, the API has no create-only mode for routes, so an apply against an event type already routed elsewhere replaces its destination list. terraform import an existing route instead of recreating it.
+  ~> Terraform will not adopt a route it did not create. The API has no create-only mode for routes, so Create reads the event type's current route first and refuses when one already exists with a different, non-empty destination list — otherwise the apply would silently redirect somebody else's alerts, and the discovery channel would be the next incident. Run terraform import lastping_route.<name> "<monitor_id>:<event_type>" to take over an existing route instead, or remove the conflicting resource. A route that is absent, empty, or already identical to the configuration is not a conflict and applies normally, so re-creating one after losing state still works. The check is a read followed by a write and is not atomic: a route created by another writer inside that window is still overwritten.
   A destination must be verified and enabled before it can be routed to: an unconfirmed kind = "email" destination is rejected with channel not verified or is disabled.
 ---
 
@@ -15,7 +15,7 @@ Routes one monitor's alerts for a single event type to a list of destinations.
 
 The API endpoint (`PUT /api/v1/checks/{id}/routes/{event_type}`) replaces the whole destination list on every write, so this resource owns `destination_ids` outright — there is no add-one/remove-one operation, and a second resource pointing at the same `(monitor_id, event_type)` pair would silently overwrite the first on every apply. Use one resource per event type.
 
-~> **Creating a route that already exists takes it over.** Unlike `lastping_monitor`, the API has no create-only mode for routes, so an apply against an event type already routed elsewhere replaces its destination list. `terraform import` an existing route instead of recreating it.
+~> **Terraform will not adopt a route it did not create.** The API has no create-only mode for routes, so `Create` reads the event type's current route first and refuses when one already exists with a different, non-empty destination list — otherwise the apply would silently redirect somebody else's alerts, and the discovery channel would be the next incident. Run `terraform import lastping_route.<name> "<monitor_id>:<event_type>"` to take over an existing route instead, or remove the conflicting resource. A route that is absent, empty, or already identical to the configuration is not a conflict and applies normally, so re-creating one after losing state still works. The check is a read followed by a write and is not atomic: a route created by another writer inside that window is still overwritten.
 
 A destination must be verified and enabled before it can be routed to: an unconfirmed `kind = "email"` destination is rejected with `channel not verified or is disabled`.
 
