@@ -56,11 +56,12 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # tfplugindocs drives a real `terraform init`, so the CLI has to be on PATH.
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
       - name: Check generated docs are current
         run: |
-          if [ ! -d docs ]; then
-            echo "No docs/ directory yet (no resources or data sources to document). Skipping docs check."
-            exit 0
-          fi
           make docs
           git diff --exit-code -- docs/

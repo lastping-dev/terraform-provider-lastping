@@ -56,6 +56,12 @@ See the [Makefile](./Makefile) for common tasks: `make build`, `make test`,
 `make lint`, `make docs`. Acceptance tests (`make testacc`) require a
 LastPing backend and are not run in this repository's CI.
 
+Registry documentation under [`docs/`](./docs) is generated from the schema and
+the [`examples/`](./examples) directory by
+[terraform-plugin-docs](https://github.com/hashicorp/terraform-plugin-docs); run
+`make docs` and commit the result whenever the schema or an example changes. CI
+fails if the committed docs are stale.
+
 ## License
 
 [Mozilla Public License 2.0](./LICENSE)
