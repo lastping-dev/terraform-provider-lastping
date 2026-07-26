@@ -101,6 +101,7 @@ func (p *lastpingProvider) Resources(context.Context) []func() resource.Resource
 		NewMonitorResource,
 		NewDestinationResource,
 		NewRouteResource,
+		NewAlertTemplateResource,
 	}
 }
 
