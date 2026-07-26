@@ -195,6 +195,17 @@ func (c *Client) attempt(
 		_, _ = io.Copy(io.Discard, resp.Body)
 		return res, nil
 	}
+
+	// A *[]byte out means "hand me the body verbatim". Only /api/v1/metrics
+	// needs it — that endpoint answers in Prometheus text exposition format,
+	// not JSON — and routing it through Do rather than a bespoke request keeps
+	// it under the same auth headers, problem decoding and 429 retry policy as
+	// every other call.
+	if raw, ok := out.(*[]byte); ok {
+		b, err := io.ReadAll(resp.Body)
+		*raw = b
+		return res, err
+	}
 	return res, json.NewDecoder(resp.Body).Decode(out)
 }
 

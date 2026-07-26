@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 )
 
 // Monitor mirrors the Check schema in the LastPing OpenAPI spec. The same
@@ -62,12 +63,30 @@ func (c *Client) GetMonitor(ctx context.Context, id string) (*Monitor, error) {
 	return &out, nil
 }
 
+// ListMonitors returns every monitor in the caller's project. A non-empty tag
+// narrows the list to monitors carrying that exact tag (GET /api/v1/checks?tag=),
+// which the server evaluates as a containment match against the tag array.
+//
+// The tag is query-escaped: the `agent:` convention and `env=prod`-style tags
+// both contain characters that would otherwise change the query's meaning.
+func (c *Client) ListMonitors(ctx context.Context, tag string) ([]Monitor, error) {
+	path := "/api/v1/checks"
+	if tag != "" {
+		path += "?tag=" + url.QueryEscape(tag)
+	}
+	var out []Monitor
+	if err := c.Do(ctx, http.MethodGet, path, nil, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // GetMonitorBySlug supports import by slug, which agents reason about far more
 // reliably than UUIDs. Monitor slugs are project-scoped, so a match against the
 // caller's own project list is unambiguous.
 func (c *Client) GetMonitorBySlug(ctx context.Context, slug string) (*Monitor, error) {
-	var list []Monitor
-	if err := c.Do(ctx, http.MethodGet, "/api/v1/checks", nil, &list); err != nil {
+	list, err := c.ListMonitors(ctx, "")
+	if err != nil {
 		return nil, err
 	}
 	for i := range list {

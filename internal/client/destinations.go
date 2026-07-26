@@ -2,7 +2,9 @@ package client
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"strings"
 )
 
 // Destination mirrors the Channel schema in the LastPing OpenAPI spec — an
@@ -77,6 +79,45 @@ func (c *Client) ListDestinations(ctx context.Context) ([]Destination, error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+// GetDestinationByName resolves a destination by its human-readable name.
+//
+// Destination names are NOT unique — unlike monitor slugs, the API imposes no
+// uniqueness constraint — so an ambiguous name is an error naming every match
+// rather than an arbitrary pick that would silently point a configuration at
+// the wrong channel. The caller can then disambiguate by UUID.
+//
+// The ambiguity error is deliberately a plain error, not a *Problem: it is not
+// something the server said, and a caller must not treat it as a 404 and
+// conclude the destination does not exist.
+func (c *Client) GetDestinationByName(ctx context.Context, name string) (*Destination, error) {
+	list, err := c.ListDestinations(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var matches []Destination
+	for i := range list {
+		if list[i].Name == name {
+			matches = append(matches, list[i])
+		}
+	}
+	switch len(matches) {
+	case 1:
+		return &matches[0], nil
+	case 0:
+		return nil, &Problem{
+			Status: http.StatusNotFound,
+			Detail: fmt.Sprintf("no destination named %q in this project", name),
+		}
+	default:
+		ids := make([]string, 0, len(matches))
+		for _, d := range matches {
+			ids = append(ids, d.ID)
+		}
+		return nil, fmt.Errorf("%d destinations are named %q: %s; look it up by id instead",
+			len(matches), name, strings.Join(ids, ", "))
+	}
 }
 
 // UpdateDestination renames a destination and/or rotates its config in place.
