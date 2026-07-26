@@ -417,7 +417,11 @@ func timestampOrNull(v *string) types.String {
 // empty — or the applied state would not match the planned state.
 func tagsValue(ctx context.Context, apiTags []string, prior types.Set) (types.Set, diag.Diagnostics) {
 	if len(apiTags) == 0 {
-		if prior.IsNull() || prior.IsUnknown() {
+		// Only reuse prior's shape when prior was itself empty (an explicit
+		// tags = []). A non-empty prior means the API actually dropped tags
+		// that Terraform thought were still set — that must surface as null,
+		// not be masked by echoing the stale value back.
+		if prior.IsNull() || prior.IsUnknown() || len(prior.Elements()) > 0 {
 			return types.SetNull(types.StringType), nil
 		}
 		return prior, nil

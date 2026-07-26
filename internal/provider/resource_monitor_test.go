@@ -1,12 +1,16 @@
 package provider
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"regexp"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/stretchr/testify/require"
+
+	"github.com/lastping-dev/terraform-provider-lastping/internal/client"
 )
 
 // testAccPreCheck skips acceptance tests unless a backend is configured. These
@@ -16,6 +20,18 @@ func testAccPreCheck(t *testing.T) {
 	if os.Getenv("LASTPING_API_KEY") == "" {
 		t.Skip("LASTPING_API_KEY not set; skipping acceptance test")
 	}
+}
+
+// testAccDirectClient returns a client that talks to the same backend as the
+// provider under test, for out-of-band calls the provider itself must not be
+// aware of (see TestAccMonitor_tagsClearedOutOfBand).
+func testAccDirectClient(t *testing.T) *client.Client {
+	t.Helper()
+	endpoint := os.Getenv("LASTPING_ENDPOINT")
+	if endpoint == "" {
+		endpoint = defaultEndpoint
+	}
+	return client.New(endpoint, os.Getenv("LASTPING_API_KEY"), "acc-test")
 }
 
 func TestAccMonitor_basic(t *testing.T) {
@@ -373,6 +389,65 @@ resource "lastping_monitor" "second" {
 					resource.TestCheckResourceAttr("lastping_monitor.first", "name", "acc-collide"),
 					resource.TestCheckResourceAttr("lastping_monitor.first", "period_s", "3600"),
 					resource.TestCheckResourceAttr("lastping_monitor.first", "grace_s", "300"),
+				),
+			},
+		},
+	})
+}
+
+// TestAccMonitor_tagsClearedOutOfBand is the regression test for the
+// tagsValue masking bug: tags removed by something other than this Terraform
+// run (the dashboard, a direct API call, an MCP tool) must show up as drift
+// on the next refresh. Before the fix, tagsValue echoed the stale prior value
+// back whenever the API reported no tags, so `terraform plan -refresh-only`
+// reported "No changes." with the removal invisible.
+func TestAccMonitor_tagsClearedOutOfBand(t *testing.T) {
+	const cfg = `
+resource "lastping_monitor" "oob" {
+  name          = "acc-tags-oob"
+  slug          = "acc-tags-oob"
+  schedule_kind = "simple"
+  period_s      = 3600
+  grace_s       = 300
+  tags          = ["env:prod"]
+}`
+	var monitorID string
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: cfg,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("lastping_monitor.oob", "tags.#", "1"),
+					resource.TestCheckResourceAttrWith("lastping_monitor.oob", "id", func(v string) error {
+						monitorID = v
+						return nil
+					}),
+				),
+			},
+			{
+				// Clear tags the way the dashboard, a direct API call, or MCP
+				// would: a PATCH that carries no tags at all. The API's PATCH
+				// fully replaces the config (see api/checks.go:
+				// handleUpdateCheck), so omitting tags clears them — this is
+				// exactly how "cleared out-of-band" happens in practice, not
+				// a contrivance of the test.
+				PreConfig: func() {
+					c := testAccDirectClient(t)
+					mon, err := c.GetMonitor(context.Background(), monitorID)
+					require.NoError(t, err)
+					mon.Tags = nil
+					_, err = c.UpdateMonitor(context.Background(), monitorID, *mon)
+					require.NoError(t, err)
+				},
+				RefreshState:       true,
+				ExpectNonEmptyPlan: true,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					// The refreshed state must reflect the removal, not the
+					// stale ["env:prod"] Terraform last knew about.
+					resource.TestCheckNoResourceAttr("lastping_monitor.oob", "tags.#"),
 				),
 			},
 		},

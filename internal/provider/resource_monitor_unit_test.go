@@ -174,4 +174,16 @@ func TestTagsValueMapsEmptyToPriorShape(t *testing.T) {
 	got, diags = tagsValue(ctx, []string{"env:prod"}, types.SetNull(types.StringType))
 	require.False(t, diags.HasError())
 	require.Len(t, got.Elements(), 1)
+
+	// Non-empty prior: the API says tags are gone (cleared out-of-band via the
+	// dashboard, a direct API call, or MCP) but the prior state still holds
+	// ["env:prod"]. Echoing prior back here would permanently mask the
+	// removal — refresh must be able to see the drift, so this must come back
+	// null, not the stale prior value.
+	nonEmptyPrior, diags := types.SetValueFrom(ctx, types.StringType, []string{"env:prod"})
+	require.False(t, diags.HasError())
+
+	got, diags = tagsValue(ctx, nil, nonEmptyPrior)
+	require.False(t, diags.HasError())
+	require.True(t, got.IsNull(), "tags cleared out-of-band must not be masked by the stale prior value")
 }
