@@ -3,11 +3,14 @@ package provider
 import (
 	"context"
 	"fmt"
-	"strings"
+	"reflect"
+	"regexp"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
@@ -22,34 +25,64 @@ import (
 )
 
 var (
-	_ resource.Resource                = (*monitorResource)(nil)
-	_ resource.ResourceWithConfigure   = (*monitorResource)(nil)
-	_ resource.ResourceWithImportState = (*monitorResource)(nil)
+	_ resource.Resource                   = (*monitorResource)(nil)
+	_ resource.ResourceWithConfigure      = (*monitorResource)(nil)
+	_ resource.ResourceWithImportState    = (*monitorResource)(nil)
+	_ resource.ResourceWithValidateConfig = (*monitorResource)(nil)
 
-	_ planmodifier.String = normalizeSlugModifier{}
+	_ validator.String = notUUIDSlugValidator{}
+	_ validator.String = rfc3339Validator{}
 )
 
-// normalizeSlugModifier lowercases and trims the configured slug before
-// Terraform locks in the planned value, matching the server's own
-// normalisation (trim + lowercase — see api/slug.go: normalizeSlug in the
-// LastPing monorepo). Without this, a mixed-case slug in config would plan to
-// itself, then the server-normalised response would make Terraform report
-// "produced inconsistent result after apply".
-type normalizeSlugModifier struct{}
+// slugPattern mirrors the server's own rule (api/slug.go: validateSlug in the
+// LastPing monorepo). The server normalises (trim + lowercase) before it
+// validates, so `  Rev-Case-Slug  ` would be accepted server-side and come back
+// as `rev-case-slug` — a value Terraform never planned. A provider cannot fix
+// that by rewriting the planned value (Terraform rejects a planned value that
+// differs from a known config value), so the only correct answer is to refuse
+// the un-normalised form at plan time.
+var slugPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,48}[a-z0-9]$`)
 
-func (normalizeSlugModifier) Description(context.Context) string {
-	return "Normalises the slug (trim + lowercase) to match server-side normalisation."
+// notUUIDSlugValidator rejects UUID-shaped slugs, which the server also rejects:
+// they are ambiguous with a monitor id during import.
+type notUUIDSlugValidator struct{}
+
+func (notUUIDSlugValidator) Description(context.Context) string {
+	return "must not be a UUID (ambiguous with a monitor id on import)"
 }
 
-func (m normalizeSlugModifier) MarkdownDescription(ctx context.Context) string {
-	return m.Description(ctx)
+func (v notUUIDSlugValidator) MarkdownDescription(ctx context.Context) string {
+	return v.Description(ctx)
 }
 
-func (normalizeSlugModifier) PlanModifyString(_ context.Context, req planmodifier.StringRequest, resp *planmodifier.StringResponse) {
+func (notUUIDSlugValidator) ValidateString(_ context.Context, req validator.StringRequest, resp *validator.StringResponse) {
 	if req.ConfigValue.IsNull() || req.ConfigValue.IsUnknown() {
 		return
 	}
-	resp.PlanValue = types.StringValue(strings.ToLower(strings.TrimSpace(req.ConfigValue.ValueString())))
+	if _, err := uuid.Parse(req.ConfigValue.ValueString()); err == nil {
+		resp.Diagnostics.AddAttributeError(req.Path, "Invalid slug",
+			"A slug must not be a UUID: it would be ambiguous with a monitor id when importing. "+
+				"Choose a human-readable slug instead.")
+	}
+}
+
+// rfc3339Validator rejects timestamps the API cannot parse, turning an opaque
+// "invalid JSON body" 400 into a plan-time error on the right attribute.
+type rfc3339Validator struct{}
+
+func (rfc3339Validator) Description(context.Context) string { return "must be an RFC 3339 timestamp" }
+
+func (v rfc3339Validator) MarkdownDescription(ctx context.Context) string { return v.Description(ctx) }
+
+func (rfc3339Validator) ValidateString(_ context.Context, req validator.StringRequest, resp *validator.StringResponse) {
+	if req.ConfigValue.IsNull() || req.ConfigValue.IsUnknown() {
+		return
+	}
+	if _, err := time.Parse(time.RFC3339, req.ConfigValue.ValueString()); err != nil {
+		resp.Diagnostics.AddAttributeError(req.Path, "Invalid timestamp",
+			fmt.Sprintf("%q is not an RFC 3339 timestamp (for example 2027-01-01T00:00:00Z).",
+				req.ConfigValue.ValueString()))
+	}
 }
 
 // NewMonitorResource returns a new lastping_monitor resource.
@@ -62,33 +95,43 @@ type monitorResource struct {
 }
 
 // monitorResourceModel is the Terraform representation of a lastping_monitor.
-// Every attribute other than name/slug/grace_s is Optional+Computed: the API
-// derives or defaults most of these server-side (tz defaults to UTC,
-// probe_method defaults to GET, tags is always returned as an array, and so
-// on), and a plain Optional attribute would make the provider "produce an
-// inconsistent result after apply" the moment the server fills one in that
-// the config left unset.
+//
+// Optional+Computed is used only where the *server* genuinely supplies a value
+// the configuration cannot: grace_s (floored to 2*probe_interval_s for http
+// monitors), schedule_kind and period_s (derived from probe_interval_s for http
+// monitors), tz (defaults to UTC), the probe_* defaults backed by column
+// defaults, and the attributes carrying a provider-side Default. Everything
+// else is plain Optional so that removing it from the configuration actually
+// unsets it — a blanket Optional+Computed pins the previous value in state
+// forever.
 type monitorResourceModel struct {
-	ID                types.String `tfsdk:"id"`
-	Name              types.String `tfsdk:"name"`
-	Slug              types.String `tfsdk:"slug"`
-	MonitorType       types.String `tfsdk:"monitor_type"`
-	ScheduleKind      types.String `tfsdk:"schedule_kind"`
-	PeriodS           types.Int64  `tfsdk:"period_s"`
-	CronExpr          types.String `tfsdk:"cron_expr"`
-	TZ                types.String `tfsdk:"tz"`
-	GraceS            types.Int64  `tfsdk:"grace_s"`
-	Tags              types.Set    `tfsdk:"tags"`
-	RunawayCeiling    types.Int64  `tfsdk:"runaway_ceiling"`
-	MonitorFrom       types.String `tfsdk:"monitor_from"`
-	ProbeURL          types.String `tfsdk:"probe_url"`
-	ProbeMethod       types.String `tfsdk:"probe_method"`
-	ProbeIntervalS    types.Int64  `tfsdk:"probe_interval_s"`
-	ProbeExpectedBody types.String `tfsdk:"probe_expected_body"`
-	Paused            types.Bool   `tfsdk:"paused"`
-	PingURL           types.String `tfsdk:"ping_url"`
-	Status            types.String `tfsdk:"status"`
-	CreatedAt         types.String `tfsdk:"created_at"`
+	ID                   types.String `tfsdk:"id"`
+	Name                 types.String `tfsdk:"name"`
+	Slug                 types.String `tfsdk:"slug"`
+	MonitorType          types.String `tfsdk:"monitor_type"`
+	ScheduleKind         types.String `tfsdk:"schedule_kind"`
+	PeriodS              types.Int64  `tfsdk:"period_s"`
+	CronExpr             types.String `tfsdk:"cron_expr"`
+	TZ                   types.String `tfsdk:"tz"`
+	GraceS               types.Int64  `tfsdk:"grace_s"`
+	Tags                 types.Set    `tfsdk:"tags"`
+	RunawayCeiling       types.Int64  `tfsdk:"runaway_ceiling"`
+	MonitorFrom          types.String `tfsdk:"monitor_from"`
+	ProbeURL             types.String `tfsdk:"probe_url"`
+	ProbeMethod          types.String `tfsdk:"probe_method"`
+	ProbeIntervalS       types.Int64  `tfsdk:"probe_interval_s"`
+	ProbeExpectedBody    types.String `tfsdk:"probe_expected_body"`
+	ProbeExpectedStatus  types.Int64  `tfsdk:"probe_expected_status"`
+	ProbeTimeoutS        types.Int64  `tfsdk:"probe_timeout_s"`
+	ProbeFollowRedirects types.Bool   `tfsdk:"probe_follow_redirects"`
+	Paused               types.Bool   `tfsdk:"paused"`
+	PingURL              types.String `tfsdk:"ping_url"`
+	Status               types.String `tfsdk:"status"`
+	CreatedAt            types.String `tfsdk:"created_at"`
+	LastPingAt           types.String `tfsdk:"last_ping_at"`
+	DueAt                types.String `tfsdk:"due_at"`
+	AlertAfter           types.String `tfsdk:"alert_after"`
+	MaintenanceUntil     types.String `tfsdk:"maintenance_until"`
 }
 
 func (r *monitorResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -113,15 +156,18 @@ func (r *monitorResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 			},
 			"slug": schema.StringAttribute{
 				Optional: true,
-				Computed: true,
 				MarkdownDescription: "Stable, project-scoped identifier used for import and for `If-None-Match` " +
 					"collision detection. The API has no path to change a monitor's slug, so changing this " +
-					"attribute replaces the resource. Normalised server-side (trimmed, lowercased); must match " +
-					"`^[a-z0-9][a-z0-9-]{1,48}[a-z0-9]$` and must not be UUID-shaped.",
-				PlanModifiers: []planmodifier.String{
-					normalizeSlugModifier{},
-					stringplanmodifier.RequiresReplace(),
+					"attribute replaces the resource. Must already be in normalised form: lowercase, trimmed, " +
+					"matching `^[a-z0-9][a-z0-9-]{1,48}[a-z0-9]$`, and not UUID-shaped.",
+				Validators: []validator.String{
+					stringvalidator.RegexMatches(slugPattern,
+						"must be lowercase and trimmed, 3-50 characters of [a-z0-9-] starting and ending "+
+							"alphanumeric (the server normalises slugs, so pass the lowercase/trimmed form "+
+							"here — for example \"my-monitor\", not \" My-Monitor \")"),
+					notUUIDSlugValidator{},
 				},
+				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
 			},
 			"monitor_type": schema.StringAttribute{
 				Optional: true,
@@ -138,17 +184,18 @@ func (r *monitorResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 				Optional: true,
 				Computed: true,
 				MarkdownDescription: "`simple` (fixed `period_s` interval) or `cron` (`cron_expr` + `tz`). " +
-					"Ignored for `monitor_type = \"http\"`, which derives its own schedule from `probe_interval_s`.",
+					"Computed for `monitor_type = \"http\"`, which the server always schedules as `simple` " +
+					"from `probe_interval_s`.",
 				Validators: []validator.String{stringvalidator.OneOf("simple", "cron")},
 			},
 			"period_s": schema.Int64Attribute{
-				Optional:            true,
-				Computed:            true,
-				MarkdownDescription: "Period in seconds, for `schedule_kind = \"simple\"`.",
+				Optional: true,
+				Computed: true,
+				MarkdownDescription: "Period in seconds, for `schedule_kind = \"simple\"`. Server-derived " +
+					"(equal to `probe_interval_s`) for `monitor_type = \"http\"`.",
 			},
 			"cron_expr": schema.StringAttribute{
 				Optional:            true,
-				Computed:            true,
 				MarkdownDescription: "5-field cron expression, for `schedule_kind = \"cron\"`.",
 			},
 			"tz": schema.StringAttribute{
@@ -157,16 +204,18 @@ func (r *monitorResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 				MarkdownDescription: "IANA timezone for cron evaluation. Defaults to `UTC` when unset.",
 			},
 			"grace_s": schema.Int64Attribute{
-				Required: true,
+				Optional: true,
+				Computed: true,
 				MarkdownDescription: "Grace period in seconds after a deadline is missed before alerting. " +
-					"Required by the API; must be between 60 and 31536000 (one year).",
+					"Must be between 60 and 31536000 (one year). Required by the API for `heartbeat` and " +
+					"`ci` monitors. For `monitor_type = \"http\"` the server floors the effective grace to " +
+					"`2 * probe_interval_s`, so omit it to take the floor; a larger value is honoured as-is.",
 				Validators: []validator.Int64{int64validator.Between(60, 31536000)},
 			},
 			"tags": schema.SetAttribute{
 				Optional:            true,
-				Computed:            true,
 				ElementType:         types.StringType,
-				MarkdownDescription: "Labels attached to this monitor. Always returned as a set (never null).",
+				MarkdownDescription: "Labels attached to this monitor. Removing them from the configuration clears them.",
 			},
 			"runaway_ceiling": schema.Int64Attribute{
 				Optional: true,
@@ -174,12 +223,14 @@ func (r *monitorResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 					"\"runaway\" incident. Omit to disable.",
 			},
 			"monitor_from": schema.StringAttribute{
-				Optional:            true,
-				MarkdownDescription: "RFC 3339 timestamp from which deadlines are computed for a new monitor.",
+				Optional: true,
+				MarkdownDescription: "RFC 3339 timestamp from which deadlines are computed for a new monitor. " +
+					"The API stores and returns UTC; a value written with a different offset is kept as " +
+					"configured as long as it denotes the same instant.",
+				Validators: []validator.String{rfc3339Validator{}},
 			},
 			"probe_url": schema.StringAttribute{
 				Optional:            true,
-				Computed:            true,
 				MarkdownDescription: "Absolute http(s) URL to probe. Required for `monitor_type = \"http\"`.",
 			},
 			"probe_method": schema.StringAttribute{
@@ -191,13 +242,29 @@ func (r *monitorResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 			},
 			"probe_interval_s": schema.Int64Attribute{
 				Optional:            true,
-				Computed:            true,
 				MarkdownDescription: "Seconds between probes, for `monitor_type = \"http\"`. Between 30 and 86400.",
+				Validators:          []validator.Int64{int64validator.Between(30, 86400)},
 			},
 			"probe_expected_body": schema.StringAttribute{
 				Optional:            true,
-				Computed:            true,
 				MarkdownDescription: "Substring the probe response body must contain to count as healthy.",
+			},
+			"probe_expected_status": schema.Int64Attribute{
+				Optional:            true,
+				Computed:            true,
+				MarkdownDescription: "HTTP status code the probe must return. Omit to accept any 2xx.",
+				Validators:          []validator.Int64{int64validator.Between(100, 599)},
+			},
+			"probe_timeout_s": schema.Int64Attribute{
+				Optional:            true,
+				Computed:            true,
+				MarkdownDescription: "Per-probe timeout in seconds, between 1 and 30. Defaults to 10 server-side.",
+				Validators:          []validator.Int64{int64validator.Between(1, 30)},
+			},
+			"probe_follow_redirects": schema.BoolAttribute{
+				Optional:            true,
+				Computed:            true,
+				MarkdownDescription: "Whether the probe follows HTTP redirects.",
 			},
 			"paused": schema.BoolAttribute{
 				Optional: true,
@@ -218,7 +285,51 @@ func (r *monitorResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 				Computed:            true,
 				MarkdownDescription: "RFC 3339 UTC timestamp when the monitor was created.",
 			},
+			"last_ping_at": schema.StringAttribute{
+				Computed:            true,
+				MarkdownDescription: "RFC 3339 UTC timestamp of the most recent ping. Null until the first ping.",
+			},
+			"due_at": schema.StringAttribute{
+				Computed:            true,
+				MarkdownDescription: "RFC 3339 UTC timestamp of the next expected ping.",
+			},
+			"alert_after": schema.StringAttribute{
+				Computed:            true,
+				MarkdownDescription: "RFC 3339 UTC timestamp after which a missing ping raises an incident.",
+			},
+			"maintenance_until": schema.StringAttribute{
+				Computed: true,
+				MarkdownDescription: "RFC 3339 UTC timestamp until which alerting is suppressed for maintenance. " +
+					"Set through the API or dashboard, not by Terraform.",
+			},
 		},
+	}
+}
+
+// ValidateConfig rejects an http monitor whose grace_s is below the server's
+// floor of 2*probe_interval_s. Without this the configuration plans cleanly and
+// then fails the apply with "provider produced inconsistent result", because
+// Terraform requires a known planned value to survive apply unchanged and the
+// server would have raised the grace.
+func (r *monitorResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
+	var cfg monitorResourceModel
+	resp.Diagnostics.Append(req.Config.Get(ctx, &cfg)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	if cfg.MonitorType.IsUnknown() || cfg.MonitorType.ValueString() != "http" {
+		return
+	}
+	if cfg.GraceS.IsNull() || cfg.GraceS.IsUnknown() ||
+		cfg.ProbeIntervalS.IsNull() || cfg.ProbeIntervalS.IsUnknown() {
+		return
+	}
+	if floor := 2 * cfg.ProbeIntervalS.ValueInt64(); cfg.GraceS.ValueInt64() < floor {
+		resp.Diagnostics.AddAttributeError(path.Root("grace_s"), "grace_s below the http probe floor",
+			fmt.Sprintf("For monitor_type = \"http\" the server raises grace_s to 2 * probe_interval_s "+
+				"(here: at least %d), so %d would never be applied as written.\n\nSet grace_s to at least %d, "+
+				"or omit it to take the server floor.",
+				floor, cfg.GraceS.ValueInt64(), floor))
 	}
 }
 
@@ -239,18 +350,21 @@ func (r *monitorResource) Configure(_ context.Context, req resource.ConfigureReq
 // optional fields are omitted by the client's `omitempty` JSON tags.
 func monitorFromModel(ctx context.Context, m monitorResourceModel) (client.Monitor, error) {
 	out := client.Monitor{
-		Name:              m.Name.ValueString(),
-		Slug:              m.Slug.ValueString(),
-		MonitorType:       m.MonitorType.ValueString(),
-		ScheduleKind:      m.ScheduleKind.ValueString(),
-		PeriodS:           m.PeriodS.ValueInt64(),
-		CronExpr:          m.CronExpr.ValueString(),
-		TZ:                m.TZ.ValueString(),
-		GraceS:            m.GraceS.ValueInt64(),
-		ProbeURL:          m.ProbeURL.ValueString(),
-		ProbeMethod:       m.ProbeMethod.ValueString(),
-		ProbeIntervalS:    m.ProbeIntervalS.ValueInt64(),
-		ProbeExpectedBody: m.ProbeExpectedBody.ValueString(),
+		Name:                 m.Name.ValueString(),
+		Slug:                 m.Slug.ValueString(),
+		MonitorType:          m.MonitorType.ValueString(),
+		ScheduleKind:         m.ScheduleKind.ValueString(),
+		PeriodS:              m.PeriodS.ValueInt64(),
+		CronExpr:             m.CronExpr.ValueString(),
+		TZ:                   m.TZ.ValueString(),
+		GraceS:               m.GraceS.ValueInt64(),
+		ProbeURL:             m.ProbeURL.ValueString(),
+		ProbeMethod:          m.ProbeMethod.ValueString(),
+		ProbeIntervalS:       m.ProbeIntervalS.ValueInt64(),
+		ProbeExpectedBody:    m.ProbeExpectedBody.ValueString(),
+		ProbeExpectedStatus:  m.ProbeExpectedStatus.ValueInt64(),
+		ProbeTimeoutS:        m.ProbeTimeoutS.ValueInt64(),
+		ProbeFollowRedirects: m.ProbeFollowRedirects.ValueBool(),
 	}
 	if !m.RunawayCeiling.IsNull() && !m.RunawayCeiling.IsUnknown() {
 		v := m.RunawayCeiling.ValueInt64()
@@ -270,42 +384,106 @@ func monitorFromModel(ctx context.Context, m monitorResourceModel) (client.Monit
 	return out, nil
 }
 
-// modelFromMonitor builds Terraform state from an API response. Config-only
-// fields the API never echoes back (paused is handled by the caller since it
-// is not part of the monitor payload returned here in a way tests rely on)
-// are copied straight through; everything the API can return is taken from
-// the API response.
-func modelFromMonitor(ctx context.Context, mon *client.Monitor) (monitorResourceModel, error) {
+// stringOrNull maps the API's empty string — which is how it reports "unset" for
+// every purely user-supplied string field — back to null, so an attribute
+// removed from the configuration reads back as removed rather than as "".
+func stringOrNull(v string) types.String {
+	if v == "" {
+		return types.StringNull()
+	}
+	return types.StringValue(v)
+}
+
+// int64OrNull is stringOrNull for the numeric equivalents (the API omits them
+// entirely when unset, which decodes as 0).
+func int64OrNull(v int64) types.Int64 {
+	if v == 0 {
+		return types.Int64Null()
+	}
+	return types.Int64Value(v)
+}
+
+// timestampOrNull maps an optional API timestamp to state.
+func timestampOrNull(v *string) types.String {
+	if v == nil || *v == "" {
+		return types.StringNull()
+	}
+	return types.StringValue(*v)
+}
+
+// tagsValue maps the API's tag list to state. The API always returns an array,
+// never null, so "no tags" has to be mapped back onto whichever empty form the
+// configuration used — null when tags is absent, [] when it is explicitly
+// empty — or the applied state would not match the planned state.
+func tagsValue(ctx context.Context, apiTags []string, prior types.Set) (types.Set, diag.Diagnostics) {
+	if len(apiTags) == 0 {
+		if prior.IsNull() || prior.IsUnknown() {
+			return types.SetNull(types.StringType), nil
+		}
+		return prior, nil
+	}
+	return types.SetValueFrom(ctx, types.StringType, apiTags)
+}
+
+// monitorFromValue keeps the configured spelling of monitor_from when the API's
+// UTC-normalised answer denotes the same instant. The API stores timestamptz and
+// always answers in UTC, so "2027-01-01T00:00:00+01:00" comes back as
+// "2026-12-31T23:00:00Z"; without this the apply fails as an inconsistent result.
+func monitorFromValue(apiVal *string, prior types.String) types.String {
+	if apiVal == nil || *apiVal == "" {
+		return types.StringNull()
+	}
+	if !prior.IsNull() && !prior.IsUnknown() {
+		got, errGot := time.Parse(time.RFC3339, *apiVal)
+		want, errWant := time.Parse(time.RFC3339, prior.ValueString())
+		if errGot == nil && errWant == nil && got.Equal(want) {
+			return prior
+		}
+	}
+	return types.StringValue(*apiVal)
+}
+
+// modelFromMonitor builds Terraform state from an API response. prior is the
+// plan (create/update) or the previous state (read); it is only consulted where
+// the API's answer is semantically but not textually identical to what Terraform
+// planned — see tagsValue and monitorFromValue.
+func modelFromMonitor(ctx context.Context, mon *client.Monitor, prior monitorResourceModel) (monitorResourceModel, error) {
 	m := monitorResourceModel{
-		ID:                types.StringValue(mon.ID),
-		Name:              types.StringValue(mon.Name),
-		Slug:              types.StringValue(mon.Slug),
-		MonitorType:       types.StringValue(mon.MonitorType),
-		ScheduleKind:      types.StringValue(mon.ScheduleKind),
-		PeriodS:           types.Int64Value(mon.PeriodS),
-		CronExpr:          types.StringValue(mon.CronExpr),
-		TZ:                types.StringValue(mon.TZ),
-		GraceS:            types.Int64Value(mon.GraceS),
-		ProbeURL:          types.StringValue(mon.ProbeURL),
-		ProbeMethod:       types.StringValue(mon.ProbeMethod),
-		ProbeIntervalS:    types.Int64Value(mon.ProbeIntervalS),
-		ProbeExpectedBody: types.StringValue(mon.ProbeExpectedBody),
-		Paused:            types.BoolValue(mon.Paused),
-		Status:            types.StringValue(mon.Status),
-		PingURL:           types.StringValue(mon.PingURL),
-		CreatedAt:         types.StringValue(mon.CreatedAt),
+		ID:           types.StringValue(mon.ID),
+		Name:         types.StringValue(mon.Name),
+		Slug:         stringOrNull(mon.Slug),
+		MonitorType:  types.StringValue(mon.MonitorType),
+		ScheduleKind: types.StringValue(mon.ScheduleKind),
+		PeriodS:      types.Int64Value(mon.PeriodS),
+		CronExpr:     stringOrNull(mon.CronExpr),
+		TZ:           types.StringValue(mon.TZ),
+		GraceS:       types.Int64Value(mon.GraceS),
+		ProbeURL:     stringOrNull(mon.ProbeURL),
+		ProbeMethod:  types.StringValue(mon.ProbeMethod),
+
+		ProbeIntervalS:       int64OrNull(mon.ProbeIntervalS),
+		ProbeExpectedBody:    stringOrNull(mon.ProbeExpectedBody),
+		ProbeExpectedStatus:  types.Int64Value(mon.ProbeExpectedStatus),
+		ProbeTimeoutS:        types.Int64Value(mon.ProbeTimeoutS),
+		ProbeFollowRedirects: types.BoolValue(mon.ProbeFollowRedirects),
+
+		Paused:           types.BoolValue(mon.Paused),
+		Status:           types.StringValue(mon.Status),
+		PingURL:          types.StringValue(mon.PingURL),
+		CreatedAt:        types.StringValue(mon.CreatedAt),
+		LastPingAt:       timestampOrNull(mon.LastPingAt),
+		DueAt:            timestampOrNull(mon.DueAt),
+		AlertAfter:       timestampOrNull(mon.AlertAfter),
+		MaintenanceUntil: timestampOrNull(mon.MaintenanceUntil),
 	}
 	if mon.RunawayCeiling != nil {
 		m.RunawayCeiling = types.Int64Value(*mon.RunawayCeiling)
 	} else {
 		m.RunawayCeiling = types.Int64Null()
 	}
-	if mon.MonitorFrom != nil && *mon.MonitorFrom != "" {
-		m.MonitorFrom = types.StringValue(*mon.MonitorFrom)
-	} else {
-		m.MonitorFrom = types.StringNull()
-	}
-	tagsSet, diags := types.SetValueFrom(ctx, types.StringType, mon.Tags)
+	m.MonitorFrom = monitorFromValue(mon.MonitorFrom, prior.MonitorFrom)
+
+	tagsSet, diags := tagsValue(ctx, mon.Tags, prior.Tags)
 	if diags.HasError() {
 		return m, fmt.Errorf("build tags set: %v", diags)
 	}
@@ -354,7 +532,7 @@ func (r *monitorResource) Create(ctx context.Context, req resource.CreateRequest
 		out.Paused = true
 	}
 
-	state, err := modelFromMonitor(ctx, out)
+	state, err := modelFromMonitor(ctx, out, plan)
 	if err != nil {
 		resp.Diagnostics.AddError("Unable to process monitor response", err.Error())
 		return
@@ -380,12 +558,31 @@ func (r *monitorResource) Read(ctx context.Context, req resource.ReadRequest, re
 		return
 	}
 
-	newState, err := modelFromMonitor(ctx, out)
+	newState, err := modelFromMonitor(ctx, out, state)
 	if err != nil {
 		resp.Diagnostics.AddError("Unable to process monitor response", err.Error())
 		return
 	}
 	resp.Diagnostics.Append(resp.State.Set(ctx, &newState)...)
+}
+
+// monitorPatchNeeded reports whether any PATCH-able attribute actually differs
+// between the plan and the current state. `paused` is not one of them — it is
+// applied through the pause/resume endpoints — so a plan that only pauses a
+// monitor must not send a PATCH, which would needlessly rewrite the schedule
+// and reset the server-side deadlines.
+func monitorPatchNeeded(ctx context.Context, plan, state monitorResourceModel) (bool, error) {
+	planPayload, err := monitorFromModel(ctx, plan)
+	if err != nil {
+		return false, err
+	}
+	statePayload, err := monitorFromModel(ctx, state)
+	if err != nil {
+		return false, err
+	}
+	// monitorFromModel only populates request fields, so response-only state
+	// (status, deadlines, paused) cannot masquerade as a configuration change.
+	return !reflect.DeepEqual(planPayload, statePayload), nil
 }
 
 func (r *monitorResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
@@ -398,16 +595,30 @@ func (r *monitorResource) Update(ctx context.Context, req resource.UpdateRequest
 
 	id := state.ID.ValueString()
 
-	payload, err := monitorFromModel(ctx, plan)
+	planPayload, err := monitorFromModel(ctx, plan)
+	if err != nil {
+		resp.Diagnostics.AddError("Unable to build monitor payload", err.Error())
+		return
+	}
+	patchNeeded, err := monitorPatchNeeded(ctx, plan, state)
 	if err != nil {
 		resp.Diagnostics.AddError("Unable to build monitor payload", err.Error())
 		return
 	}
 
-	out, err := r.client.UpdateMonitor(ctx, id, payload)
-	if err != nil {
-		resp.Diagnostics.AddError("Unable to update monitor", err.Error())
-		return
+	var out *client.Monitor
+	if patchNeeded {
+		out, err = r.client.UpdateMonitor(ctx, id, planPayload)
+		if err != nil {
+			resp.Diagnostics.AddError("Unable to update monitor", err.Error())
+			return
+		}
+	} else {
+		out, err = r.client.GetMonitor(ctx, id)
+		if err != nil {
+			resp.Diagnostics.AddError("Unable to read monitor", err.Error())
+			return
+		}
 	}
 
 	// Update — paused maps onto the pause/resume endpoints, not a PATCH field.
@@ -419,7 +630,7 @@ func (r *monitorResource) Update(ctx context.Context, req resource.UpdateRequest
 		out.Paused = plan.Paused.ValueBool()
 	}
 
-	newState, err := modelFromMonitor(ctx, out)
+	newState, err := modelFromMonitor(ctx, out, plan)
 	if err != nil {
 		resp.Diagnostics.AddError("Unable to process monitor response", err.Error())
 		return
@@ -449,8 +660,16 @@ func (r *monitorResource) ImportState(ctx context.Context, req resource.ImportSt
 	id := req.ID
 
 	m, err := r.client.GetMonitorBySlug(ctx, id)
-	if err == nil {
+	switch {
+	case err == nil:
 		resource.ImportStatePassthroughID(ctx, path.Root("id"), resource.ImportStateRequest{ID: m.ID}, resp)
+		return
+	case !client.IsNotFound(err):
+		// The lookup itself failed (network, 5xx, bad credentials). Reporting
+		// that as "no such monitor" would send the operator hunting for a
+		// missing resource instead of a broken backend.
+		resp.Diagnostics.AddError("Unable to look up monitor for import",
+			fmt.Sprintf("Listing monitors to resolve %q failed: %s", id, err))
 		return
 	}
 
@@ -460,5 +679,5 @@ func (r *monitorResource) ImportState(ctx context.Context, req resource.ImportSt
 	}
 
 	resp.Diagnostics.AddError("Unable to import monitor",
-		fmt.Sprintf("No monitor found with slug or ID %q: %s", id, err))
+		fmt.Sprintf("No monitor found with slug or ID %q in this project.", id))
 }
