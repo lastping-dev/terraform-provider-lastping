@@ -420,6 +420,41 @@ resource "lastping_destination" "bad" {
 	})
 }
 
+// TestAccDestination_invalidEmailAddress: the API parses the address with
+// net/mail.ParseAddress, so a typo is otherwise a 400 partway through an apply.
+// The point of this test is the `PlanOnly` — the error has to land before
+// anything is created.
+func TestAccDestination_invalidEmailAddress(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "lastping_destination" "bad_email" {
+  kind    = "email"
+  name    = "acc-bad-email"
+  address = "ops-at-example.com"
+}`,
+				PlanOnly:    true,
+				ExpectError: regexp.MustCompile(`(?s)Invalid email address`),
+			},
+			{
+				// A list is a single address as far as the API is concerned, and
+				// only the first would ever be delivered to.
+				Config: `
+resource "lastping_destination" "bad_email" {
+  kind    = "email"
+  name    = "acc-bad-email"
+  address = "a@example.com, b@example.com"
+}`,
+				PlanOnly:    true,
+				ExpectError: regexp.MustCompile(`(?s)Invalid email address`),
+			},
+		},
+	})
+}
+
 // TestAccDestination_wrongKindAttribute: an attribute belonging to a different
 // kind is silently dropped by the API, which would leave a configuration that
 // looks correct and delivers nowhere.

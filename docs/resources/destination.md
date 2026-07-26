@@ -122,7 +122,7 @@ variable "pushover_user_key" {
 
 ### Optional
 
-- `address` (String) Recipient email address. Required for `kind = "email"`. Changing it clears `verified` and sends a fresh confirmation email to the new address.
+- `address` (String) Recipient email address, validated at plan time against the same parser the API uses. Required for `kind = "email"`. Changing it clears `verified` and sends a fresh confirmation email to the new address.
 - `bot_token` (String, Sensitive) Telegram bot token. Required for `kind = "telegram"`. Write-only: never returned by the API.
 - `chat_id` (String) Telegram chat ID to post into. Required for `kind = "telegram"`.
 - `secret` (String, Sensitive) Shared secret used to sign webhook deliveries. Required for `kind = "webhook"`. Write-only: never returned by the API.

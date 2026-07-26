@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"net/mail"
 	"strings"
 
 	"github.com/google/uuid"
@@ -162,6 +163,38 @@ func (v *kindRequiresValidator) ValidateResource(ctx context.Context, req resour
 	}
 }
 
+// emailAddressValidator rejects an address the API would reject. It mirrors the
+// server exactly — api/channels.go: validateChannelConfig runs the same
+// net/mail.ParseAddress — so this can only move an error earlier, never invent
+// one. Without it a typo'd address is an opaque 400 partway through an apply,
+// which is the one thing this resource's plan-time validation exists to avoid.
+type emailAddressValidator struct{}
+
+var _ validator.String = emailAddressValidator{}
+
+func (emailAddressValidator) Description(context.Context) string {
+	return "must be a valid RFC 5322 email address"
+}
+
+func (v emailAddressValidator) MarkdownDescription(ctx context.Context) string {
+	return v.Description(ctx)
+}
+
+func (emailAddressValidator) ValidateString(_ context.Context, req validator.StringRequest, resp *validator.StringResponse) {
+	// An empty or absent address is the required-attribute check's business
+	// (kindRequiresValidator); reporting it twice would be noise.
+	if req.ConfigValue.IsNull() || req.ConfigValue.IsUnknown() || req.ConfigValue.ValueString() == "" {
+		return
+	}
+	if _, err := mail.ParseAddress(req.ConfigValue.ValueString()); err != nil {
+		resp.Diagnostics.AddAttributeError(req.Path,
+			"Invalid email address",
+			fmt.Sprintf("%q is not a valid email address, and the API would reject it: %s.\n\n"+
+				"Use a single address such as \"ops@example.com\".",
+				req.ConfigValue.ValueString(), err))
+	}
+}
+
 // NewDestinationResource returns a new lastping_destination resource.
 func NewDestinationResource() resource.Resource {
 	return &destinationResource{}
@@ -282,9 +315,11 @@ func (r *destinationResource) Schema(_ context.Context, _ resource.SchemaRequest
 					"Write-only: never returned by the API.",
 			},
 			"address": schema.StringAttribute{
-				Optional: true,
-				MarkdownDescription: "Recipient email address. Required for `kind = \"email\"`. Changing it " +
-					"clears `verified` and sends a fresh confirmation email to the new address.",
+				Optional:   true,
+				Validators: []validator.String{emailAddressValidator{}},
+				MarkdownDescription: "Recipient email address, validated at plan time against the same " +
+					"parser the API uses. Required for `kind = \"email\"`. Changing it clears `verified` " +
+					"and sends a fresh confirmation email to the new address.",
 			},
 
 			"target": schema.StringAttribute{
