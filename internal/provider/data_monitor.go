@@ -174,9 +174,19 @@ func monitorDataAttributes() map[string]schema.Attribute {
 }
 
 // monitorDataFromAPI maps an API monitor onto the data-source model. It uses
-// the same empty-to-null conventions as lastping_monitor, so
-// `data.lastping_monitor.x.cron_expr` and `lastping_monitor.x.cron_expr` are
-// comparable values rather than "" versus null.
+// the same per-attribute empty/zero-to-null conventions as
+// lastping_monitor's modelFromMonitor, attribute by attribute, so
+// `data.lastping_monitor.x.<attr>` and `lastping_monitor.x.<attr>` are
+// comparable values rather than "" or 0 versus null.
+//
+// That parity is deliberate, not automatic: period_s, grace_s,
+// probe_timeout_s and probe_expected_status are never null on either side —
+// the API always reports a concrete number for them (0 is a real answer, e.g.
+// period_s on a cron monitor), so both surfaces report it as 0, not null.
+// probe_interval_s and runaway_ceiling are the opposite: both surfaces map an
+// absent value (0, or a nil pointer) to null, because 0 is not a value either
+// can take on legitimately. data_monitor_test.go pairs every one of these
+// attributes against the resource to keep it that way.
 func monitorDataFromAPI(ctx context.Context, m *client.Monitor) (monitorDataModel, diag.Diagnostics) {
 	tags, diags := types.SetValueFrom(ctx, types.StringType, m.Tags)
 	if m.Tags == nil {
@@ -191,18 +201,18 @@ func monitorDataFromAPI(ctx context.Context, m *client.Monitor) (monitorDataMode
 		Slug:                 stringOrNull(m.Slug),
 		MonitorType:          stringOrNull(m.MonitorType),
 		ScheduleKind:         stringOrNull(m.ScheduleKind),
-		PeriodS:              int64OrNull(m.PeriodS),
+		PeriodS:              types.Int64Value(m.PeriodS),
 		CronExpr:             stringOrNull(m.CronExpr),
 		TZ:                   stringOrNull(m.TZ),
-		GraceS:               int64OrNull(m.GraceS),
+		GraceS:               types.Int64Value(m.GraceS),
 		Tags:                 tags,
 		MonitorFrom:          timestampOrNull(m.MonitorFrom),
 		ProbeURL:             stringOrNull(m.ProbeURL),
 		ProbeMethod:          stringOrNull(m.ProbeMethod),
 		ProbeIntervalS:       int64OrNull(m.ProbeIntervalS),
 		ProbeExpectedBody:    stringOrNull(m.ProbeExpectedBody),
-		ProbeExpectedStatus:  int64OrNull(m.ProbeExpectedStatus),
-		ProbeTimeoutS:        int64OrNull(m.ProbeTimeoutS),
+		ProbeExpectedStatus:  types.Int64Value(m.ProbeExpectedStatus),
+		ProbeTimeoutS:        types.Int64Value(m.ProbeTimeoutS),
 		ProbeFollowRedirects: types.BoolValue(m.ProbeFollowRedirects),
 		Paused:               types.BoolValue(m.Paused),
 		PingURL:              stringOrNull(m.PingURL),

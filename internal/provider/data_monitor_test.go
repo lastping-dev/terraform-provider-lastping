@@ -59,6 +59,18 @@ data "lastping_monitor" "by_slug" {
 						"data.lastping_monitor.by_slug", "tz", "lastping_monitor.src", "tz"),
 					resource.TestCheckResourceAttrPair(
 						"data.lastping_monitor.by_slug", "grace_s", "lastping_monitor.src", "grace_s"),
+					// period_s, probe_timeout_s and probe_expected_status are all
+					// inapplicable to this cron monitor, so the API reports 0 for
+					// each. Pairing them here pins down that both surfaces read
+					// back that same concrete 0 rather than one reporting null —
+					// see the int64OrNull-vs-Int64Value split in
+					// monitorDataFromAPI / modelFromMonitor.
+					resource.TestCheckResourceAttrPair(
+						"data.lastping_monitor.by_slug", "period_s", "lastping_monitor.src", "period_s"),
+					resource.TestCheckResourceAttrPair(
+						"data.lastping_monitor.by_slug", "probe_timeout_s", "lastping_monitor.src", "probe_timeout_s"),
+					resource.TestCheckResourceAttrPair(
+						"data.lastping_monitor.by_slug", "probe_expected_status", "lastping_monitor.src", "probe_expected_status"),
 					resource.TestCheckResourceAttrPair(
 						"data.lastping_monitor.by_slug", "runaway_ceiling", "lastping_monitor.src", "runaway_ceiling"),
 					resource.TestCheckResourceAttrPair(
