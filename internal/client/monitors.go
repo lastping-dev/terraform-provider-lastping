@@ -6,30 +6,39 @@ import (
 	"net/http"
 )
 
-// Monitor mirrors the Check schema in the LastPing OpenAPI spec.
+// Monitor mirrors the Check schema in the LastPing OpenAPI spec. The same
+// struct is used for requests and responses; `omitempty` keeps unset fields out
+// of the payload, which the API reads as "not supplied".
 type Monitor struct {
-	ID                string   `json:"id,omitempty"`
-	Name              string   `json:"name"`
-	Slug              string   `json:"slug,omitempty"`
-	MonitorType       string   `json:"monitor_type,omitempty"`
-	ScheduleKind      string   `json:"schedule_kind,omitempty"`
-	PeriodS           int64    `json:"period_s,omitempty"`
-	CronExpr          string   `json:"cron_expr,omitempty"`
-	TZ                string   `json:"tz,omitempty"`
-	GraceS            int64    `json:"grace_s,omitempty"`
-	Tags              []string `json:"tags,omitempty"`
-	RunawayCeiling    *int64   `json:"runaway_ceiling,omitempty"`
-	MonitorFrom       *string  `json:"monitor_from,omitempty"`
-	ProbeURL          string   `json:"probe_url,omitempty"`
-	ProbeMethod       string   `json:"probe_method,omitempty"`
-	ProbeIntervalS    int64    `json:"probe_interval_s,omitempty"`
-	ProbeExpectedBody string   `json:"probe_expected_body,omitempty"`
+	ID                   string   `json:"id,omitempty"`
+	Name                 string   `json:"name"`
+	Slug                 string   `json:"slug,omitempty"`
+	MonitorType          string   `json:"monitor_type,omitempty"`
+	ScheduleKind         string   `json:"schedule_kind,omitempty"`
+	PeriodS              int64    `json:"period_s,omitempty"`
+	CronExpr             string   `json:"cron_expr,omitempty"`
+	TZ                   string   `json:"tz,omitempty"`
+	GraceS               int64    `json:"grace_s,omitempty"`
+	Tags                 []string `json:"tags,omitempty"`
+	RunawayCeiling       *int64   `json:"runaway_ceiling,omitempty"`
+	MonitorFrom          *string  `json:"monitor_from,omitempty"`
+	ProbeURL             string   `json:"probe_url,omitempty"`
+	ProbeMethod          string   `json:"probe_method,omitempty"`
+	ProbeIntervalS       int64    `json:"probe_interval_s,omitempty"`
+	ProbeExpectedBody    string   `json:"probe_expected_body,omitempty"`
+	ProbeExpectedStatus  int64    `json:"probe_expected_status,omitempty"`
+	ProbeTimeoutS        int64    `json:"probe_timeout_s,omitempty"`
+	ProbeFollowRedirects bool     `json:"probe_follow_redirects,omitempty"`
 
 	// Computed.
-	Paused    bool   `json:"paused,omitempty"`
-	Status    string `json:"status,omitempty"`
-	PingURL   string `json:"ping_url,omitempty"`
-	CreatedAt string `json:"created_at,omitempty"`
+	Paused           bool    `json:"paused,omitempty"`
+	Status           string  `json:"status,omitempty"`
+	PingURL          string  `json:"ping_url,omitempty"`
+	CreatedAt        string  `json:"created_at,omitempty"`
+	LastPingAt       *string `json:"last_ping_at,omitempty"`
+	DueAt            *string `json:"due_at,omitempty"`
+	AlertAfter       *string `json:"alert_after,omitempty"`
+	MaintenanceUntil *string `json:"maintenance_until,omitempty"`
 }
 
 // CreateMonitor creates a monitor with create-only semantics: If-None-Match: *
