@@ -103,6 +103,7 @@ func (p *lastpingProvider) Resources(context.Context) []func() resource.Resource
 		NewRouteResource,
 		NewAlertTemplateResource,
 		NewStatusPageResource,
+		NewAPIKeyResource,
 	}
 }
 
@@ -111,5 +112,7 @@ func (p *lastpingProvider) DataSources(context.Context) []func() datasource.Data
 }
 
 func (p *lastpingProvider) EphemeralResources(context.Context) []func() ephemeral.EphemeralResource {
-	return []func() ephemeral.EphemeralResource{}
+	return []func() ephemeral.EphemeralResource{
+		NewAPIKeyEphemeralResource,
+	}
 }
