@@ -56,11 +56,22 @@ resource "lastping_destination" "phone" {
   chat_id   = "-1001234567890"
 }
 
-# ntfy needs no credential at all — the topic URL is the address.
+# A public ntfy.sh topic needs no credential at all — the topic URL is the
+# address.
 resource "lastping_destination" "ntfy" {
   kind      = "ntfy"
   name      = "ntfy alerts"
   topic_url = "https://ntfy.sh/my-lastping-alerts"
+}
+
+# A protected topic or a self-hosted ntfy server takes a bearer token as well,
+# sent as `Authorization: Bearer`. It is write-only like every other credential
+# here, so feed it in from a variable.
+resource "lastping_destination" "ntfy_private" {
+  kind      = "ntfy"
+  name      = "ntfy alerts (self-hosted)"
+  topic_url = "https://ntfy.internal.example.com/lastping"
+  token     = var.ntfy_token
 }
 
 resource "lastping_destination" "pushover" {
@@ -81,6 +92,11 @@ variable "webhook_signing_secret" {
 }
 
 variable "telegram_bot_token" {
+  type      = string
+  sensitive = true
+}
+
+variable "ntfy_token" {
   type      = string
   sensitive = true
 }
@@ -110,8 +126,8 @@ variable "pushover_user_key" {
 - `bot_token` (String, Sensitive) Telegram bot token. Required for `kind = "telegram"`. Write-only: never returned by the API.
 - `chat_id` (String) Telegram chat ID to post into. Required for `kind = "telegram"`.
 - `secret` (String, Sensitive) Shared secret used to sign webhook deliveries. Required for `kind = "webhook"`. Write-only: never returned by the API.
-- `token` (String, Sensitive) Pushover application token. Required for `kind = "pushover"`. Write-only: never returned by the API.
-- `topic_url` (String) Full ntfy topic URL, for example `https://ntfy.sh/my-alerts`. Required for `kind = "ntfy"`.
+- `token` (String, Sensitive) Bearer token. Required for `kind = "pushover"` (the Pushover application token) and optional for `kind = "ntfy"`, where it is sent as `Authorization: Bearer` — set it for a protected topic or a self-hosted server, and leave it unset for a public ntfy.sh topic. Write-only: never returned by the API.
+- `topic_url` (String) Full ntfy topic URL, for example `https://ntfy.sh/my-alerts` or `https://ntfy.internal.example.com/my-alerts`. Required for `kind = "ntfy"`; pair it with `token` for a protected topic.
 - `url` (String) Endpoint LastPing POSTs to. Required for `kind = "webhook"`.
 - `user_key` (String, Sensitive) Pushover user or group key. Required for `kind = "pushover"`. Write-only: never returned by the API.
 - `webhook_url` (String, Sensitive) Incoming-webhook URL. Required for `kind` `discord`, `slack`, `msteams`, and `googlechat`. Write-only: the URL is itself the credential, so the API never returns it.

@@ -261,6 +261,90 @@ resource "lastping_destination" "ntfy" {
 	})
 }
 
+// TestAccDestination_ntfyToken covers the optional ntfy bearer token, which is
+// what authenticated and self-hosted ntfy servers require. Two things are being
+// pinned. First, the token must be accepted at all: `token` is pushover's
+// required attribute, so a validator that keys purely off the attribute name
+// would reject it here as belonging to another kind. Second — the reason this
+// test changes topic_url — the API replaces `config` wholesale on PATCH, so an
+// update that rebuilds the payload without the token silently wipes a
+// credential the API will never hand back.
+func TestAccDestination_ntfyToken(t *testing.T) {
+	const token = "tk_acc_ntfy_token"
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: fmt.Sprintf(`
+resource "lastping_destination" "auth_ntfy" {
+  kind      = "ntfy"
+  name      = "acc-ntfy-auth"
+  topic_url = "https://ntfy.example.com/acc-private"
+  token     = %q
+}`, token),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("lastping_destination.auth_ntfy", "token", token),
+					resource.TestCheckResourceAttr("lastping_destination.auth_ntfy", "topic_url",
+						"https://ntfy.example.com/acc-private"),
+					resource.TestCheckResourceAttr("lastping_destination.auth_ntfy", "target",
+						"https://ntfy.example.com/acc-private"),
+					resource.TestCheckResourceAttr("lastping_destination.auth_ntfy", "verified", "true"),
+				),
+			},
+			{
+				// The API never returns config, so a refresh must not null the
+				// token out; and the following plan must be empty.
+				RefreshState: true,
+				Check:        resource.TestCheckResourceAttr("lastping_destination.auth_ntfy", "token", token),
+			},
+			{
+				Config: fmt.Sprintf(`
+resource "lastping_destination" "auth_ntfy" {
+  kind      = "ntfy"
+  name      = "acc-ntfy-auth"
+  topic_url = "https://ntfy.example.com/acc-private"
+  token     = %q
+}`, token),
+				PlanOnly: true,
+			},
+			{
+				// Change only topic_url. The token is not in this diff, and the
+				// server-side config replace would drop it unless Update resends
+				// it — so its survival here is the assertion.
+				Config: fmt.Sprintf(`
+resource "lastping_destination" "auth_ntfy" {
+  kind      = "ntfy"
+  name      = "acc-ntfy-auth"
+  topic_url = "https://ntfy.example.com/acc-moved"
+  token     = %q
+}`, token),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("lastping_destination.auth_ntfy",
+							plancheck.ResourceActionUpdate),
+					},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("lastping_destination.auth_ntfy", "topic_url",
+						"https://ntfy.example.com/acc-moved"),
+					resource.TestCheckResourceAttr("lastping_destination.auth_ntfy", "target",
+						"https://ntfy.example.com/acc-moved"),
+					resource.TestCheckResourceAttr("lastping_destination.auth_ntfy", "token", token),
+				),
+			},
+			{
+				// The token is a credential, so import cannot recover it.
+				ResourceName:            "lastping_destination.auth_ntfy",
+				ImportState:             true,
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"token"},
+			},
+		},
+	})
+}
+
 // TestAccDestination_telegram covers the kind whose target is a rendered string
 // ("chat <id>") rather than the raw attribute, so chat_id has to be recovered
 // from it without disturbing the write-only bot_token.

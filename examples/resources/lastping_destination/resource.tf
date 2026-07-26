@@ -38,11 +38,22 @@ resource "lastping_destination" "phone" {
   chat_id   = "-1001234567890"
 }
 
-# ntfy needs no credential at all — the topic URL is the address.
+# A public ntfy.sh topic needs no credential at all — the topic URL is the
+# address.
 resource "lastping_destination" "ntfy" {
   kind      = "ntfy"
   name      = "ntfy alerts"
   topic_url = "https://ntfy.sh/my-lastping-alerts"
+}
+
+# A protected topic or a self-hosted ntfy server takes a bearer token as well,
+# sent as `Authorization: Bearer`. It is write-only like every other credential
+# here, so feed it in from a variable.
+resource "lastping_destination" "ntfy_private" {
+  kind      = "ntfy"
+  name      = "ntfy alerts (self-hosted)"
+  topic_url = "https://ntfy.internal.example.com/lastping"
+  token     = var.ntfy_token
 }
 
 resource "lastping_destination" "pushover" {
@@ -63,6 +74,11 @@ variable "webhook_signing_secret" {
 }
 
 variable "telegram_bot_token" {
+  type      = string
+  sensitive = true
+}
+
+variable "ntfy_token" {
   type      = string
   sensitive = true
 }

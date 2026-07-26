@@ -33,10 +33,9 @@ var destinationKinds = []string{
 	"webhook", "telegram", "discord", "slack", "msteams", "googlechat", "ntfy", "pushover", "email",
 }
 
-// destinationKindAttrs maps each kind onto the configuration attributes that
-// make up its `config` payload. Every attribute is required by the API for its
-// kind (api/channels.go: validateChannelConfig), and no attribute outside a
-// kind's list is meaningful for it.
+// destinationKindAttrs maps each kind onto the configuration attributes the API
+// *requires* for it (api/channels.go: validateChannelConfig). Anything outside a
+// kind's required-plus-optional lists is not meaningful for it.
 var destinationKindAttrs = map[string][]string{
 	"webhook":    {"url", "secret"},
 	"telegram":   {"bot_token", "chat_id"},
@@ -49,16 +48,34 @@ var destinationKindAttrs = map[string][]string{
 	"email":      {"address"},
 }
 
-// allDestinationConfigAttrs is the union of every kind's attributes, used to
-// reject attributes that belong to a different kind than the one configured.
+// destinationKindOptionalAttrs maps a kind onto config attributes it accepts but
+// does not require. These have to be tracked separately from the required set:
+// they must be allowed through the foreign-attribute check without being
+// demanded, and they must be included in the `config` payload when set, because
+// the API replaces config wholesale (api/channels.go: handleUpdateChannel) and
+// an omitted credential is a wiped credential.
+//
+// `token` is the one member so far — ntfy sends it as `Authorization: Bearer`
+// (internal/channels/ntfy.go), which is what authenticated and self-hosted ntfy
+// servers need. Note it is simultaneously a *required* attribute of pushover;
+// that is exactly why validation keys off `kind` rather than attribute name.
+var destinationKindOptionalAttrs = map[string][]string{
+	"ntfy": {"token"},
+}
+
+// allDestinationConfigAttrs is the union of every kind's attributes, required
+// and optional, used to reject attributes that belong to a different kind than
+// the one configured.
 var allDestinationConfigAttrs = func() []string {
 	seen := map[string]bool{}
 	var out []string
 	for _, kind := range destinationKinds {
-		for _, a := range destinationKindAttrs[kind] {
-			if !seen[a] {
-				seen[a] = true
-				out = append(out, a)
+		for _, group := range [][]string{destinationKindAttrs[kind], destinationKindOptionalAttrs[kind]} {
+			for _, a := range group {
+				if !seen[a] {
+					seen[a] = true
+					out = append(out, a)
+				}
 			}
 		}
 	}
@@ -73,11 +90,15 @@ var allDestinationConfigAttrs = func() []string {
 type kindRequiresValidator struct {
 	kind     string
 	required []string
+	optional []string
 }
 
 func (v *kindRequiresValidator) Description(context.Context) string {
-	return fmt.Sprintf("kind=%s requires %s and no attributes belonging to other kinds",
-		v.kind, strings.Join(v.required, ", "))
+	s := fmt.Sprintf("kind=%s requires %s", v.kind, strings.Join(v.required, ", "))
+	if len(v.optional) > 0 {
+		s += fmt.Sprintf(", optionally accepts %s", strings.Join(v.optional, ", "))
+	}
+	return s + " and no attributes belonging to other kinds"
 }
 
 func (v *kindRequiresValidator) MarkdownDescription(ctx context.Context) string {
@@ -97,6 +118,10 @@ func (v *kindRequiresValidator) ValidateResource(ctx context.Context, req resour
 	}
 
 	allowed := map[string]bool{}
+	// Optional attributes are allowed but never demanded.
+	for _, attr := range v.optional {
+		allowed[attr] = true
+	}
 	for _, attr := range v.required {
 		allowed[attr] = true
 
@@ -238,14 +263,17 @@ func (r *destinationResource) Schema(_ context.Context, _ resource.SchemaRequest
 			},
 			"topic_url": schema.StringAttribute{
 				Optional: true,
-				MarkdownDescription: "Full ntfy topic URL, for example `https://ntfy.sh/my-alerts`. " +
-					"Required for `kind = \"ntfy\"`.",
+				MarkdownDescription: "Full ntfy topic URL, for example `https://ntfy.sh/my-alerts` or " +
+					"`https://ntfy.internal.example.com/my-alerts`. Required for `kind = \"ntfy\"`; pair it " +
+					"with `token` for a protected topic.",
 			},
 			"token": schema.StringAttribute{
 				Optional:  true,
 				Sensitive: true,
-				MarkdownDescription: "Pushover application token. Required for `kind = \"pushover\"`. " +
-					"Write-only: never returned by the API.",
+				MarkdownDescription: "Bearer token. Required for `kind = \"pushover\"` (the Pushover " +
+					"application token) and optional for `kind = \"ntfy\"`, where it is sent as " +
+					"`Authorization: Bearer` — set it for a protected topic or a self-hosted server, " +
+					"and leave it unset for a public ntfy.sh topic. Write-only: never returned by the API.",
 			},
 			"user_key": schema.StringAttribute{
 				Optional:  true,
@@ -293,7 +321,11 @@ func (r *destinationResource) Schema(_ context.Context, _ resource.SchemaRequest
 func (r *destinationResource) ConfigValidators(context.Context) []resource.ConfigValidator {
 	out := make([]resource.ConfigValidator, 0, len(destinationKinds))
 	for _, kind := range destinationKinds {
-		out = append(out, &kindRequiresValidator{kind: kind, required: destinationKindAttrs[kind]})
+		out = append(out, &kindRequiresValidator{
+			kind:     kind,
+			required: destinationKindAttrs[kind],
+			optional: destinationKindOptionalAttrs[kind],
+		})
 	}
 	return out
 }
@@ -314,6 +346,13 @@ func (r *destinationResource) Configure(_ context.Context, req resource.Configur
 // destinationConfig builds the API `config` object for the configured kind.
 // Attributes belonging to other kinds are ignored — ConfigValidators has
 // already rejected them.
+//
+// Required attributes are always sent, even when empty, because the API
+// re-validates the whole object and an empty value is a better error than a
+// missing key. An unset optional attribute is omitted entirely, so a tokenless
+// ntfy destination produces exactly the payload it always did; a *set* one is
+// always sent, because PATCH replaces config wholesale and omitting it would
+// wipe a credential the API never returns.
 func destinationConfig(m destinationResourceModel) map[string]string {
 	values := map[string]types.String{
 		"url":         m.URL,
@@ -326,9 +365,15 @@ func destinationConfig(m destinationResourceModel) map[string]string {
 		"user_key":    m.UserKey,
 		"address":     m.Address,
 	}
+	kind := m.Kind.ValueString()
 	cfg := map[string]string{}
-	for _, attr := range destinationKindAttrs[m.Kind.ValueString()] {
+	for _, attr := range destinationKindAttrs[kind] {
 		cfg[attr] = values[attr].ValueString()
+	}
+	for _, attr := range destinationKindOptionalAttrs[kind] {
+		if v := values[attr]; !v.IsNull() && !v.IsUnknown() && v.ValueString() != "" {
+			cfg[attr] = v.ValueString()
+		}
 	}
 	return cfg
 }
