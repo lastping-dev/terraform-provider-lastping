@@ -413,6 +413,28 @@ func destinationConfig(m destinationResourceModel) map[string]string {
 	return cfg
 }
 
+// destinationConfigPatch returns the `config` object to send with an update, or
+// nil to leave the stored config alone.
+//
+// The API replaces config wholesale, so this is all-or-nothing: either every
+// attribute for the kind goes, credentials included, or none does. Skipping an
+// unchanged config keeps a rename a rename — no needless rewrite of write-only
+// credentials over the wire on an update that has nothing to do with them, and
+// no re-validation of a config the operator did not touch.
+//
+// It is NOT what protects an email destination's verification, despite being an
+// easy thing to assume. The server compares the old and new addresses before it
+// touches verification (api/channels.go: handleUpdateChannel), so resending an
+// identical config would preserve `verified` just the same. Only a genuine
+// address change resets it, which is exactly what an operator would expect.
+func destinationConfigPatch(plan, state destinationResourceModel) map[string]string {
+	planCfg, stateCfg := destinationConfig(plan), destinationConfig(state)
+	if maps.Equal(planCfg, stateCfg) {
+		return nil
+	}
+	return planCfg
+}
+
 // modelFromDestination builds Terraform state from an API response.
 //
 // SECURITY / CORRECTNESS: the API never returns `config`, so the credential
@@ -507,16 +529,8 @@ func (r *destinationResource) Update(ctx context.Context, req resource.UpdateReq
 		name = &v
 	}
 
-	// The API replaces config wholesale, and for an email destination a changed
-	// address resets verification. Send config only when it actually changed, so
-	// a pure rename stays a rename.
-	var config map[string]string
-	planCfg, stateCfg := destinationConfig(plan), destinationConfig(state)
-	if !maps.Equal(planCfg, stateCfg) {
-		config = planCfg
-	}
-
-	out, err := r.client.UpdateDestination(ctx, state.ID.ValueString(), name, config)
+	out, err := r.client.UpdateDestination(ctx, state.ID.ValueString(), name,
+		destinationConfigPatch(plan, state))
 	if err != nil {
 		resp.Diagnostics.AddError("Unable to update destination", err.Error())
 		return

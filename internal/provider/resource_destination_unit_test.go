@@ -95,6 +95,76 @@ func TestDestinationConfigOmitsUnsetNtfyToken(t *testing.T) {
 	require.Equal(t, map[string]string{"topic_url": "https://ntfy.sh/alerts"}, cfg)
 }
 
+// TestDestinationConfigPatchSkipsUnchangedConfig covers the one branch that had
+// no test at all: a rename must not drag the whole `config` object along with
+// it. The acceptance rename test could not catch this — it holds the address
+// constant, so an always-send-config Update would produce the same observable
+// result.
+//
+// Note what this does NOT claim. Resending an identical config would not reset
+// `verified` either: the server compares the old and new addresses before
+// touching verification (api/channels.go: handleUpdateChannel), so it is the
+// server, not this skip, that makes a rename safe for an email destination.
+// What the skip buys is a rename that stays a rename — no needless rewrite of
+// write-only credentials over the wire on an update that has nothing to do with
+// them, and no re-validation of a config the operator did not touch.
+func TestDestinationConfigPatchSkipsUnchangedConfig(t *testing.T) {
+	email := func(name, address string) destinationResourceModel {
+		return destinationResourceModel{
+			Kind:    types.StringValue("email"),
+			Name:    types.StringValue(name),
+			Address: types.StringValue(address),
+		}
+	}
+
+	t.Run("pure rename sends no config", func(t *testing.T) {
+		require.Nil(t, destinationConfigPatch(
+			email("renamed", "ops@example.com"),
+			email("original", "ops@example.com"),
+		), "a rename must not resend config")
+	})
+
+	t.Run("changed address sends config", func(t *testing.T) {
+		require.Equal(t, map[string]string{"address": "new@example.com"}, destinationConfigPatch(
+			email("same", "new@example.com"),
+			email("same", "old@example.com"),
+		))
+	})
+
+	t.Run("rotated credential sends config", func(t *testing.T) {
+		slack := func(hook string) destinationResourceModel {
+			return destinationResourceModel{
+				Kind:       types.StringValue("slack"),
+				Name:       types.StringValue("oncall"),
+				WebhookURL: types.StringValue(hook),
+			}
+		}
+		require.Equal(t, map[string]string{"webhook_url": "https://hooks.slack.com/new"},
+			destinationConfigPatch(slack("https://hooks.slack.com/new"), slack("https://hooks.slack.com/old")))
+	})
+
+	t.Run("newly set ntfy token sends config", func(t *testing.T) {
+		ntfy := func(token types.String) destinationResourceModel {
+			return destinationResourceModel{
+				Kind:     types.StringValue("ntfy"),
+				Name:     types.StringValue("alerts"),
+				TopicURL: types.StringValue("https://ntfy.example.com/a"),
+				Token:    token,
+			}
+		}
+		// Adding a token to an existing tokenless destination is a config
+		// change even though topic_url is untouched.
+		require.Equal(t, map[string]string{
+			"topic_url": "https://ntfy.example.com/a",
+			"token":     "tk",
+		}, destinationConfigPatch(ntfy(types.StringValue("tk")), ntfy(types.StringNull())))
+
+		// And an unchanged token is not a reason to rewrite anything.
+		require.Nil(t, destinationConfigPatch(
+			ntfy(types.StringValue("tk")), ntfy(types.StringValue("tk"))))
+	})
+}
+
 // TestDestinationRequiredAttrsExcludeOptional: `token` is required for pushover
 // but merely optional for ntfy, so it must not be added to ntfy's required set —
 // otherwise every existing tokenless ntfy configuration fails to validate.
