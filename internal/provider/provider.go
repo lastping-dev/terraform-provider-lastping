@@ -97,7 +97,9 @@ func (p *lastpingProvider) Configure(ctx context.Context, req provider.Configure
 }
 
 func (p *lastpingProvider) Resources(context.Context) []func() resource.Resource {
-	return []func() resource.Resource{}
+	return []func() resource.Resource{
+		NewMonitorResource,
+	}
 }
 
 func (p *lastpingProvider) DataSources(context.Context) []func() datasource.DataSource {

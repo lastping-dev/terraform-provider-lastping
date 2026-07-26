@@ -11,9 +11,6 @@ import (
 )
 
 // testAccProtoV6ProviderFactories is used by every acceptance test in this package.
-// It is unused until later tasks add resource/data-source acceptance tests.
-//
-//nolint:unused // consumed by acceptance tests added in subsequent tasks
 var testAccProtoV6ProviderFactories = map[string]func() (tfprotov6.ProviderServer, error){
 	"lastping": providerserver.NewProtocol6WithError(New("test")()),
 }
