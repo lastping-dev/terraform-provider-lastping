@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/mapvalidator"
@@ -101,6 +102,16 @@ func (r *alertTemplateResource) Schema(_ context.Context, _ resource.SchemaReque
 			"make them clobber each other on every apply — the last one applied would win and the others would " +
 			"show a permanent diff. Destroying the resource clears every template and returns the monitor to the " +
 			"default wording; it does not delete the monitor.\n\n" +
+			"~> **Terraform will not adopt templates it did not create.** Because one write replaces the whole " +
+			"set, creating this resource on a monitor whose templates were set through the dashboard or over " +
+			"MCP would overwrite or clear them — silently, with the next incident as the discovery channel. So " +
+			"`Create` reads the monitor's current templates first and refuses when any stored, non-empty body " +
+			"differs from the configured one or is missing from it. Run `terraform import " +
+			"lastping_alert_template.<name> <monitor_id>` to take over the existing templates instead, or " +
+			"remove the conflicting keys. A monitor with no templates, or one already holding exactly what is " +
+			"configured, is not a conflict and applies normally, so re-creating the resource after losing state " +
+			"still works. The check is a read followed by a write and is not atomic: a template set by another " +
+			"writer inside that window is still overwritten.\n\n" +
 			"A body is plain text with `{token}` placeholders. The tokens are `{check_name}`, `{status}`, " +
 			"`{event}`, `{cause}`, `{last_ping}`, `{schedule}`, `{incident_url}`, `{run_url}`, `{branch}`, " +
 			"`{commit}`, `{actor}`, `{failing_stage}`, `{duration}`, `{latency}`, `{status_code}` and `{url}`; " +
@@ -190,6 +201,36 @@ func replacementPayload(desired, current map[string]string) map[string]string {
 	return out
 }
 
+// alertTemplateConflicts returns, sorted, the keys whose stored bodies writing
+// desired would destroy.
+//
+// Only a *meaningful* clobber counts. A key the monitor does not have, one
+// stored empty, and one whose body already matches the configuration exactly
+// are all fine — the first two lose nothing and the third makes the write a
+// no-op — so re-creating a template set after losing state still works. A key
+// the server holds and the configuration omits is a conflict too:
+// replacementPayload sends it as an explicit delete, so the apply would clear
+// it just as surely as a differing body would overwrite it.
+func alertTemplateConflicts(current, desired map[string]string) []string {
+	var out []string
+	for key, body := range current {
+		if body != "" && body != desired[key] {
+			out = append(out, key)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// quotedKeys renders keys for a diagnostic: `"down", "down/silence"`.
+func quotedKeys(keys []string) string {
+	quoted := make([]string, len(keys))
+	for i, k := range keys {
+		quoted[i] = fmt.Sprintf("%q", k)
+	}
+	return strings.Join(quoted, ", ")
+}
+
 // write applies desired as the monitor's complete template set and returns the
 // resulting server state.
 func (r *alertTemplateResource) write(ctx context.Context, monitorID string, desired map[string]string) (map[string]string, error) {
@@ -222,10 +263,46 @@ func (r *alertTemplateResource) Create(ctx context.Context, req resource.CreateR
 	}
 
 	monitorID := plan.MonitorID.ValueString()
+
 	// Create asserts the whole set, so any template already on the monitor —
-	// set through the dashboard, or left behind by an earlier resource — is
-	// cleared rather than silently surviving as an unmanaged extra key.
-	out, err := r.write(ctx, monitorID, desired)
+	// set through the dashboard or by an agent over MCP — would be overwritten
+	// or cleared. Silently. The operator finds out at the next incident, when
+	// the alert arrives in the default wording somebody had deliberately
+	// replaced. So read first and refuse to adopt.
+	//
+	// This GET→PUT window is inherently racy: another writer can set a template
+	// between the read and the write and we will clobber it. Accepted
+	// knowingly — closing it needs a server-side precondition on the templates
+	// PUT, which is an API change, not a provider one. The race needs two
+	// writers inside one round-trip; the hazard being fixed here needs only
+	// one, at any point in the past.
+	current, err := r.client.GetTemplates(ctx, monitorID)
+	switch {
+	case err == nil:
+		if clobbered := alertTemplateConflicts(current, desired); len(clobbered) > 0 {
+			resp.Diagnostics.AddError(
+				"Alert templates already exist",
+				fmt.Sprintf("Monitor %s already has custom alert templates set outside Terraform, for %s. "+
+					"Terraform will not take over templates it did not create: applying this would "+
+					"overwrite or clear them, and the alerts they customise would silently go back to "+
+					"other wording.\n\nTo manage the existing templates, import them:\n"+
+					"  terraform import lastping_alert_template.<name> %s\n\n"+
+					"Or remove the conflicting keys from your configuration.",
+					monitorID, quotedKeys(clobbered), monitorID),
+			)
+			return
+		}
+	case client.IsNotFound(err):
+		// No such monitor — the write below reports it with the API's own 404.
+	default:
+		resp.Diagnostics.AddError("Unable to read existing alert templates", err.Error())
+		return
+	}
+
+	// The read above is the one write() would have done, so reuse it rather
+	// than paying for a second round-trip. In the 404 case current is nil and
+	// the write reports the missing monitor itself.
+	out, err := r.client.PutTemplates(ctx, monitorID, replacementPayload(desired, current))
 	if err != nil {
 		resp.Diagnostics.AddError("Unable to write alert templates", err.Error())
 		return

@@ -7,6 +7,7 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/plancheck"
+	"github.com/hashicorp/terraform-plugin-testing/terraform"
 )
 
 // templateMonitor is the monitor every alert-template test hangs its messages
@@ -228,6 +229,119 @@ resource "lastping_alert_template" "t" {
   templates  = { "down" = "{no_such_token}" }
 }`,
 				ExpectError: regexp.MustCompile(`(?s)Unable to write alert templates`),
+			},
+		},
+	})
+}
+
+// TestAccAlertTemplate_refusesToAdoptExistingTemplates is the adoption guard.
+//
+// One write replaces the monitor's whole set, so before this guard a first
+// `terraform apply` silently wiped every template set in the dashboard or over
+// MCP. Nothing failed and nothing was logged; the operator found out at the
+// next incident, when carefully worded alerts arrived in wording nobody had
+// chosen. Create must refuse, and must leave the stored templates alone.
+func TestAccAlertTemplate_refusesToAdoptExistingTemplates(t *testing.T) {
+	var monitorID string
+
+	// The set written out of band: one event-wide key that the configuration
+	// below contradicts, and one per-cause key it omits entirely. Both are
+	// destroyed by an unguarded create — the first overwritten, the second
+	// cleared by the explicit delete replacementPayload sends for it.
+	preexisting := map[string]string{
+		"down":         "dashboard wording for down",
+		"fail/runaway": "dashboard wording for runaway",
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: templateMonitor,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					captureAttr("lastping_monitor.m", "id", &monitorID),
+					func(*terraform.State) error {
+						_, err := testAccDirectClient(t).PutTemplates(t.Context(), monitorID, preexisting)
+						return err
+					},
+				),
+			},
+			{
+				Config: templateMonitor + `
+resource "lastping_alert_template" "t" {
+  monitor_id = lastping_monitor.m.id
+  templates = {
+    "down" = "terraform wording for down"
+  }
+}`,
+				ExpectError: regexp.MustCompile(
+					`(?s)Alert templates already exist.*"down", "fail/runaway".*` +
+						`terraform import lastping_alert_template\.<name> [0-9a-f-]+`),
+			},
+			{
+				// Assert against the server: the resource never entered state,
+				// so state proves nothing either way.
+				Config: templateMonitor,
+				Check: func(*terraform.State) error {
+					got, err := testAccDirectClient(t).GetTemplates(t.Context(), monitorID)
+					if err != nil {
+						return err
+					}
+					if len(got) != len(preexisting) {
+						return fmt.Errorf("the refusal still wrote: server holds %v, want %v", got, preexisting)
+					}
+					for k, v := range preexisting {
+						if got[k] != v {
+							return fmt.Errorf("template %q is %q, want %q", k, got[k], v)
+						}
+					}
+					return nil
+				},
+			},
+		},
+	})
+}
+
+// TestAccAlertTemplate_createsOverAnIdenticalSet: the guard must not fire when
+// the write would change nothing. Re-creating the resource after losing the
+// state file is a legitimate recovery, and failing it would be worse than the
+// hazard the guard exists for.
+func TestAccAlertTemplate_createsOverAnIdenticalSet(t *testing.T) {
+	var monitorID string
+
+	preexisting := map[string]string{
+		"down":         "{check_name} missed its deadline",
+		"fail/runaway": "too many pings",
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: templateMonitor,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					captureAttr("lastping_monitor.m", "id", &monitorID),
+					func(*terraform.State) error {
+						_, err := testAccDirectClient(t).PutTemplates(t.Context(), monitorID, preexisting)
+						return err
+					},
+				),
+			},
+			{
+				Config: templateMonitor + `
+resource "lastping_alert_template" "t" {
+  monitor_id = lastping_monitor.m.id
+  templates = {
+    "down"         = "{check_name} missed its deadline"
+    "fail/runaway" = "too many pings"
+  }
+}`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("lastping_alert_template.t", "templates.%", "2"),
+					checkTemplatesOnServer(t, preexisting),
+				),
 			},
 		},
 	})

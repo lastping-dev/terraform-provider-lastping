@@ -108,3 +108,71 @@ func TestTemplateKeyPattern(t *testing.T) {
 		require.False(t, templateKeyPattern.MatchString(key), "%q must be rejected", key)
 	}
 }
+
+// TestAlertTemplateConflicts pins which stored templates count as "Terraform
+// would destroy this".
+//
+// A key the configuration omits is as much a conflict as one it contradicts:
+// replacementPayload sends every stored-but-unconfigured key as an explicit
+// delete, so an unguarded create clears it just as surely as a differing body
+// overwrites it. The reported keys are sorted so the diagnostic is stable —
+// map iteration order is not.
+func TestAlertTemplateConflicts(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		current map[string]string
+		desired map[string]string
+		want    []string
+	}{
+		{
+			name:    "monitor has no templates",
+			current: map[string]string{},
+			desired: map[string]string{"down": "a"},
+		},
+		{
+			name:    "stored set is identical",
+			current: map[string]string{"down": "a", "down/silence": "b"},
+			desired: map[string]string{"down": "a", "down/silence": "b"},
+		},
+		{
+			name:    "configuration only adds keys",
+			current: map[string]string{"down": "a"},
+			desired: map[string]string{"down": "a", "recovery": "c"},
+		},
+		{
+			name:    "an empty stored body loses nothing",
+			current: map[string]string{"down": ""},
+			desired: map[string]string{"down": "a"},
+		},
+		{
+			name:    "a stored body would be overwritten",
+			current: map[string]string{"down": "dashboard"},
+			desired: map[string]string{"down": "terraform"},
+			want:    []string{"down"},
+		},
+		{
+			name:    "a stored key the configuration omits would be cleared",
+			current: map[string]string{"down": "a", "fail/runaway": "b"},
+			desired: map[string]string{"down": "a"},
+			want:    []string{"fail/runaway"},
+		},
+		{
+			name:    "several conflicts come back sorted",
+			current: map[string]string{"recovery": "r", "down": "d", "fail/ci": "f"},
+			desired: map[string]string{},
+			want:    []string{"down", "fail/ci", "recovery"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, alertTemplateConflicts(tc.current, tc.desired))
+		})
+	}
+}
+
+// TestQuotedKeys: the diagnostic names the keys, and a template key can contain
+// a "/" — quoting them keeps the list readable rather than ambiguous.
+func TestQuotedKeys(t *testing.T) {
+	require.Equal(t, "", quotedKeys(nil))
+	require.Equal(t, `"down"`, quotedKeys([]string{"down"}))
+	require.Equal(t, `"down", "fail/runaway"`, quotedKeys([]string{"down", "fail/runaway"}))
+}
