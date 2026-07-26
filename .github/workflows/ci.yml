@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Acceptance tests (`make testacc`) are intentionally not run here: they
+# require a live LastPing backend and are wired up separately from the
+# monorepo's CI.
+
+jobs:
+  build:
+    name: Build, vet, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: make build
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: make test
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+
+  docs:
+    name: Docs up to date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Check generated docs are current
+        run: |
+          if [ ! -d docs ]; then
+            echo "No docs/ directory yet (no resources or data sources to document). Skipping docs check."
+            exit 0
+          fi
+          make docs
+          git diff --exit-code -- docs/

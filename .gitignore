@@ -1,0 +1,21 @@
+# Build artifacts
+dist/
+terraform-provider-lastping
+terraform-provider-lastping_v*
+
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+terraform.tfvars
+*.tfvars
+
+# Secrets / local env
+.env
+.env.*
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
