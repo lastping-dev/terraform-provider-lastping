@@ -108,7 +108,14 @@ func (p *lastpingProvider) Resources(context.Context) []func() resource.Resource
 }
 
 func (p *lastpingProvider) DataSources(context.Context) []func() datasource.DataSource {
-	return []func() datasource.DataSource{}
+	return []func() datasource.DataSource{
+		NewMonitorDataSource,
+		NewMonitorsDataSource,
+		NewDestinationDataSource,
+		NewIncidentsDataSource,
+		NewMetricsDataSource,
+		NewProjectDataSource,
+	}
 }
 
 func (p *lastpingProvider) EphemeralResources(context.Context) []func() ephemeral.EphemeralResource {

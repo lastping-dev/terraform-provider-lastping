@@ -1,0 +1,27 @@
+# Which project is this API key about to change?
+#
+# Every LastPing resource is scoped to the key's project, and the key does not
+# say which one that is. Reading it back makes the blast radius explicit — and
+# doubles as a credential smoke-test, since an invalid or revoked key fails
+# here rather than partway through an apply.
+data "lastping_project" "current" {}
+
+output "project_id" {
+  value = data.lastping_project.current.project_id
+}
+
+# Refuse to apply against the wrong project, for a workspace whose key comes
+# from the environment and could be pointed anywhere.
+resource "terraform_data" "project_guard" {
+  lifecycle {
+    precondition {
+      condition     = data.lastping_project.current.project_id == var.expected_project_id
+      error_message = "LASTPING_API_KEY belongs to project ${data.lastping_project.current.project_id}, not ${var.expected_project_id}."
+    }
+  }
+}
+
+variable "expected_project_id" {
+  type        = string
+  description = "The project this workspace is allowed to manage."
+}
