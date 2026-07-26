@@ -21,6 +21,15 @@ type Client struct {
 	apiKey  string
 	version string
 	HTTP    *http.Client
+
+	// RetryMaxAttempts and RetryMaxWait bound the 429 retry loop (see retry.go).
+	// Zero selects the default.
+	RetryMaxAttempts int
+	RetryMaxWait     time.Duration
+
+	// sleep is the backoff wait, swapped out in tests so the retry loop can be
+	// exercised without real multi-second sleeps.
+	sleep func(ctx context.Context, d time.Duration) error
 }
 
 // New creates a Client. Any trailing slash on baseURL is trimmed.
@@ -30,6 +39,7 @@ func New(baseURL, apiKey, version string) *Client {
 		apiKey:  apiKey,
 		version: version,
 		HTTP:    &http.Client{Timeout: 30 * time.Second},
+		sleep:   sleepCtx,
 	}
 }
 
@@ -86,24 +96,76 @@ func WithHeader(k, v string) ReqOpt {
 
 // Do performs an authenticated request. body is JSON-encoded when non-nil; the
 // response is decoded into out when non-nil. Non-2xx responses return *Problem.
+//
+// A 429 is retried under the policy in retry.go; every other status is
+// terminal. The encoded body is kept so each attempt gets a fresh reader.
 func (c *Client) Do(ctx context.Context, method, path string, body, out any, opts ...ReqOpt) error {
-	var rdr io.Reader
+	var encoded []byte
 	if body != nil {
-		buf, err := json.Marshal(body)
-		if err != nil {
+		var err error
+		if encoded, err = json.Marshal(body); err != nil {
 			return fmt.Errorf("encode request body: %w", err)
 		}
-		rdr = bytes.NewReader(buf)
+	}
+
+	var waited time.Duration
+	for attempt := 1; ; attempt++ {
+		res, err := c.attempt(ctx, method, path, encoded, body != nil, out, opts)
+		switch {
+		case err != nil:
+			return err
+		case res.problem == nil:
+			return nil
+		case res.status != http.StatusTooManyRequests:
+			return res.problem
+		}
+
+		// Rate-limited. Give up once the attempt budget is spent or the next
+		// wait would push past the total-wait ceiling, and surface the 429 as
+		// the ordinary *Problem callers already know how to interpret.
+		delay := retryDelay(res.retryAfter, attempt, time.Now())
+		if attempt >= c.retryMaxAttempts() || waited+delay > c.retryMaxWait() {
+			return res.problem
+		}
+		waited += delay
+		if err := c.sleepFn()(ctx, delay); err != nil {
+			return err
+		}
+	}
+}
+
+// attemptResult is one response, reduced to what the retry loop needs. status
+// is the wire status code, deliberately separate from Problem.Status — the
+// latter is whatever the response body claimed, and a retry decision must not
+// be driven by a body an intermediary wrote.
+type attemptResult struct {
+	status     int
+	retryAfter string
+	problem    *Problem // non-nil iff the response was not 2xx
+}
+
+// attempt performs one request, decoding into out on success.
+func (c *Client) attempt(
+	ctx context.Context,
+	method, path string,
+	encoded []byte,
+	hasBody bool,
+	out any,
+	opts []ReqOpt,
+) (attemptResult, error) {
+	var rdr io.Reader
+	if hasBody {
+		rdr = bytes.NewReader(encoded)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, method, c.BaseURL+path, rdr)
 	if err != nil {
-		return err
+		return attemptResult{}, err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "terraform-provider-lastping/"+c.version)
-	if body != nil {
+	if hasBody {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	for _, o := range opts {
@@ -112,9 +174,11 @@ func (c *Client) Do(ctx context.Context, method, path string, body, out any, opt
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return err
+		return attemptResult{}, err
 	}
 	defer func() { _ = resp.Body.Close() }()
+
+	res := attemptResult{status: resp.StatusCode, retryAfter: resp.Header.Get("Retry-After")}
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		p := &Problem{Status: resp.StatusCode}
@@ -123,12 +187,22 @@ func (c *Client) Do(ctx context.Context, method, path string, body, out any, opt
 		if p.Status == 0 {
 			p.Status = resp.StatusCode
 		}
-		return p
+		res.problem = p
+		return res, nil
 	}
 
 	if out == nil || resp.StatusCode == http.StatusNoContent {
 		_, _ = io.Copy(io.Discard, resp.Body)
-		return nil
+		return res, nil
 	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	return res, json.NewDecoder(resp.Body).Decode(out)
+}
+
+// sleepFn returns the backoff wait, defaulting to a real timer so a
+// zero-value Client still behaves.
+func (c *Client) sleepFn() func(context.Context, time.Duration) error {
+	if c.sleep != nil {
+		return c.sleep
+	}
+	return sleepCtx
 }
