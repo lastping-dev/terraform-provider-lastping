@@ -291,6 +291,14 @@ components:
           type: boolean
           description: When true the check does not alert regardless of ping status.
           example: false
+        maintenance_until:
+          type: [string, "null"]
+          format: date-time
+          description: >-
+            RFC 3339 timestamp until which the check is snoozed. Alerts are
+            suppressed while this is in the future; null or absent when the
+            check is not snoozed.
+          example: "2026-07-11T09:00:00Z"
         created_at:
           type: string
           format: date-time

@@ -55,16 +55,13 @@ const specPath = "../../testdata/openapi.yaml"
 // so this map cannot quietly become a dumping ground.
 //
 // Keys are "<case name>.<attribute>".
-var knownSpecGaps = map[string]string{
-	// maintenance_until is returned by the API — api/checks.go, checkResponse
-	// has `MaintenanceUntil *time.Time \`json:"maintenance_until,omitempty"\`` —
-	// and drives the dashboard's snooze display, but the Check schema in the
-	// published spec never lists it. MONOREPO BUG: add maintenance_until to
-	// components.schemas.Check, then delete these three entries.
-	"resource.lastping_monitor.maintenance_until":       "api/checks.go checkResponse returns it; components.schemas.Check omits it",
-	"data.lastping_monitor.maintenance_until":           "api/checks.go checkResponse returns it; components.schemas.Check omits it",
-	"data.lastping_monitors.monitors.maintenance_until": "api/checks.go checkResponse returns it; components.schemas.Check omits it",
-}
+//
+// Empty is the healthy state, and the map is kept rather than deleted so the
+// next gap is recorded here — visibly, with a reason — instead of being waved
+// through an exempt map. The last three entries (maintenance_until on the
+// monitor resource and both monitor data sources) went when the monorepo added
+// the property to components.schemas.Check.
+var knownSpecGaps = map[string]string{}
 
 // destinationConfigExempt is the reason every per-kind credential attribute on
 // lastping_destination has no spec property of its own. They are flattened by
