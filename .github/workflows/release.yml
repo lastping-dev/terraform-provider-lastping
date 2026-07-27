@@ -1,0 +1,48 @@
+# Publishes a release to GitHub whenever a vX.Y.Z tag is pushed. The Terraform
+# Registry then picks the release up over its webhook and serves the version.
+#
+# Two repository secrets must exist before the first tag:
+#   GPG_PRIVATE_KEY - ASCII-armored private key (RSA; the registry rejects ECC)
+#   PASSPHRASE      - that key's passphrase
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  # Required to create the GitHub release and upload its artifacts.
+  contents: write
+
+jobs:
+  goreleaser:
+    name: GoReleaser
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # GoReleaser derives the version from the tag, so it needs the tags
+          # and the full history, not the default shallow clone.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Import GPG key
+        id: import_gpg
+        uses: crazy-max/ghaction-import-gpg@v7
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.PASSPHRASE }}
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: '~> v2'
+          args: release --clean
+        env:
+          # .goreleaser.yml signs the checksum file with this key.
+          GPG_FINGERPRINT: ${{ steps.import_gpg.outputs.fingerprint }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

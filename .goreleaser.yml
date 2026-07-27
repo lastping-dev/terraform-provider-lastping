@@ -1,0 +1,73 @@
+# Release configuration for the Terraform Registry.
+#
+# The registry is strict about artifact names: the zip archives, the
+# SHA256SUMS file, its detached signature, and the protocol manifest must all
+# follow the layout below or the published version is rejected (or, worse,
+# accepted and unusable). Validate changes with `goreleaser check` and a
+# `goreleaser release --snapshot --clean --skip=sign,publish` dry run.
+version: 2
+
+# Deliberately no `before: hooks: - go mod tidy`. The upstream HashiCorp
+# template runs it, but a tidy at release time can rewrite go.mod/go.sum and
+# publish binaries built from a module graph CI never tested. Tidiness is a
+# pull-request concern, not a release-time one.
+
+builds:
+  - env:
+      - CGO_ENABLED=0
+    mod_timestamp: '{{ .CommitTimestamp }}'
+    flags:
+      - -trimpath
+    ldflags:
+      - '-s -w -X main.version={{.Version}}'
+    goos:
+      - linux
+      - darwin
+      - windows
+      - freebsd
+    goarch:
+      - amd64
+      - arm64
+      - '386'
+      - arm
+    ignore:
+      # darwin dropped 32-bit entirely, and Go has no darwin/arm port.
+      - goos: darwin
+        goarch: '386'
+      - goos: darwin
+        goarch: arm
+    # The registry expects the executable inside the zip to be named
+    # terraform-provider-<name>_v<version>.
+    binary: '{{ .ProjectName }}_v{{ .Version }}'
+
+archives:
+  - formats: [zip]
+    # .Version has no leading "v": terraform-provider-lastping_0.1.0_linux_amd64.zip
+    name_template: '{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}'
+
+checksum:
+  extra_files:
+    - glob: 'terraform-registry-manifest.json'
+      name_template: '{{ .ProjectName }}_{{ .Version }}_manifest.json'
+  name_template: '{{ .ProjectName }}_{{ .Version }}_SHA256SUMS'
+  algorithm: sha256
+
+signs:
+  - artifacts: checksum
+    args:
+      # GPG_FINGERPRINT is exported by the release workflow's key-import step.
+      - "--batch"
+      - "--local-user"
+      - "{{ .Env.GPG_FINGERPRINT }}"
+      - "--output"
+      - "${signature}"
+      - "--detach-sign"
+      - "${artifact}"
+
+release:
+  extra_files:
+    - glob: 'terraform-registry-manifest.json'
+      name_template: '{{ .ProjectName }}_{{ .Version }}_manifest.json'
+
+changelog:
+  disable: true

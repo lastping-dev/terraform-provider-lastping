@@ -109,6 +109,53 @@ otherwise: an older CLI cannot see ephemeral resources, so tfplugindocs deletes
 `docs/ephemeral-resources/` rather than regenerating it, and CI's staleness
 check cannot detect a page that is already missing.
 
+## Releasing
+
+Releases are cut by pushing a tag:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+`.github/workflows/release.yml` then builds every platform with
+[GoReleaser](https://goreleaser.com), signs the `SHA256SUMS` file with GPG, and
+publishes a GitHub release. The Terraform Registry picks that release up over
+its webhook and serves the new version.
+
+Two repository secrets have to exist before the first tag:
+
+| Secret | Contents |
+|---|---|
+| `GPG_PRIVATE_KEY` | The ASCII-armored private signing key (`gpg --armor --export-secret-keys <id>`). |
+| `PASSPHRASE` | That key's passphrase. |
+
+The public half of the same key must also be uploaded to the Terraform Registry
+under the publishing namespace.
+
+**The signing key must be RSA.** The registry rejects ECC keys, and ECC
+(Curve25519) is what modern GnuPG generates by default — so `gpg --gen-key`,
+and the default path through `gpg --full-generate-key`, both produce a key the
+registry will not accept. Ask for RSA explicitly:
+
+```sh
+gpg --full-generate-key   # choose "(1) RSA and RSA", 4096 bits
+# or, non-interactively:
+gpg --quick-generate-key "Your Name <you@example.com>" rsa4096 sign never
+```
+
+`terraform-registry-manifest.json` at the repository root declares protocol
+version 6 (this provider is built on terraform-plugin-framework). It is both
+committed and shipped as a release artifact; without it the registry assumes
+protocol 5 and the provider fails to load for everyone.
+
+The release config can be exercised without tagging anything:
+
+```sh
+goreleaser check
+goreleaser release --snapshot --clean --skip=sign,publish   # output in dist/
+```
+
 ## License
 
 [Mozilla Public License 2.0](./LICENSE)
