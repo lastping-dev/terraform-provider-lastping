@@ -493,7 +493,11 @@ resource "lastping_route" "down" {
 }
 
 // testAccDefaultEmailDestinationID resolves the destination the API auto-routes
-// every new monitor to, which the adoption-exemption tests need to exist.
+// every new monitor to. testAccPreCheck calls this for every acceptance test in
+// the suite, not just the adoption-exemption tests here, so a project lacking
+// one can never again pass the suite without exercising the auto-route path.
+// The adoption-exemption tests also call it directly to get the id itself,
+// which PreCheck's use of the return value discards.
 //
 // It fails rather than skips. A skip here would be indistinguishable from a
 // pass, and the bug this guards against — a monitor and its routes being
@@ -534,10 +538,9 @@ func TestAccRoute_createsAMonitorAndItsRoutesInOneApply(t *testing.T) {
 	var monitorID string
 
 	resource.Test(t, resource.TestCase{
-		PreCheck: func() {
-			testAccPreCheck(t)
-			testAccDefaultEmailDestinationID(t)
-		},
+		// testAccPreCheck itself now requires the default email channel to
+		// exist (it is what this test needs), so no extra call is needed here.
+		PreCheck:                 func() { testAccPreCheck(t) },
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{
 			{

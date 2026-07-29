@@ -84,22 +84,30 @@ func (r *routeResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 			"list on every write, so this resource owns `destination_ids` outright — there is no add-one/remove-one " +
 			"operation, and a second resource pointing at the same `(monitor_id, event_type)` pair would silently " +
 			"overwrite the first on every apply. Use one resource per event type.\n\n" +
-			"~> **Terraform will not adopt a route it did not create.** The API has no create-only mode for " +
-			"routes, so `Create` reads the event type's current route first and refuses when one already exists " +
-			"with a different, non-empty destination list — otherwise the apply would silently redirect somebody " +
-			"else's alerts, and the discovery channel would be the next incident. Run `terraform import " +
-			"lastping_route.<name> \"<monitor_id>:<event_type>\"` to take over an existing route instead, or " +
-			"remove the conflicting resource. A route that is absent, empty, or already identical to the " +
-			"configuration is not a conflict and applies normally, so re-creating one after losing state still " +
-			"works. The check is a read followed by a write and is not atomic: a route created by another writer " +
-			"inside that window is still overwritten.\n\n" +
-			"LastPing routes every new monitor's `down`, `fail` and `recovery` events to the project's " +
-			"default email destination automatically, so a monitor created moments earlier already " +
-			"carries three routes Terraform did not write. Those are adopted rather than refused, which " +
-			"is what lets a monitor and its routes be created in a single apply. The exemption is exact: " +
-			"the existing route must have precisely one destination, and that destination must be the " +
-			"project's first verified `kind = \"email\"` destination. Anything else is treated as routing " +
-			"a person configured, and refused.\n\n" +
+			"~> **Terraform will not adopt a route it did not create — except one shape.** The API has no " +
+			"create-only mode for routes, so `Create` reads the event type's current route first and refuses " +
+			"when one already exists with a different, non-empty destination list — otherwise the apply would " +
+			"silently redirect somebody else's alerts, and the discovery channel would be the next incident. Run " +
+			"`terraform import lastping_route.<name> \"<monitor_id>:<event_type>\"` to take over an existing " +
+			"route instead, or remove the conflicting resource. A route that is absent, empty, or already " +
+			"identical to the configuration is not a conflict and applies normally, so re-creating one after " +
+			"losing state still works. The check is a read followed by a write and is not atomic: a route " +
+			"created by another writer inside that window is still overwritten.\n\n" +
+			"The one exception: LastPing routes every new monitor's `down`, `fail` and `recovery` events to " +
+			"the project's default email destination automatically (its first verified `kind = \"email\"` " +
+			"destination), so a monitor created moments earlier already carries three routes Terraform did " +
+			"not write. A route whose destination list is exactly that one destination — nothing more, " +
+			"nothing less — is taken over rather than refused; without this, a monitor and its routes could " +
+			"never be created in a single apply. Read that plainly: **any single-destination route that " +
+			"happens to point at the default email destination is treated as that auto-created route and " +
+			"adopted, whether or not it actually is one.** Two shapes a reader would not expect from " +
+			"\"will not adopt a route it did not create\" fall into this — a route someone deliberately " +
+			"narrowed to only the default email destination, and a human-set single-destination route left " +
+			"over on a monitor created before the project had any verified email channel, because the check " +
+			"compares against the project's default *now*, not against what was actually written for that " +
+			"monitor at the time. Both are adopted, silently and indistinguishably from a genuine auto-route. " +
+			"A route with any other shape — more than one destination, or a single destination that is not " +
+			"the default — is a person's own configuration, and refused.\n\n" +
 			"A destination must be verified and enabled before it can be routed to: an unconfirmed " +
 			"`kind = \"email\"` destination is rejected with `channel not verified or is disabled`.",
 		Attributes: map[string]schema.Attribute{

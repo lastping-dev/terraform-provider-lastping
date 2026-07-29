@@ -35,13 +35,21 @@ resource "lastping_monitor" "second" {
 // testAccForeignClient returns a client for a SECOND project, used to prove
 // that cross-tenant resources stay invisible. It skips rather than fails when
 // the second key is absent: a single-project backend cannot demonstrate
-// isolation either way, and a green run that silently proved nothing would be
-// worse than a skip.
+// isolation either way, and unlike the default-email-channel prerequisite (see
+// testAccPreCheck), a second project is genuinely optional for local work — it
+// cannot be seeded by one `psql -c INSERT` into the same backend. The skip
+// message is deliberately loud rather than terse, so a run that silently
+// proves nothing about tenant isolation cannot be mistaken for one that does.
 func testAccForeignClient(t *testing.T) *client.Client {
 	t.Helper()
 	key := os.Getenv("LASTPING_ACC_FOREIGN_API_KEY")
 	if key == "" {
-		t.Skip("LASTPING_ACC_FOREIGN_API_KEY not set; skipping cross-tenant test")
+		t.Skip("LASTPING_ACC_FOREIGN_API_KEY not set: skipping " +
+			"TestAccStatusPage_importOfForeignSlugIsNotFound. Cross-tenant " +
+			"isolation on status page import is NOT being verified this run. " +
+			"Set LASTPING_ACC_FOREIGN_API_KEY to a valid API key for a SECOND, " +
+			"distinct LastPing project to cover it; see README.md's testing " +
+			"section.")
 	}
 	endpoint := os.Getenv("LASTPING_ENDPOINT")
 	if endpoint == "" {

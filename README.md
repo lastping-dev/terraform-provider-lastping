@@ -103,7 +103,18 @@ docker compose exec -T postgres psql -U lastping -d lastping -c \
            '{\"address\":\"acc@example.com\"}'::jsonb, now());"
 ```
 
-The tests that depend on it fail with instructions rather than skipping.
+Because this is checked once, centrally, in `testAccPreCheck`, every acceptance
+test fails with those instructions rather than skipping — there is no longer a
+code path where the suite passes against a project missing this seed.
+
+**`TestAccStatusPage_importOfForeignSlugIsNotFound` additionally wants a SECOND,
+distinct project's API key**, in `LASTPING_ACC_FOREIGN_API_KEY`, to prove
+cross-tenant status-page import stays invisible across projects. Unlike the
+email channel above, this cannot be seeded with one SQL statement against the
+same backend, so it is optional for local work and the test skips — loudly,
+naming the variable and what goes unverified — rather than failing when it is
+unset. Wiring a second seeded project's key into CI so this actually runs
+there is an open item, not yet automated.
 
 ### API contract test
 

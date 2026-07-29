@@ -14,13 +14,25 @@ import (
 	"github.com/lastping-dev/terraform-provider-lastping/internal/client"
 )
 
-// testAccPreCheck skips acceptance tests unless a backend is configured. These
-// run from the monorepo CI against docker-compose, not from public CI.
+// testAccPreCheck skips acceptance tests unless a backend is configured, and
+// then hard-fails unless that backend's project has a verified email channel.
+//
+// The second half exists because a project without one hid a real bug: the API
+// only auto-routes a new monitor's down/fail/recovery events when it has a
+// default email channel to route to (attachDefaultRoutes no-ops otherwise), so
+// the auto-route/adoption scenario simply never arose against an unseeded
+// project, and 43 passing acceptance tests never touched it. That is not a
+// property of one or two route tests — it is a property of the fixture the
+// whole suite runs against — so the requirement lives here, not in individual
+// tests' PreChecks, and applies to every acceptance test without exception.
+//
+// These run from the monorepo CI against docker-compose, not from public CI.
 func testAccPreCheck(t *testing.T) {
 	t.Helper()
 	if os.Getenv("LASTPING_API_KEY") == "" {
 		t.Skip("LASTPING_API_KEY not set; skipping acceptance test")
 	}
+	testAccDefaultEmailDestinationID(t)
 }
 
 // testAccDirectClient returns a client that talks to the same backend as the
