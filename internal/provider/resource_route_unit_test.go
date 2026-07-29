@@ -99,3 +99,90 @@ func TestRouteAdoptionConflict(t *testing.T) {
 		})
 	}
 }
+
+// TestRouteIsServerDefault pins the exemption that lets a monitor and its routes
+// be created in one apply.
+//
+// The API auto-routes every new monitor's down/fail/recovery events to the
+// project's default email channel, so the routes Terraform meets on a monitor
+// it created a millisecond ago are the server's, not a person's. Adopting them
+// is right. Adopting anything wider than the exact signature attachDefaultRoutes
+// writes — one destination, and that destination is the project's first verified
+// email channel — would reinstate the hazard the guard exists for, which is a
+// silent redirect of somebody's alerts.
+func TestRouteIsServerDefault(t *testing.T) {
+	const (
+		defaultEmail = "70d93e48-1a2b-4c3d-8e9f-0a1b2c3d4e5f"
+		otherEmail   = "5b6d7e8f-9a0b-4c1d-8e2f-3a4b5c6d7e8f"
+		slack        = "8a1e7c92-4d3b-4a1f-9c2e-5b6d7e8f9a0b"
+	)
+
+	for _, tc := range []struct {
+		name          string
+		existing      []string
+		defaultDestID string
+		want          bool
+	}{
+		{
+			name:          "exactly what attachDefaultRoutes writes",
+			existing:      []string{defaultEmail},
+			defaultDestID: defaultEmail,
+			want:          true,
+		},
+		{
+			// Two destinations cannot have come from attachDefaultRoutes: it
+			// writes a one-element list. Somebody added the second one.
+			name:          "default destination plus another",
+			existing:      []string{defaultEmail, slack},
+			defaultDestID: defaultEmail,
+			want:          false,
+		},
+		{
+			name:          "default destination, but not first in the list",
+			existing:      []string{slack, defaultEmail},
+			defaultDestID: defaultEmail,
+			want:          false,
+		},
+		{
+			// A hand-made route that happens to have one destination is the
+			// ordinary conflict case, and must stay one.
+			name:          "single destination that is not the default",
+			existing:      []string{slack},
+			defaultDestID: defaultEmail,
+			want:          false,
+		},
+		{
+			// A second verified email channel is not the one the server picks.
+			name:          "a different email destination",
+			existing:      []string{otherEmail},
+			defaultDestID: defaultEmail,
+			want:          false,
+		},
+		{
+			// No verified email channel means attachDefaultRoutes returned
+			// early and never wrote anything, so nothing can be its output.
+			// Without the guard, "" would match a project whose route list the
+			// API somehow answered with an empty id.
+			name:          "project has no default destination",
+			existing:      []string{defaultEmail},
+			defaultDestID: "",
+			want:          false,
+		},
+		{
+			name:          "no route at all",
+			existing:      nil,
+			defaultDestID: defaultEmail,
+			want:          false,
+		},
+		{
+			name:          "empty route",
+			existing:      []string{},
+			defaultDestID: defaultEmail,
+			want:          false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, routeIsServerDefault(tc.existing, tc.defaultDestID))
+		})
+	}
+}

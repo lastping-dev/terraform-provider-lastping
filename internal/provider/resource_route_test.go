@@ -491,3 +491,180 @@ resource "lastping_route" "down" {
 		},
 	})
 }
+
+// testAccDefaultEmailDestinationID resolves the destination the API auto-routes
+// every new monitor to, which the adoption-exemption tests need to exist.
+//
+// It fails rather than skips. A skip here would be indistinguishable from a
+// pass, and the bug this guards against — a monitor and its routes being
+// impossible to create in one apply — is invisible in a project that has no
+// verified email channel, because attachDefaultRoutes then returns early and
+// writes no routes at all. That is exactly how the whole suite missed it.
+func testAccDefaultEmailDestinationID(t *testing.T) string {
+	t.Helper()
+	id, err := testAccDirectClient(t).DefaultEmailDestinationID(t.Context())
+	if err != nil {
+		t.Fatalf("listing destinations: %v", err)
+	}
+	if id == "" {
+		t.Fatal("this project has no verified email destination, so the API will not " +
+			"auto-route new monitors and this test cannot exercise anything.\n" +
+			"Seed one in the acceptance backend, for example:\n" +
+			"  docker compose exec -T postgres psql -U lastping -d lastping -c \\\n" +
+			"    \"INSERT INTO channels (id, project_id, kind, name, config, verified_at) \\\n" +
+			"     VALUES (gen_random_uuid(), '<project>', 'email', 'Email', \\\n" +
+			"             '{\\\"address\\\":\\\"acc@example.com\\\"}'::jsonb, now());\"")
+	}
+	return id
+}
+
+// TestAccRoute_createsAMonitorAndItsRoutesInOneApply is the provider's most
+// obvious use case, and before the auto-route exemption it was impossible.
+//
+// The API attaches down/fail/recovery routes to the project's default email
+// channel the moment a monitor is created (api/defaultdest.go:
+// attachDefaultRoutes), so by the time Terraform creates the route resources in
+// the same apply, all three event types are already routed — to destinations
+// Terraform did not write. The adoption guard refused, every time, with
+// "Route already exists", and the only way forward was to apply, read the
+// auto-routes back, write import blocks and apply again.
+//
+// This test is the whole scenario in one apply. It fails before the fix.
+func TestAccRoute_createsAMonitorAndItsRoutesInOneApply(t *testing.T) {
+	var monitorID string
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testAccDefaultEmailDestinationID(t)
+		},
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "lastping_monitor" "fresh" {
+  name          = "acc-route-oneshot"
+  slug          = "acc-route-oneshot"
+  schedule_kind = "simple"
+  period_s      = 3600
+  grace_s       = 300
+}
+
+resource "lastping_destination" "oncall" {
+  kind      = "ntfy"
+  name      = "acc-route-oneshot-oncall"
+  topic_url = "https://ntfy.sh/acc-route-oneshot-oncall"
+}
+
+resource "lastping_route" "down" {
+  monitor_id      = lastping_monitor.fresh.id
+  event_type      = "down"
+  destination_ids = [lastping_destination.oncall.id]
+}
+
+resource "lastping_route" "fail" {
+  monitor_id      = lastping_monitor.fresh.id
+  event_type      = "fail"
+  destination_ids = [lastping_destination.oncall.id]
+}
+
+resource "lastping_route" "recovery" {
+  monitor_id      = lastping_monitor.fresh.id
+  event_type      = "recovery"
+  destination_ids = [lastping_destination.oncall.id]
+}`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					captureAttr("lastping_monitor.fresh", "id", &monitorID),
+					resource.TestCheckResourceAttrPair("lastping_route.down", "destination_ids.0",
+						"lastping_destination.oncall", "id"),
+					resource.TestCheckResourceAttrPair("lastping_route.fail", "destination_ids.0",
+						"lastping_destination.oncall", "id"),
+					resource.TestCheckResourceAttrPair("lastping_route.recovery", "destination_ids.0",
+						"lastping_destination.oncall", "id"),
+					// Assert against the server: adoption has to have replaced
+					// the auto-routes, not merely written state that says so.
+					resource.TestCheckResourceAttrWith("lastping_destination.oncall", "id",
+						func(oncallID string) error {
+							routes, err := testAccDirectClient(t).GetRoutes(t.Context(), monitorID)
+							if err != nil {
+								return err
+							}
+							seen := map[string]bool{}
+							for _, rt := range routes {
+								seen[rt.EventType] = true
+								if len(rt.ChannelIDs) != 1 || rt.ChannelIDs[0] != oncallID {
+									return fmt.Errorf("%s route holds %v, want [%s]",
+										rt.EventType, rt.ChannelIDs, oncallID)
+								}
+							}
+							for _, ev := range []string{"down", "fail", "recovery"} {
+								if !seen[ev] {
+									return fmt.Errorf("no %s route on the monitor", ev)
+								}
+							}
+							return nil
+						}),
+				),
+			},
+		},
+	})
+}
+
+// TestAccRoute_refusesARouteBuiltOnTheDefaultDestination keeps the exemption
+// from widening into the hazard.
+//
+// The auto-route the API writes has exactly one destination. A route that also
+// contains the default email destination but has been extended by hand — the
+// ordinary "page me as well as emailing the team" edit — is a person's
+// configuration, and taking it over would drop whoever was added. It must be
+// refused, and the route must survive the refusal untouched.
+func TestAccRoute_refusesARouteBuiltOnTheDefaultDestination(t *testing.T) {
+	var monitorID, firstID, defaultID string
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: routeFixtures,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					captureAttr("lastping_monitor.m", "id", &monitorID),
+					captureAttr("lastping_destination.first", "id", &firstID),
+					func(*terraform.State) error {
+						defaultID = testAccDefaultEmailDestinationID(t)
+						// Widen the auto-route by hand, exactly as somebody
+						// would in the dashboard.
+						_, err := testAccDirectClient(t).UpsertRoute(t.Context(),
+							monitorID, "down", []string{defaultID, firstID})
+						return err
+					},
+				),
+			},
+			{
+				Config: routeFixtures + `
+resource "lastping_route" "down" {
+  monitor_id      = lastping_monitor.m.id
+  event_type      = "down"
+  destination_ids = [lastping_destination.second.id]
+}`,
+				ExpectError: regexp.MustCompile(
+					`(?s)Route already exists.*terraform import lastping_route\.<name> [0-9a-f-]+:down`),
+			},
+			{
+				Config: routeFixtures,
+				Check: func(*terraform.State) error {
+					rt, err := testAccDirectClient(t).GetRoute(t.Context(), monitorID, "down")
+					if err != nil {
+						return fmt.Errorf("the pre-existing route is gone: %w", err)
+					}
+					want := []string{defaultID, firstID}
+					if len(rt.ChannelIDs) != 2 || rt.ChannelIDs[0] != want[0] || rt.ChannelIDs[1] != want[1] {
+						return fmt.Errorf("the refusal still overwrote the route: got %v, want %v",
+							rt.ChannelIDs, want)
+					}
+					return nil
+				},
+			},
+		},
+	})
+}

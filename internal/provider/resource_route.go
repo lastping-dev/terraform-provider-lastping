@@ -93,6 +93,13 @@ func (r *routeResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 			"configuration is not a conflict and applies normally, so re-creating one after losing state still " +
 			"works. The check is a read followed by a write and is not atomic: a route created by another writer " +
 			"inside that window is still overwritten.\n\n" +
+			"LastPing routes every new monitor's `down`, `fail` and `recovery` events to the project's " +
+			"default email destination automatically, so a monitor created moments earlier already " +
+			"carries three routes Terraform did not write. Those are adopted rather than refused, which " +
+			"is what lets a monitor and its routes be created in a single apply. The exemption is exact: " +
+			"the existing route must have precisely one destination, and that destination must be the " +
+			"project's first verified `kind = \"email\"` destination. Anything else is treated as routing " +
+			"a person configured, and refused.\n\n" +
 			"A destination must be verified and enabled before it can be routed to: an unconfirmed " +
 			"`kind = \"email\"` destination is rejected with `channel not verified or is disabled`.",
 		Attributes: map[string]schema.Attribute{
@@ -208,6 +215,36 @@ func routeAdoptionConflict(existing, want []string) bool {
 	return len(existing) > 0 && !slices.Equal(existing, want)
 }
 
+// routeIsServerDefault reports whether existing is the route the API attached
+// by itself when the monitor was created, rather than routing a person chose.
+//
+// The API auto-routes every new monitor's down/fail/recovery events to the
+// project's default email channel (api/defaultdest.go: attachDefaultRoutes),
+// which means a monitor Terraform created a millisecond ago already has three
+// routes Terraform did not create. Treating those as somebody else's
+// configuration made the obvious first apply — a monitor and its routes
+// together — impossible: it always failed, and the only way forward was to
+// apply, discover the auto-routes, write import blocks and apply again.
+//
+// The signature is deliberately narrow. attachDefaultRoutes writes exactly one
+// destination, and that destination is the project's default email channel, so
+// anything else — two destinations, one destination that is something else —
+// cannot have come from it and is left to the guard. A human who deliberately
+// narrowed a route down to just the default email channel is indistinguishable
+// from the auto-route and will be adopted; that is the one accepted
+// false-positive, and it costs them a destination list Terraform is about to
+// write explicitly rather than an alert path they lose silently.
+//
+// defaultDestID is "" when the project has no verified email channel. Then
+// attachDefaultRoutes returned early, no auto-route exists, and nothing can
+// match — hence the explicit guard rather than a comparison against "".
+func routeIsServerDefault(existing []string, defaultDestID string) bool {
+	if defaultDestID == "" {
+		return false
+	}
+	return len(existing) == 1 && existing[0] == defaultDestID
+}
+
 func (r *routeResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
 	var plan routeResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
@@ -240,18 +277,40 @@ func (r *routeResource) Create(ctx context.Context, req resource.CreateRequest, 
 	switch {
 	case err == nil:
 		if routeAdoptionConflict(existing.ChannelIDs, want) {
-			resp.Diagnostics.AddError(
-				"Route already exists",
-				fmt.Sprintf("The %q route on monitor %s already sends to %s. Terraform will not "+
-					"take over a route it did not create: applying this would replace that "+
-					"destination list, and alerts for this event would stop reaching whoever is "+
-					"on it.\n\nTo manage the existing route, import it:\n"+
-					"  terraform import lastping_route.<name> %s:%s\n\n"+
-					"Or remove this resource from your configuration.",
-					eventType, monitorID, strings.Join(existing.ChannelIDs, ", "),
-					monitorID, eventType),
-			)
-			return
+			// One exception, and only one: the route the API attached to this
+			// monitor by itself when it was created. Looked up lazily, so the
+			// ordinary path — no route, or a route that matches — never pays
+			// for the extra round-trip.
+			defaultDestID, derr := r.client.DefaultEmailDestinationID(ctx)
+			if derr != nil {
+				// Fail closed. Without knowing the project's default channel
+				// there is no way to tell an auto-route from a person's
+				// routing, and guessing in the permissive direction is the
+				// hazard this guard exists for.
+				resp.Diagnostics.AddError("Unable to identify the project's default destination",
+					fmt.Sprintf("The %q route on monitor %s already sends to %s, and listing the "+
+						"project's destinations to check whether that is the route LastPing "+
+						"attaches to new monitors failed: %s\n\nTerraform will not take over an "+
+						"existing route it cannot account for. Retry, or import the route:\n"+
+						"  terraform import lastping_route.<name> %s:%s",
+						eventType, monitorID, strings.Join(existing.ChannelIDs, ", "), derr,
+						monitorID, eventType))
+				return
+			}
+			if !routeIsServerDefault(existing.ChannelIDs, defaultDestID) {
+				resp.Diagnostics.AddError(
+					"Route already exists",
+					fmt.Sprintf("The %q route on monitor %s already sends to %s. Terraform will not "+
+						"take over a route it did not create: applying this would replace that "+
+						"destination list, and alerts for this event would stop reaching whoever is "+
+						"on it.\n\nTo manage the existing route, import it:\n"+
+						"  terraform import lastping_route.<name> %s:%s\n\n"+
+						"Or remove this resource from your configuration.",
+						eventType, monitorID, strings.Join(existing.ChannelIDs, ", "),
+						monitorID, eventType),
+				)
+				return
+			}
 		}
 	case client.IsNotFound(err):
 		// No route for this event type — or no such monitor, which the write

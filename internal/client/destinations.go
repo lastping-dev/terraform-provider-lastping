@@ -81,6 +81,42 @@ func (c *Client) ListDestinations(ctx context.Context) ([]Destination, error) {
 	return out, nil
 }
 
+// DefaultEmailDestinationID returns the destination the API auto-routes every
+// newly created monitor to, or "" when the project has none.
+//
+// It mirrors the server's own selection exactly (api/defaultdest.go:
+// attachDefaultRoutes in the LastPing monorepo): the FIRST channel that is
+// `kind = "email"` and verified, in the order the API returns them. Both sides
+// read the same query — `SELECT * FROM channels WHERE project_id = $1 ORDER BY
+// created_at` — and GET /api/v1/channels serialises those rows in order, so
+// "first" means the same thing here as it does there.
+//
+// Two deliberate omissions, both of which keep this in step with the server:
+//
+//   - A disabled channel is still eligible, because attachDefaultRoutes tests
+//     only verified_at. Skipping disabled channels here would make the provider
+//     name a different channel than the one the auto-created route points at.
+//
+//   - No tie-break beyond created_at. That column is not unique, so two email
+//     channels stamped in the same microsecond are ordered arbitrarily — by the
+//     server and by this call alike, but not necessarily the same way. Reaching
+//     that state takes two hand-made email channels created inside one clock
+//     tick, because the auto-provisioning path creates at most one per project
+//     (ensureDefaultEmailChannel is idempotent on kind). Losing that coin flip
+//     costs a refusal to adopt, which is the safe direction, not an overwrite.
+func (c *Client) DefaultEmailDestinationID(ctx context.Context) (string, error) {
+	list, err := c.ListDestinations(ctx)
+	if err != nil {
+		return "", err
+	}
+	for i := range list {
+		if list[i].Kind == "email" && list[i].Verified {
+			return list[i].ID, nil
+		}
+	}
+	return "", nil
+}
+
 // GetDestinationByName resolves a destination by its human-readable name.
 //
 // Destination names are NOT unique — unlike monitor slugs, the API imposes no

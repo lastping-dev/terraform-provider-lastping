@@ -83,6 +83,28 @@ See the [Makefile](./Makefile) for common tasks: `make build`, `make test`,
 `make lint`, `make docs`, `make sync-openapi`. Acceptance tests (`make testacc`)
 require a LastPing backend and are not run in this repository's CI.
 
+### Acceptance test backend
+
+`make testacc` reads `LASTPING_API_KEY` and `LASTPING_ENDPOINT`, and skips
+entirely without the first.
+
+**The project behind that key must have a verified email destination.** LastPing
+auto-routes every new monitor's `down`, `fail` and `recovery` events to the
+project's default email channel, and a project without one takes that path
+never — which makes the acceptance suite pass against behaviour real users never
+see. That is exactly how the route resource shipped unable to create a monitor
+and its routes in the same apply: locally the monitor came back unrouted, so
+nothing ever collided. Seed one before running the suite:
+
+```sh
+docker compose exec -T postgres psql -U lastping -d lastping -c \
+  "INSERT INTO channels (id, project_id, kind, name, config, verified_at)
+   VALUES (gen_random_uuid(), '<project-id>', 'email', 'Email',
+           '{\"address\":\"acc@example.com\"}'::jsonb, now());"
+```
+
+The tests that depend on it fail with instructions rather than skipping.
+
 ### API contract test
 
 `testdata/openapi.yaml` is a vendored copy of the published
