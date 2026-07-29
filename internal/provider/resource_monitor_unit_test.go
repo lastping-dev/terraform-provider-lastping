@@ -2,7 +2,10 @@ package provider
 
 import (
 	"context"
+	"reflect"
 	"testing"
+
+	"github.com/hashicorp/terraform-plugin-framework/attr"
 
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
@@ -186,4 +189,107 @@ func TestTagsValueMapsEmptyToPriorShape(t *testing.T) {
 	got, diags = tagsValue(ctx, nil, nonEmptyPrior)
 	require.False(t, diags.HasError())
 	require.True(t, got.IsNull(), "tags cleared out-of-band must not be masked by the stale prior value")
+}
+
+// TestResolveUnknownsFromState_CoversEveryAttribute is the guard against the
+// bug coming back through a new attribute.
+//
+// terraform-plugin-framework marks every Optional+Computed attribute the
+// configuration omits as UNKNOWN in the plan. `ValueInt64()` on an unknown is
+// 0 and `ValueString()` is "", and `PATCH /api/v1/checks/{id}` replaces the
+// whole object, so any attribute that is not carried forward from the prior
+// state is silently reset — or, for grace_s, fails the apply outright with
+// "grace 0s outside [60, 31536000]".
+//
+// This builds a plan in which EVERY attribute is unknown, so a field added to
+// monitorResourceModel and forgotten by the resolver fails here rather than in
+// somebody's production apply.
+func TestResolveUnknownsFromState_CoversEveryAttribute(t *testing.T) {
+	state := monitorResourceModel{
+		ID:                   types.StringValue("3f7c1f5a-1a2b-4c3d-8e9f-0a1b2c3d4e5f"),
+		Name:                 types.StringValue("nightly-backup"),
+		Slug:                 types.StringValue("nightly-backup"),
+		MonitorType:          types.StringValue("heartbeat"),
+		ScheduleKind:         types.StringValue("cron"),
+		PeriodS:              types.Int64Value(3600),
+		CronExpr:             types.StringValue("0 3 * * *"),
+		TZ:                   types.StringValue("Europe/Berlin"),
+		GraceS:               types.Int64Value(1800),
+		Tags:                 types.SetValueMust(types.StringType, []attr.Value{types.StringValue("prod")}),
+		RunawayCeiling:       types.Int64Value(40),
+		MonitorFrom:          types.StringValue("2027-01-01T00:00:00Z"),
+		ProbeURL:             types.StringValue("https://example.com/health"),
+		ProbeMethod:          types.StringValue("HEAD"),
+		ProbeIntervalS:       types.Int64Value(120),
+		ProbeExpectedBody:    types.StringValue("ok"),
+		ProbeExpectedStatus:  types.Int64Value(204),
+		ProbeTimeoutS:        types.Int64Value(25),
+		ProbeFollowRedirects: types.BoolValue(true),
+		Paused:               types.BoolValue(true),
+		PingURL:              types.StringValue("https://ping.lastping.dev/p/abc"),
+		Status:               types.StringValue("up"),
+		CreatedAt:            types.StringValue("2026-01-01T00:00:00Z"),
+		LastPingAt:           types.StringValue("2026-01-02T00:00:00Z"),
+		DueAt:                types.StringValue("2026-01-03T00:00:00Z"),
+		AlertAfter:           types.StringValue("2026-01-04T00:00:00Z"),
+		MaintenanceUntil:     types.StringValue("2026-01-05T00:00:00Z"),
+	}
+
+	// Every field unknown, and every field of `state` set to a distinctive
+	// value, so "carried forward" cannot be confused with "happened to match".
+	var allUnknown monitorResourceModel
+	planV := reflect.ValueOf(&allUnknown).Elem()
+	stateV := reflect.ValueOf(state)
+	for i := range planV.NumField() {
+		require.False(t, stateV.Field(i).Interface().(attr.Value).IsNull(),
+			"state field %s is unset, so this test cannot tell a carried-forward value from a zero",
+			planV.Type().Field(i).Name)
+		switch planV.Field(i).Interface().(type) {
+		case types.String:
+			planV.Field(i).Set(reflect.ValueOf(types.StringUnknown()))
+		case types.Int64:
+			planV.Field(i).Set(reflect.ValueOf(types.Int64Unknown()))
+		case types.Bool:
+			planV.Field(i).Set(reflect.ValueOf(types.BoolUnknown()))
+		case types.Set:
+			planV.Field(i).Set(reflect.ValueOf(types.SetUnknown(types.StringType)))
+		default:
+			t.Fatalf("field %s has an unhandled type %T; extend this test",
+				planV.Type().Field(i).Name, planV.Field(i).Interface())
+		}
+	}
+
+	require.Equal(t, state, resolveUnknownsFromState(allUnknown, state))
+}
+
+// TestResolveUnknownsFromState_LeavesKnownAndNullAlone: only unknowns are
+// resolved.
+//
+// A null is a real instruction. A plain Optional attribute removed from the
+// configuration plans as null and has to reach the API as unset — carrying
+// nulls forward as well would pin every removed attribute in place forever, so
+// `cron_expr` could never be deleted and `tags` could never be cleared.
+func TestResolveUnknownsFromState_LeavesKnownAndNullAlone(t *testing.T) {
+	state := monitorResourceModel{
+		Name:         types.StringValue("old-name"),
+		CronExpr:     types.StringValue("0 3 * * *"),
+		ScheduleKind: types.StringValue("cron"),
+		GraceS:       types.Int64Value(1800),
+		PeriodS:      types.Int64Value(3600),
+	}
+	plan := monitorResourceModel{
+		Name:         types.StringValue("new-name"), // configured: keep it
+		CronExpr:     types.StringNull(),            // removed: must stay unset
+		ScheduleKind: types.StringValue("simple"),   // configured: keep it
+		GraceS:       types.Int64Unknown(),          // omitted: carry forward
+		PeriodS:      types.Int64Value(7200),        // configured: keep it
+	}
+
+	got := resolveUnknownsFromState(plan, state)
+
+	require.Equal(t, types.StringValue("new-name"), got.Name)
+	require.True(t, got.CronExpr.IsNull(), "a removed attribute must not be resurrected from state")
+	require.Equal(t, types.StringValue("simple"), got.ScheduleKind)
+	require.Equal(t, types.Int64Value(1800), got.GraceS)
+	require.Equal(t, types.Int64Value(7200), got.PeriodS)
 }

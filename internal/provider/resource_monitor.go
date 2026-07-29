@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
+	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
@@ -570,6 +571,51 @@ func (r *monitorResource) Read(ctx context.Context, req resource.ReadRequest, re
 	resp.Diagnostics.Append(resp.State.Set(ctx, &newState)...)
 }
 
+// resolveUnknownsFromState returns plan with every unknown attribute replaced by
+// the value the prior state holds for it.
+//
+// This exists because of the way terraform-plugin-framework plans an
+// Optional+Computed attribute that the configuration omits: it marks it UNKNOWN
+// in the plan (fwserver.MarkComputedNilsAsUnknown keys off the *config*, not
+// the proposed new state), throwing away the prior value Terraform core had
+// already carried forward. `types.Int64.ValueInt64()` on an unknown returns 0
+// and `ValueString()` returns "", so the payload builder then invents a zero
+// nobody wrote — and `PATCH /api/v1/checks/{id}` is a whole-object replace, not
+// a merge, so that zero lands.
+//
+// The reported failure: grace_s = 1800 in state and in production, a
+// configuration omitting grace_s, an apply touching only `tags` — and
+// `check: grace 0s outside [60, 31536000]`, apply stopped dead. The silent
+// variants were worse: on an http monitor the same PATCH reset probe_timeout_s
+// and probe_expected_status to server defaults and turned probe_follow_redirects
+// off, with no error at all.
+//
+// Only unknowns are resolved, never nulls. A null is a real instruction: a
+// plain Optional attribute (cron_expr, runaway_ceiling, probe_interval_s,
+// probe_url, probe_expected_body, monitor_from, tags) removed from the
+// configuration plans as null and has to be sent as unset. Carrying nulls
+// forward too would pin every removed attribute in place forever.
+//
+// Resolving the whole model rather than a hand-picked list of attributes is
+// deliberate: the next Optional+Computed attribute added to the schema is
+// covered without anyone remembering this function exists. The result feeds
+// monitorFromModel and monitorPatchNeeded only and is never written to state,
+// so the response-only fields it also fills in (status, ping_url, the
+// deadlines) cannot mask a server-side change.
+func resolveUnknownsFromState(plan, state monitorResourceModel) monitorResourceModel {
+	out := plan
+	outV := reflect.ValueOf(&out).Elem()
+	stateV := reflect.ValueOf(state)
+	for i := range outV.NumField() {
+		v, ok := outV.Field(i).Interface().(attr.Value)
+		if !ok || !v.IsUnknown() {
+			continue
+		}
+		outV.Field(i).Set(stateV.Field(i))
+	}
+	return out
+}
+
 // monitorPatchNeeded reports whether any PATCH-able attribute actually differs
 // between the plan and the current state. `paused` is not one of them — it is
 // applied through the pause/resume endpoints — so a plan that only pauses a
@@ -599,12 +645,18 @@ func (r *monitorResource) Update(ctx context.Context, req resource.UpdateRequest
 
 	id := state.ID.ValueString()
 
-	planPayload, err := monitorFromModel(ctx, plan)
+	// PATCH replaces the whole object, so anything the plan left unknown has to
+	// come from the prior state before the payload is built — otherwise the
+	// write carries a zero the operator never configured. See
+	// resolveUnknownsFromState.
+	desired := resolveUnknownsFromState(plan, state)
+
+	planPayload, err := monitorFromModel(ctx, desired)
 	if err != nil {
 		resp.Diagnostics.AddError("Unable to build monitor payload", err.Error())
 		return
 	}
-	patchNeeded, err := monitorPatchNeeded(ctx, plan, state)
+	patchNeeded, err := monitorPatchNeeded(ctx, desired, state)
 	if err != nil {
 		resp.Diagnostics.AddError("Unable to build monitor payload", err.Error())
 		return

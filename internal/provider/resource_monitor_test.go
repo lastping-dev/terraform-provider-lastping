@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/plancheck"
 	"github.com/stretchr/testify/require"
 
 	"github.com/lastping-dev/terraform-provider-lastping/internal/client"
@@ -448,6 +449,202 @@ resource "lastping_monitor" "oob" {
 					// The refreshed state must reflect the removal, not the
 					// stale ["env:prod"] Terraform last knew about.
 					resource.TestCheckNoResourceAttr("lastping_monitor.oob", "tags.#"),
+				),
+			},
+		},
+	})
+}
+
+// TestAccMonitor_omittedOptionalComputedSurviveAnUnrelatedUpdate is the exact
+// apply that broke in production.
+//
+// A monitor holds grace_s = 1800 in state and on the server. The configuration
+// never mentions grace_s. An apply that changes only `tags` used to fail with
+//
+//	check: grace 0s outside [60, 31536000] [INVALID_GRACE_PERIOD]
+//
+// because terraform-plugin-framework marks every Optional+Computed attribute
+// absent from the configuration as unknown in the plan, `ValueInt64()` on an
+// unknown is 0, and `PATCH /api/v1/checks/{id}` replaces the whole object
+// rather than merging. The same mechanism emptied schedule_kind and zeroed
+// period_s and tz in the same request.
+//
+// Step 2 omits all four and touches only `tags`. It fails before the fix.
+func TestAccMonitor_omittedOptionalComputedSurviveAnUnrelatedUpdate(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				// Establish non-default values the server could not have
+				// guessed, so "unchanged" cannot be confused with "reset to a
+				// default that happens to match".
+				Config: `
+resource "lastping_monitor" "carry" {
+  name          = "acc-carry"
+  slug          = "acc-carry"
+  schedule_kind = "cron"
+  cron_expr     = "0 3 * * *"
+  tz            = "Europe/Berlin"
+  grace_s       = 1800
+  tags          = ["acc:test"]
+}`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("lastping_monitor.carry", "grace_s", "1800"),
+					resource.TestCheckResourceAttr("lastping_monitor.carry", "tz", "Europe/Berlin"),
+					resource.TestCheckResourceAttr("lastping_monitor.carry", "schedule_kind", "cron"),
+				),
+			},
+			{
+				// grace_s, tz and schedule_kind are gone from the configuration.
+				// Only tags changed. Nothing else may move.
+				Config: `
+resource "lastping_monitor" "carry" {
+  name      = "acc-carry"
+  slug      = "acc-carry"
+  cron_expr = "0 3 * * *"
+  tags      = ["acc:test", "acc:second"]
+}`,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("lastping_monitor.carry", plancheck.ResourceActionUpdate),
+					},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("lastping_monitor.carry", "grace_s", "1800"),
+					resource.TestCheckResourceAttr("lastping_monitor.carry", "tz", "Europe/Berlin"),
+					resource.TestCheckResourceAttr("lastping_monitor.carry", "schedule_kind", "cron"),
+					resource.TestCheckResourceAttr("lastping_monitor.carry", "cron_expr", "0 3 * * *"),
+					resource.TestCheckResourceAttr("lastping_monitor.carry", "tags.#", "2"),
+					// Read it back from the API, not just from state: a PATCH
+					// that reset the server would still leave state agreeing
+					// with the plan, because the plan said "known after apply".
+					resource.TestCheckResourceAttrWith("lastping_monitor.carry", "id",
+						func(id string) error {
+							mon, err := testAccDirectClient(t).GetMonitor(t.Context(), id)
+							if err != nil {
+								return err
+							}
+							if mon.GraceS != 1800 {
+								return fmt.Errorf("server holds grace_s=%d, want 1800", mon.GraceS)
+							}
+							if mon.TZ != "Europe/Berlin" {
+								return fmt.Errorf("server holds tz=%q, want Europe/Berlin", mon.TZ)
+							}
+							if mon.ScheduleKind != "cron" {
+								return fmt.Errorf("server holds schedule_kind=%q, want cron", mon.ScheduleKind)
+							}
+							return nil
+						}),
+				),
+			},
+		},
+	})
+}
+
+// TestAccMonitor_omittedPeriodSurvivesAnUnrelatedUpdate covers the simple
+// schedule half of the same bug. period_s is Optional+Computed too, and a
+// simple-schedule monitor whose configuration omits it had its period sent as
+// 0 on every update.
+func TestAccMonitor_omittedPeriodSurvivesAnUnrelatedUpdate(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "lastping_monitor" "period" {
+  name          = "acc-period"
+  slug          = "acc-period"
+  schedule_kind = "simple"
+  period_s      = 7200
+  grace_s       = 900
+  tags          = ["acc:test"]
+}`,
+				Check: resource.TestCheckResourceAttr("lastping_monitor.period", "period_s", "7200"),
+			},
+			{
+				Config: `
+resource "lastping_monitor" "period" {
+  name = "acc-period"
+  slug = "acc-period"
+  tags = ["acc:test", "acc:second"]
+}`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("lastping_monitor.period", "period_s", "7200"),
+					resource.TestCheckResourceAttr("lastping_monitor.period", "grace_s", "900"),
+					resource.TestCheckResourceAttr("lastping_monitor.period", "schedule_kind", "simple"),
+				),
+			},
+		},
+	})
+}
+
+// TestAccMonitor_omittedProbeSettingsSurviveAnUnrelatedUpdate is the silent
+// half of the same bug, and the more dangerous one: it raised no error at all.
+//
+// probe_expected_status, probe_timeout_s and probe_follow_redirects are
+// Optional+Computed. Omitted from the configuration they planned as "known
+// after apply", so the zero the provider then sent was accepted without
+// complaint — the probe quietly went back to accepting any 2xx, timing out at
+// the default, and not following redirects. Nothing in state looked wrong.
+func TestAccMonitor_omittedProbeSettingsSurviveAnUnrelatedUpdate(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "lastping_monitor" "probe" {
+  name                   = "acc-probe-carry"
+  slug                   = "acc-probe-carry"
+  monitor_type           = "http"
+  probe_url              = "https://example.com/health"
+  probe_interval_s       = 300
+  probe_expected_status  = 204
+  probe_timeout_s        = 25
+  probe_follow_redirects = true
+  tags                   = ["acc:test"]
+}`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("lastping_monitor.probe", "probe_expected_status", "204"),
+					resource.TestCheckResourceAttr("lastping_monitor.probe", "probe_timeout_s", "25"),
+					resource.TestCheckResourceAttr("lastping_monitor.probe", "probe_follow_redirects", "true"),
+				),
+			},
+			{
+				// All three are gone from the configuration; only tags changed.
+				Config: `
+resource "lastping_monitor" "probe" {
+  name             = "acc-probe-carry"
+  slug             = "acc-probe-carry"
+  monitor_type     = "http"
+  probe_url        = "https://example.com/health"
+  probe_interval_s = 300
+  tags             = ["acc:test", "acc:second"]
+}`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("lastping_monitor.probe", "probe_expected_status", "204"),
+					resource.TestCheckResourceAttr("lastping_monitor.probe", "probe_timeout_s", "25"),
+					resource.TestCheckResourceAttr("lastping_monitor.probe", "probe_follow_redirects", "true"),
+					resource.TestCheckResourceAttrWith("lastping_monitor.probe", "id",
+						func(id string) error {
+							mon, err := testAccDirectClient(t).GetMonitor(t.Context(), id)
+							if err != nil {
+								return err
+							}
+							if mon.ProbeExpectedStatus != 204 {
+								return fmt.Errorf("server holds probe_expected_status=%d, want 204",
+									mon.ProbeExpectedStatus)
+							}
+							if mon.ProbeTimeoutS != 25 {
+								return fmt.Errorf("server holds probe_timeout_s=%d, want 25", mon.ProbeTimeoutS)
+							}
+							if !mon.ProbeFollowRedirects {
+								return fmt.Errorf("server turned probe_follow_redirects off")
+							}
+							return nil
+						}),
 				),
 			},
 		},
