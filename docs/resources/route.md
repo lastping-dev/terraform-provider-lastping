@@ -74,6 +74,17 @@ resource "lastping_route" "backup_fail" {
   destination_ids = []
 }
 
+# "every-run" notifies once per completed run rather than on a state change, so
+# it is far chattier than the other three and is not flap-damped. The delivery
+# rate cap is per destination and shared across event types, so a busy every-run
+# route can use up the budget a real "down" alert needs — give it a low-stakes
+# destination rather than the one that pages someone.
+resource "lastping_route" "backup_every_run" {
+  monitor_id      = lastping_monitor.nightly_backup.id
+  event_type      = "every-run"
+  destination_ids = [lastping_destination.backup_owner.id]
+}
+
 variable "slack_webhook_url" {
   type      = string
   sensitive = true
@@ -86,7 +97,9 @@ variable "slack_webhook_url" {
 ### Required
 
 - `destination_ids` (List of String) Destinations notified for this event, as a **list**: the API stores and returns the array in the order given, and that order is the order alerts are dispatched in. An empty list is valid and means "deliver nowhere for this event", which is not the same as removing the resource. Duplicates are rejected at plan time because the API silently de-duplicates them, which would otherwise fail the apply as an inconsistent result.
-- `event_type` (String) Which event this route covers: `down`, `recovery`, `fail`. `down` fires when a monitor misses its deadline, `recovery` when it comes back, and `fail` when a run reports failure explicitly. Part of the resource's identity, so changing it replaces the resource.
+- `event_type` (String) Which event this route covers: `down`, `recovery`, `fail`, `every-run`. `down` fires when a monitor misses its deadline, `recovery` when it comes back, and `fail` when a run reports failure explicitly. Part of the resource's identity, so changing it replaces the resource.
+
+~> **`every-run` is much chattier than the other three.** They fire on a state change, so their volume is bounded by how often the monitor changes state. `every-run` fires once per completed run, success or failure, so its volume is bounded only by how often the monitor runs. It is also not flap-damped: a `fail` is held for the flap window so a short blip can be cancelled before it pages, while an `every-run` is released immediately. Most importantly the delivery rate cap is **per destination and the same for every event type** (60 notifications per hour by default), so a busy `every-run` route can use up a destination's budget and cause a later `down` or `fail` on that same destination to be dropped rather than delivered. Point `every-run` at a low-stakes destination, not at the one that pages someone.
 - `monitor_id` (String) UUID of the monitor whose alerts are being routed. The route lives at a path keyed on this id, so changing it replaces the resource.
 
 ## Import
@@ -100,6 +113,7 @@ The [`terraform import` command](https://developer.hashicorp.com/terraform/cli/c
 # and the event it covers — so the import ID carries both, separated by a colon:
 terraform import lastping_route.backup_down 550e8400-e29b-41d4-a716-446655440000:down
 
-# The event type must be one of down, recovery or fail. Anything else, or a
-# missing colon, is rejected with the expected shape rather than a lookup miss.
+# The event type must be one of down, recovery, fail or every-run. Anything
+# else, or a missing colon, is rejected with the expected shape rather than a
+# lookup miss.
 ```

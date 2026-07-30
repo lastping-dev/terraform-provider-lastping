@@ -47,6 +47,17 @@ resource "lastping_route" "backup_fail" {
   destination_ids = []
 }
 
+# "every-run" notifies once per completed run rather than on a state change, so
+# it is far chattier than the other three and is not flap-damped. The delivery
+# rate cap is per destination and shared across event types, so a busy every-run
+# route can use up the budget a real "down" alert needs — give it a low-stakes
+# destination rather than the one that pages someone.
+resource "lastping_route" "backup_every_run" {
+  monitor_id      = lastping_monitor.nightly_backup.id
+  event_type      = "every-run"
+  destination_ids = [lastping_destination.backup_owner.id]
+}
+
 variable "slack_webhook_url" {
   type      = string
   sensitive = true

@@ -30,7 +30,18 @@ var (
 )
 
 // routeEventTypes is the set the API accepts (api/routes.go: validEventTypes).
-var routeEventTypes = []string{"down", "recovery", "fail"}
+//
+// This is NOT the same set the API auto-routes on monitor creation
+// (api/defaultdest.go: defaultAlertEvents), which is down/fail/recovery only.
+// every-run is deliberately absent there, so widening this slice must not widen
+// the adoption exemption in routeIsServerDefault.
+var routeEventTypes = []string{"down", "recovery", "fail", "every-run"}
+
+// defaultAlertEvents mirrors api/defaultdest.go: the events the API attaches to
+// the project's default email destination when a monitor is created. Kept
+// separate from routeEventTypes on purpose — every-run is routable but is never
+// auto-routed.
+var defaultAlertEvents = []string{"down", "fail", "recovery"}
 
 // uuidValidator rejects a value the API could only answer with an opaque
 // "invalid JSON body" 400, because it decodes ids straight into uuid.UUID.
@@ -123,7 +134,16 @@ func (r *routeResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 				MarkdownDescription: "Which event this route covers: `" +
 					strings.Join(routeEventTypes, "`, `") + "`. `down` fires when a monitor misses its deadline, " +
 					"`recovery` when it comes back, and `fail` when a run reports failure explicitly. Part of the " +
-					"resource's identity, so changing it replaces the resource.",
+					"resource's identity, so changing it replaces the resource.\n\n" +
+					"~> **`every-run` is much chattier than the other three.** They fire on a state change, so " +
+					"their volume is bounded by how often the monitor changes state. `every-run` fires once per " +
+					"completed run, success or failure, so its volume is bounded only by how often the monitor " +
+					"runs. It is also not flap-damped: a `fail` is held for the flap window so a short blip can " +
+					"be cancelled before it pages, while an `every-run` is released immediately. Most importantly " +
+					"the delivery rate cap is **per destination and the same for every event type** (60 " +
+					"notifications per hour by default), so a busy `every-run` route can use up a destination's " +
+					"budget and cause a later `down` or `fail` on that same destination to be dropped rather than " +
+					"delivered. Point `every-run` at a low-stakes destination, not at the one that pages someone.",
 				Validators:    []validator.String{stringvalidator.OneOf(routeEventTypes...)},
 				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
 			},
@@ -246,8 +266,17 @@ func routeAdoptionConflict(existing, want []string) bool {
 // defaultDestID is "" when the project has no verified email channel. Then
 // attachDefaultRoutes returned early, no auto-route exists, and nothing can
 // match — hence the explicit guard rather than a comparison against "".
-func routeIsServerDefault(existing []string, defaultDestID string) bool {
+//
+// eventType gates the exemption to the three events the API actually
+// auto-routes. every-run is routable but is NOT auto-routed, so an existing
+// every-run route pointing at the default destination cannot have come from the
+// server — somebody chose it. Adopting it would be a pure false-positive that
+// buys nothing, so every-run gets the full guard instead.
+func routeIsServerDefault(eventType string, existing []string, defaultDestID string) bool {
 	if defaultDestID == "" {
+		return false
+	}
+	if !slices.Contains(defaultAlertEvents, eventType) {
 		return false
 	}
 	return len(existing) == 1 && existing[0] == defaultDestID
@@ -305,7 +334,7 @@ func (r *routeResource) Create(ctx context.Context, req resource.CreateRequest, 
 						monitorID, eventType))
 				return
 			}
-			if !routeIsServerDefault(existing.ChannelIDs, defaultDestID) {
+			if !routeIsServerDefault(eventType, existing.ChannelIDs, defaultDestID) {
 				resp.Diagnostics.AddError(
 					"Route already exists",
 					fmt.Sprintf("The %q route on monitor %s already sends to %s. Terraform will not "+
