@@ -26,8 +26,9 @@ func TestParseRouteImportID(t *testing.T) {
 		{name: "bare event type", id: "down", wantErr: "missing the \":\" separator"},
 		{name: "monitor slug, not id", id: "my-monitor:down", wantErr: "not a monitor UUID"},
 		{name: "empty monitor", id: ":down", wantErr: "not a monitor UUID"},
-		{name: "unknown event", id: monitorID + ":every-run", wantErr: "not one of down, recovery, fail"},
-		{name: "empty event", id: monitorID + ":", wantErr: "not one of down, recovery, fail"},
+		{name: "every-run", id: monitorID + ":every-run", wantEvent: "every-run"},
+		{name: "unknown event", id: monitorID + ":runaway", wantErr: "not one of down, recovery, fail, every-run"},
+		{name: "empty event", id: monitorID + ":", wantErr: "not one of down, recovery, fail, every-run"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			gotMonitor, gotEvent, err := parseRouteImportID(tc.id)
@@ -119,12 +120,39 @@ func TestRouteIsServerDefault(t *testing.T) {
 
 	for _, tc := range []struct {
 		name          string
+		eventType     string
 		existing      []string
 		defaultDestID string
 		want          bool
 	}{
 		{
 			name:          "exactly what attachDefaultRoutes writes",
+			eventType:     "down",
+			existing:      []string{defaultEmail},
+			defaultDestID: defaultEmail,
+			want:          true,
+		},
+		{
+			// attachDefaultRoutes writes down, fail and recovery — never
+			// every-run. An every-run route pointing at the default destination
+			// is therefore somebody's deliberate choice, and adopting it would
+			// silently redirect routing nobody asked Terraform to touch.
+			name:          "every-run is never auto-routed, so never adopted",
+			eventType:     "every-run",
+			existing:      []string{defaultEmail},
+			defaultDestID: defaultEmail,
+			want:          false,
+		},
+		{
+			name:          "fail is auto-routed and still adopted",
+			eventType:     "fail",
+			existing:      []string{defaultEmail},
+			defaultDestID: defaultEmail,
+			want:          true,
+		},
+		{
+			name:          "recovery is auto-routed and still adopted",
+			eventType:     "recovery",
 			existing:      []string{defaultEmail},
 			defaultDestID: defaultEmail,
 			want:          true,
@@ -182,7 +210,10 @@ func TestRouteIsServerDefault(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			require.Equal(t, tc.want, routeIsServerDefault(tc.existing, tc.defaultDestID))
+			if tc.eventType == "" {
+				tc.eventType = "down"
+			}
+			require.Equal(t, tc.want, routeIsServerDefault(tc.eventType, tc.existing, tc.defaultDestID))
 		})
 	}
 }

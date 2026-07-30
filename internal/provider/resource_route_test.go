@@ -230,6 +230,91 @@ resource "lastping_route" "fail" {
 	})
 }
 
+// TestAccRoute_everyRun: every-run is routable through the dashboard and has
+// been permitted by the check_routes constraint since the CI/CD signal-sources
+// migration, but the REST validator used to reject it — so a project configured
+// by clicking could not be reproduced in Terraform at all. This asserts the
+// fourth event type applies, round-trips through Read, and imports.
+//
+// every-run does not go through the auto-route adoption exemption: the API
+// never attaches an every-run route itself, so there is nothing to adopt.
+func TestAccRoute_everyRun(t *testing.T) {
+	config := routeFixtures + `
+resource "lastping_route" "every_run" {
+  monitor_id      = lastping_monitor.m.id
+  event_type      = "every-run"
+  destination_ids = [lastping_destination.first.id]
+}`
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("lastping_route.every_run", "event_type", "every-run"),
+					resource.TestCheckResourceAttrPair("lastping_route.every_run", "destination_ids.0",
+						"lastping_destination.first", "id"),
+					// Confirm against the API rather than trusting state: the
+					// bug being fixed was the server rejecting this value.
+					resource.TestCheckResourceAttrWith("lastping_route.every_run", "monitor_id",
+						func(id string) error {
+							routes, err := testAccDirectClient(t).GetRoutes(t.Context(), id)
+							if err != nil {
+								return err
+							}
+							for _, rt := range routes {
+								if rt.EventType == "every-run" {
+									return nil
+								}
+							}
+							return fmt.Errorf("the API has no every-run route for monitor %s: %+v", id, routes)
+						}),
+				),
+			},
+			{
+				// The import ID is "<monitor_id>:<event_type>", so this also
+				// pins that parseRouteImportID accepts the hyphenated type.
+				ResourceName: "lastping_route.every_run",
+				ImportState:  true,
+				// A route has no id of its own, so verification has to key on
+				// the monitor id instead (same as the other import tests).
+				ImportStateVerify:                    true,
+				ImportStateVerifyIdentifierAttribute: "monitor_id",
+				ImportStateIdFunc: func(s *terraform.State) (string, error) {
+					rs, ok := s.RootModule().Resources["lastping_route.every_run"]
+					if !ok {
+						return "", fmt.Errorf("lastping_route.every_run not found in state")
+					}
+					return rs.Primary.Attributes["monitor_id"] + ":every-run", nil
+				},
+			},
+			{
+				// Widening must not have broken the original three.
+				Config: routeFixtures + `
+resource "lastping_route" "every_run" {
+  monitor_id      = lastping_monitor.m.id
+  event_type      = "every-run"
+  destination_ids = [lastping_destination.first.id]
+}
+
+resource "lastping_route" "down" {
+  monitor_id      = lastping_monitor.m.id
+  event_type      = "down"
+  destination_ids = [lastping_destination.second.id]
+}`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("lastping_route.every_run", "event_type", "every-run"),
+					resource.TestCheckResourceAttr("lastping_route.down", "event_type", "down"),
+					resource.TestCheckResourceAttrPair("lastping_route.down", "destination_ids.0",
+						"lastping_destination.second", "id"),
+				),
+			},
+		},
+	})
+}
+
 // TestAccRoute_deletedOutOfBand: a route removed through the dashboard must be
 // recreated on the next apply, not fail the plan.
 func TestAccRoute_deletedOutOfBand(t *testing.T) {
@@ -275,10 +360,15 @@ func TestAccRoute_invalidConfig(t *testing.T) {
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{
 			{
+				// Was "every-run" until every-run became routable. The
+				// validator still has to reject something, so use a value the
+				// API has never accepted: "runaway" is a real incident cause,
+				// but it is surfaced through the fail event rather than routed
+				// on its own.
 				Config: `
 resource "lastping_route" "bad" {
   monitor_id      = "3f7c1f5a-1a2b-4c3d-8e9f-0a1b2c3d4e5f"
-  event_type      = "every-run"
+  event_type      = "runaway"
   destination_ids = []
 }`,
 				PlanOnly:    true,
@@ -340,7 +430,7 @@ resource "lastping_route" "down" {
 				ResourceName:  "lastping_route.down",
 				ImportState:   true,
 				ImportStateId: "3f7c1f5a-1a2b-4c3d-8e9f-0a1b2c3d4e5f:sideways",
-				ExpectError:   regexp.MustCompile(`(?s)not one of down, recovery, fail`),
+				ExpectError:   regexp.MustCompile(`(?s)not one of down, recovery, fail, every-run`),
 			},
 		},
 	})
