@@ -286,6 +286,177 @@ resource "lastping_monitor" "tagged" {
 	})
 }
 
+// TestAccMonitor_runawayCeilingCanBeRemoved is `tags` clearing for the other
+// null-clearable numeric field, which had no coverage at all.
+//
+// runaway_ceiling is a *int64 on the wire. `omitempty` dropped the key when the
+// attribute was removed from the configuration, which a merge-patch server
+// reads as "leave it alone" — the ceiling stayed on the monitor and kept
+// opening runaway incidents nobody could turn off through Terraform.
+func TestAccMonitor_runawayCeilingCanBeRemoved(t *testing.T) {
+	const withCeiling = `
+resource "lastping_monitor" "runaway" {
+  name            = "acc-runaway"
+  slug            = "acc-runaway"
+  schedule_kind   = "simple"
+  period_s        = 3600
+  grace_s         = 300
+  runaway_ceiling = 40
+}`
+	const withoutCeiling = `
+resource "lastping_monitor" "runaway" {
+  name          = "acc-runaway"
+  slug          = "acc-runaway"
+  schedule_kind = "simple"
+  period_s      = 3600
+  grace_s       = 300
+}`
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: withCeiling,
+				Check:  resource.TestCheckResourceAttr("lastping_monitor.runaway", "runaway_ceiling", "40"),
+			},
+			{
+				Config: withoutCeiling,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr("lastping_monitor.runaway", "runaway_ceiling"),
+					// Read it back from the API: state agreeing with the plan
+					// proves nothing when the plan said "removed" and the
+					// server was never told.
+					resource.TestCheckResourceAttrWith("lastping_monitor.runaway", "id", func(id string) error {
+						mon, err := testAccDirectClient(t).GetMonitor(t.Context(), id)
+						if err != nil {
+							return err
+						}
+						if mon.RunawayCeiling != nil {
+							return fmt.Errorf("server still holds runaway_ceiling=%d, want it cleared",
+								*mon.RunawayCeiling)
+						}
+						return nil
+					}),
+				),
+			},
+			{
+				// And it stays cleared: no perpetual diff on re-plan.
+				Config:   withoutCeiling,
+				PlanOnly: true,
+			},
+		},
+	})
+}
+
+// TestAccMonitor_monitorFromCanBeRemoved covers the third null-clearable
+// attribute. Same mechanism as runaway_ceiling: a *string that `omitempty`
+// dropped, leaving the stored anchor timestamp in place forever.
+func TestAccMonitor_monitorFromCanBeRemoved(t *testing.T) {
+	const withFrom = `
+resource "lastping_monitor" "mfclear" {
+  name          = "acc-monitor-from-clear"
+  slug          = "acc-monitor-from-clear"
+  schedule_kind = "simple"
+  period_s      = 3600
+  grace_s       = 300
+  monitor_from  = "2027-01-01T00:00:00Z"
+}`
+	const withoutFrom = `
+resource "lastping_monitor" "mfclear" {
+  name          = "acc-monitor-from-clear"
+  slug          = "acc-monitor-from-clear"
+  schedule_kind = "simple"
+  period_s      = 3600
+  grace_s       = 300
+}`
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: withFrom,
+				Check: resource.TestCheckResourceAttr(
+					"lastping_monitor.mfclear", "monitor_from", "2027-01-01T00:00:00Z"),
+			},
+			{
+				Config: withoutFrom,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr("lastping_monitor.mfclear", "monitor_from"),
+					resource.TestCheckResourceAttrWith("lastping_monitor.mfclear", "id", func(id string) error {
+						mon, err := testAccDirectClient(t).GetMonitor(t.Context(), id)
+						if err != nil {
+							return err
+						}
+						if mon.MonitorFrom != nil && *mon.MonitorFrom != "" {
+							return fmt.Errorf("server still holds monitor_from=%q, want it cleared",
+								*mon.MonitorFrom)
+						}
+						return nil
+					}),
+				),
+			},
+			{
+				Config:   withoutFrom,
+				PlanOnly: true,
+			},
+		},
+	})
+}
+
+// TestAccMonitor_probeFollowRedirectsCanBeTurnedOff is the meaningful-zero half
+// of the same bug, and it needs no attribute removal at all to bite.
+//
+// probe_follow_redirects defaults to true server-side. `omitempty` on a bool
+// drops the key when it is false, so `probe_follow_redirects = false` — a value
+// the practitioner wrote explicitly — produced the same bytes as not
+// configuring it. The stored `true` survived, and the probe kept following
+// redirects while both the plan and state said it did not.
+func TestAccMonitor_probeFollowRedirectsCanBeTurnedOff(t *testing.T) {
+	const cfg = `
+resource "lastping_monitor" "redir" {
+  name                   = "acc-redirects"
+  slug                   = "acc-redirects"
+  monitor_type           = "http"
+  probe_url              = "https://example.com/"
+  probe_interval_s       = 300
+  probe_follow_redirects = %s
+}`
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: fmt.Sprintf(cfg, "true"),
+				Check: resource.TestCheckResourceAttr(
+					"lastping_monitor.redir", "probe_follow_redirects", "true"),
+			},
+			{
+				Config: fmt.Sprintf(cfg, "false"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("lastping_monitor.redir", "probe_follow_redirects", "false"),
+					resource.TestCheckResourceAttrWith("lastping_monitor.redir", "id", func(id string) error {
+						mon, err := testAccDirectClient(t).GetMonitor(t.Context(), id)
+						if err != nil {
+							return err
+						}
+						if mon.ProbeFollowRedirects {
+							return fmt.Errorf("server still follows redirects, want it turned off")
+						}
+						return nil
+					}),
+				),
+			},
+			{
+				Config:   fmt.Sprintf(cfg, "false"),
+				PlanOnly: true,
+			},
+		},
+	})
+}
+
 // TestAccMonitor_pause exercises the update path where the only change is
 // `paused`: it maps onto the pause/resume endpoints and must not also PATCH the
 // monitor's configuration.
@@ -450,7 +621,7 @@ resource "lastping_monitor" "oob" {
 				// it as "clear", and the older full-replace server decoded it
 				// to a nil slice and cleared too. Simply omitting the key is
 				// NOT equivalent — under merge patch it preserves the tags and
-				// this test would silently stop testing anything.
+				// the test would silently stop testing anything.
 				//
 				// The other fields are echoed back unchanged so that a
 				// full-replace server rewrites them to the values they already
