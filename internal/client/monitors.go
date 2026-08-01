@@ -7,9 +7,15 @@ import (
 	"net/url"
 )
 
-// Monitor mirrors the Check schema in the LastPing OpenAPI spec. The same
-// struct is used for requests and responses; `omitempty` keeps unset fields out
-// of the payload, which the API reads as "not supplied".
+// Monitor mirrors the Check schema in the LastPing OpenAPI spec. It is the
+// create request body and every response body — but deliberately NOT the update
+// body.
+//
+// `omitempty` on every field is right for create, where an absent key means
+// "use the default". It is wrong for update: PATCH /api/v1/checks/{id} is a
+// JSON Merge Patch (RFC 7396), so an absent key means "leave the stored value
+// alone", and a struct that drops every zero value can therefore never clear
+// anything. Updates go through MonitorPatch instead.
 type Monitor struct {
 	ID                   string   `json:"id,omitempty"`
 	Name                 string   `json:"name"`
@@ -97,11 +103,31 @@ func (c *Client) GetMonitorBySlug(ctx context.Context, slug string) (*Monitor, e
 	return nil, &Problem{Status: http.StatusNotFound, Detail: fmt.Sprintf("no monitor with slug %q", slug)}
 }
 
-// UpdateMonitor updates a monitor's configuration. The API preserves slug and
-// monitor_type on PATCH regardless of what is sent — both are create-only.
-func (c *Client) UpdateMonitor(ctx context.Context, id string, m Monitor) (*Monitor, error) {
+// MonitorPatch is the body of PATCH /api/v1/checks/{id}: a sparse JSON Merge
+// Patch (RFC 7396) document.
+//
+//   - a key that is absent leaves the stored value alone;
+//   - a key whose value is nil serialises as JSON `null`, which clears the
+//     field — the API honours that for runaway_ceiling, monitor_from, tags,
+//     ci_workflow and ci_branch, and treats it as "absent" everywhere else;
+//   - any other value replaces the stored one.
+//
+// slug, monitor_type, ci_provider and ci_secret are create-only and ignored if
+// present.
+//
+// This is a map and not a struct on purpose. Presence is the entire point of a
+// merge patch, and encoding/json cannot express "present, and null" for a
+// struct field without a wrapper type per field. Reusing the Monitor struct —
+// whose blanket `omitempty` makes "cleared" and "unset" the same wire bytes —
+// is precisely what made removing tags from a configuration a silent no-op, so
+// do not reintroduce a second Monitor-shaped struct here.
+type MonitorPatch map[string]any
+
+// UpdateMonitor applies a merge patch to a monitor. See MonitorPatch for how an
+// absent key, an explicit null and a value differ.
+func (c *Client) UpdateMonitor(ctx context.Context, id string, patch MonitorPatch) (*Monitor, error) {
 	var out Monitor
-	if err := c.Do(ctx, http.MethodPatch, "/api/v1/checks/"+id, m, &out); err != nil {
+	if err := c.Do(ctx, http.MethodPatch, "/api/v1/checks/"+id, patch, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil

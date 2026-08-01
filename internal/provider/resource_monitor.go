@@ -347,8 +347,13 @@ func (r *monitorResource) Configure(_ context.Context, req resource.ConfigureReq
 	r.client = c
 }
 
-// monitorFromModel builds the API payload from the plan/config. Zero-value
-// optional fields are omitted by the client's `omitempty` JSON tags.
+// monitorFromModel builds the *create* payload from the plan. Zero-value
+// optional fields are omitted by the client's `omitempty` JSON tags, which on
+// create correctly means "take the server default".
+//
+// Update does not use this: an omitted key cannot clear anything. See
+// monitorPatchFromModel. It is still the right shape for monitorPatchNeeded,
+// which only ever compares two models against each other.
 func monitorFromModel(ctx context.Context, m monitorResourceModel) (client.Monitor, error) {
 	out := client.Monitor{
 		Name:                 m.Name.ValueString(),
@@ -383,6 +388,103 @@ func monitorFromModel(ctx context.Context, m monitorResourceModel) (client.Monit
 		out.Tags = tags
 	}
 	return out, nil
+}
+
+// monitorPatchFromModel builds the body of PATCH /api/v1/checks/{id}.
+//
+// It takes two models because the payload needs two different things:
+//
+//   - desired is the plan with unknowns resolved from the prior state (see
+//     resolveUnknownsFromState), so every value in it is concrete. It supplies
+//     the values.
+//   - cfg is the practitioner's literal configuration. It supplies presence,
+//     which the plan cannot: an attribute deleted from the HCL reads as null in
+//     cfg, and that is the only signal separating "clear this" from "the plan
+//     carried the stored value forward".
+//
+// The document is sparse (see client.MonitorPatch) and its keys fall into three
+// groups:
+//
+//  1. Clearable — tags, runaway_ceiling, monitor_from. Absent from the
+//     configuration, they are sent as an explicit JSON null. Under merge-patch
+//     that is the only way to clear them; under the older full-replace server a
+//     null decodes to a nil slice / nil pointer and clears them just as an
+//     absent key did. One document is therefore correct against both servers.
+//
+//  2. Meaningful zero — cron_expr, probe_expected_body,
+//     probe_follow_redirects. Always sent, never dropped. A configured "" has
+//     to be able to delete a cron expression or a body assertion, and a
+//     configured false has to be able to turn redirect-following off; dropping
+//     the zero makes all three states unreachable, because the stored value
+//     survives instead.
+//
+//  3. Everything else — sent only when non-zero, which is exactly what the
+//     `omitempty` tags used to do. These are the Optional+Computed and
+//     create-only attributes, and they must keep being sent: omitting them is
+//     only safe against a server that merges, and this provider still has to
+//     work against one that replaces. Narrowing them is a separate change.
+func monitorPatchFromModel(ctx context.Context, desired, cfg monitorResourceModel) (client.MonitorPatch, error) {
+	patch := client.MonitorPatch{
+		"name": desired.Name.ValueString(),
+
+		// Group 2.
+		"cron_expr":              desired.CronExpr.ValueString(),
+		"probe_expected_body":    desired.ProbeExpectedBody.ValueString(),
+		"probe_follow_redirects": desired.ProbeFollowRedirects.ValueBool(),
+	}
+
+	// Group 3.
+	putString := func(key string, v types.String) {
+		if s := v.ValueString(); s != "" {
+			patch[key] = s
+		}
+	}
+	putInt64 := func(key string, v types.Int64) {
+		if n := v.ValueInt64(); n != 0 {
+			patch[key] = n
+		}
+	}
+	putString("slug", desired.Slug)
+	putString("monitor_type", desired.MonitorType)
+	putString("schedule_kind", desired.ScheduleKind)
+	putInt64("period_s", desired.PeriodS)
+	putString("tz", desired.TZ)
+	putInt64("grace_s", desired.GraceS)
+	putString("probe_url", desired.ProbeURL)
+	putString("probe_method", desired.ProbeMethod)
+	putInt64("probe_interval_s", desired.ProbeIntervalS)
+	putInt64("probe_expected_status", desired.ProbeExpectedStatus)
+	putInt64("probe_timeout_s", desired.ProbeTimeoutS)
+
+	// Group 1. A nil value marshals to JSON null, which clears.
+	if cfg.RunawayCeiling.IsNull() || desired.RunawayCeiling.IsNull() {
+		patch["runaway_ceiling"] = nil
+	} else {
+		patch["runaway_ceiling"] = desired.RunawayCeiling.ValueInt64()
+	}
+
+	if cfg.MonitorFrom.IsNull() || desired.MonitorFrom.ValueString() == "" {
+		patch["monitor_from"] = nil
+	} else {
+		patch["monitor_from"] = desired.MonitorFrom.ValueString()
+	}
+
+	if cfg.Tags.IsNull() || desired.Tags.IsNull() || desired.Tags.IsUnknown() {
+		patch["tags"] = nil
+	} else {
+		var tags []string
+		if diags := desired.Tags.ElementsAs(ctx, &tags, false); diags.HasError() {
+			return nil, fmt.Errorf("read tags: %v", diags)
+		}
+		if tags == nil {
+			// An explicit `tags = []`. Send the empty array rather than letting
+			// it marshal to null: both clear, but the array says what was meant.
+			tags = []string{}
+		}
+		patch["tags"] = tags
+	}
+
+	return patch, nil
 }
 
 // stringOrNull maps the API's empty string — which is how it reports "unset" for
@@ -580,8 +682,8 @@ func (r *monitorResource) Read(ctx context.Context, req resource.ReadRequest, re
 // the proposed new state), throwing away the prior value Terraform core had
 // already carried forward. `types.Int64.ValueInt64()` on an unknown returns 0
 // and `ValueString()` returns "", so the payload builder then invents a zero
-// nobody wrote — and `PATCH /api/v1/checks/{id}` is a whole-object replace, not
-// a merge, so that zero lands.
+// nobody wrote — and against the full-replace `PATCH /api/v1/checks/{id}` this
+// provider still has to support, that zero lands.
 //
 // The reported failure: grace_s = 1800 in state and in production, a
 // configuration omitting grace_s, an apply touching only `tags` — and
@@ -593,13 +695,15 @@ func (r *monitorResource) Read(ctx context.Context, req resource.ReadRequest, re
 // Only unknowns are resolved, never nulls. A null is a real instruction: a
 // plain Optional attribute (cron_expr, runaway_ceiling, probe_interval_s,
 // probe_url, probe_expected_body, monitor_from, tags) removed from the
-// configuration plans as null and has to be sent as unset. Carrying nulls
-// forward too would pin every removed attribute in place forever.
+// configuration plans as null and has to reach the API as a clear — for the
+// clearable attributes that means an explicit JSON null, see
+// monitorPatchFromModel. Carrying nulls forward too would pin every removed
+// attribute in place forever.
 //
 // Resolving the whole model rather than a hand-picked list of attributes is
 // deliberate: the next Optional+Computed attribute added to the schema is
 // covered without anyone remembering this function exists. The result feeds
-// monitorFromModel and monitorPatchNeeded only and is never written to state,
+// monitorPatchFromModel and monitorPatchNeeded only and is never written to state,
 // so the response-only fields it also fills in (status, ping_url, the
 // deadlines) cannot mask a server-side change.
 func resolveUnknownsFromState(plan, state monitorResourceModel) monitorResourceModel {
@@ -636,22 +740,27 @@ func monitorPatchNeeded(ctx context.Context, plan, state monitorResourceModel) (
 }
 
 func (r *monitorResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
-	var plan, state monitorResourceModel
+	var plan, state, cfg monitorResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	// The configuration is read alongside the plan because it is the only place
+	// that records what the practitioner actually wrote: an attribute they
+	// deleted is null here even when the plan still carries the stored value.
+	// monitorPatchFromModel needs that to tell "clear it" from "leave it".
+	resp.Diagnostics.Append(req.Config.Get(ctx, &cfg)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
 	id := state.ID.ValueString()
 
-	// PATCH replaces the whole object, so anything the plan left unknown has to
-	// come from the prior state before the payload is built — otherwise the
-	// write carries a zero the operator never configured. See
+	// Anything the plan left unknown has to come from the prior state before the
+	// payload is built — otherwise the write carries a zero the operator never
+	// configured, which a full-replace server applies verbatim. See
 	// resolveUnknownsFromState.
 	desired := resolveUnknownsFromState(plan, state)
 
-	planPayload, err := monitorFromModel(ctx, desired)
+	patch, err := monitorPatchFromModel(ctx, desired, cfg)
 	if err != nil {
 		resp.Diagnostics.AddError("Unable to build monitor payload", err.Error())
 		return
@@ -664,7 +773,7 @@ func (r *monitorResource) Update(ctx context.Context, req resource.UpdateRequest
 
 	var out *client.Monitor
 	if patchNeeded {
-		out, err = r.client.UpdateMonitor(ctx, id, planPayload)
+		out, err = r.client.UpdateMonitor(ctx, id, patch)
 		if err != nil {
 			resp.Diagnostics.AddError("Unable to update monitor", err.Error())
 			return

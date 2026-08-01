@@ -442,17 +442,31 @@ resource "lastping_monitor" "oob" {
 			},
 			{
 				// Clear tags the way the dashboard, a direct API call, or MCP
-				// would: a PATCH that carries no tags at all. The API's PATCH
-				// fully replaces the config (see api/checks.go:
-				// handleUpdateCheck), so omitting tags clears them — this is
-				// exactly how "cleared out-of-band" happens in practice, not
-				// a contrivance of the test.
+				// would — this is how "cleared out-of-band" happens in
+				// practice, not a contrivance of the test.
+				//
+				// The clear is an explicit `tags: null`, which is correct
+				// against both server generations: a merge-patch server treats
+				// it as "clear", and the older full-replace server decoded it
+				// to a nil slice and cleared too. Simply omitting the key is
+				// NOT equivalent — under merge patch it preserves the tags and
+				// this test would silently stop testing anything.
+				//
+				// The other fields are echoed back unchanged so that a
+				// full-replace server rewrites them to the values they already
+				// hold rather than to zeroes the schedule cannot survive.
 				PreConfig: func() {
 					c := testAccDirectClient(t)
 					mon, err := c.GetMonitor(context.Background(), monitorID)
 					require.NoError(t, err)
-					mon.Tags = nil
-					_, err = c.UpdateMonitor(context.Background(), monitorID, *mon)
+					_, err = c.UpdateMonitor(context.Background(), monitorID, client.MonitorPatch{
+						"name":          mon.Name,
+						"schedule_kind": mon.ScheduleKind,
+						"period_s":      mon.PeriodS,
+						"tz":            mon.TZ,
+						"grace_s":       mon.GraceS,
+						"tags":          nil,
+					})
 					require.NoError(t, err)
 				},
 				RefreshState:       true,
