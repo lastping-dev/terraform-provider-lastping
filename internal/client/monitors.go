@@ -11,8 +11,8 @@ import (
 // create request body and every response body — but deliberately NOT the update
 // body.
 //
-// `omitempty` on every field is right for create, where an absent key means
-// "use the default". It is wrong for update: PATCH /api/v1/checks/{id} is a
+// `omitempty` on every field but Name is right for create, where an absent key
+// means "use the default". It is wrong for update: PATCH /api/v1/checks/{id} is a
 // JSON Merge Patch (RFC 7396), so an absent key means "leave the stored value
 // alone", and a struct that drops every zero value can therefore never clear
 // anything. Updates go through MonitorPatch instead.

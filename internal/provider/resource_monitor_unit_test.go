@@ -278,13 +278,49 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		require.Equal(t, fullyConfigured, got)
 	})
 
+	t.Run("null config clears even when the plan carries a value", func(t *testing.T) {
+		// This shape cannot arise with the current schema: tags,
+		// runaway_ceiling and monitor_from are Optional-only (pinned by
+		// TestMonitorOptionalOnlyAttributesAreNotComputed), so a null config
+		// always means a null plan — which is why the subtests above pass the
+		// same model as both arguments.
+		//
+		// It is asserted anyway, because it is the only case the cfg argument
+		// exists for. Making one of the three Optional+Computed would produce
+		// exactly this shape — config null, plan holding the stored value — on
+		// every apply that does not mention the attribute, and this assertion
+		// is what keeps the defensive branch from rotting into dead code
+		// nobody dares delete.
+		cfg := stored
+		cfg.Tags = types.SetNull(types.StringType)
+		cfg.RunawayCeiling = types.Int64Null()
+		cfg.MonitorFrom = types.StringNull()
+
+		got, err := monitorPatchFromModel(ctx, stored, cfg)
+		require.NoError(t, err)
+
+		require.Contains(t, got, "tags")
+		require.Nil(t, got["tags"], "a null config must clear, not echo the plan's value back")
+		require.Contains(t, got, "runaway_ceiling")
+		require.Nil(t, got["runaway_ceiling"])
+		require.Contains(t, got, "monitor_from")
+		require.Nil(t, got["monitor_from"])
+	})
+
 	t.Run("explicitly empty tags are sent as an empty array", func(t *testing.T) {
 		empty := stored
 		empty.Tags = types.SetValueMust(types.StringType, []attr.Value{})
 
+		// ElementsAs yields a non-nil zero-length slice here, so this reaches
+		// the wire as `[]` and not as `null`. Both clear the tags; the empty
+		// array is the one that says what was configured.
 		got, err := monitorPatchFromModel(ctx, empty, empty)
 		require.NoError(t, err)
 		require.Equal(t, []string{}, got["tags"])
+
+		body, err := json.Marshal(got)
+		require.NoError(t, err)
+		require.Contains(t, string(body), `"tags":[]`)
 	})
 }
 

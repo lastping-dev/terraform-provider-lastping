@@ -392,15 +392,31 @@ func monitorFromModel(ctx context.Context, m monitorResourceModel) (client.Monit
 
 // monitorPatchFromModel builds the body of PATCH /api/v1/checks/{id}.
 //
-// It takes two models because the payload needs two different things:
+// It takes two models:
 //
 //   - desired is the plan with unknowns resolved from the prior state (see
 //     resolveUnknownsFromState), so every value in it is concrete. It supplies
-//     the values.
-//   - cfg is the practitioner's literal configuration. It supplies presence,
-//     which the plan cannot: an attribute deleted from the HCL reads as null in
-//     cfg, and that is the only signal separating "clear this" from "the plan
-//     carried the stored value forward".
+//     the values — and, with the current schema, presence too: the three
+//     clearable attributes are Optional-only, so removing one from the
+//     configuration plans it as null.
+//   - cfg is the practitioner's literal configuration. Its null-ness is checked
+//     as well, but strictly as belt-and-braces: while those attributes stay
+//     Optional-only, cfg can never be null where desired holds a value, so
+//     dropping the argument would not change a byte of any payload today.
+//
+// The cfg check is kept because it is the signal that stays correct if one of
+// the three is ever made Optional+Computed — and that is exactly the change to
+// be careful about. terraform-plugin-framework marks an Optional+Computed
+// attribute absent from the configuration as unknown, which
+// resolveUnknownsFromState then fills from prior state; cfg would be null while
+// desired carried the stored value, and a function trusting desired alone would
+// send an explicit null and destroy tags on an apply that only renamed the
+// monitor. monitorPatchNeeded would not gate it either, because it compares
+// desired against state and the two would agree.
+//
+// TestMonitorOptionalOnlyAttributesAreNotComputed is the guardrail that keeps
+// tags, runaway_ceiling and monitor_from Optional-only. Read it before making
+// any of them Computed to suppress drift.
 //
 // The document is sparse (see client.MonitorPatch) and its keys fall into three
 // groups:
