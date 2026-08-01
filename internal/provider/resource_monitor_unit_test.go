@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"reflect"
 	"testing"
 
@@ -12,6 +13,8 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/stretchr/testify/require"
+
+	"github.com/lastping-dev/terraform-provider-lastping/internal/client"
 )
 
 // monitorSchema returns the resource schema for direct, backend-free assertions.
@@ -155,6 +158,170 @@ func TestMonitorPatchNeeded(t *testing.T) {
 	need, err = monitorPatchNeeded(ctx, untagged, base)
 	require.NoError(t, err)
 	require.True(t, need, "clearing tags must be PATCHed")
+}
+
+// TestMonitorPatchFromModel pins the exact PATCH document.
+//
+// PATCH /api/v1/checks/{id} is a JSON Merge Patch: an absent key preserves the
+// stored value. "Which keys are present" is therefore the entire contract — and
+// every bug this builder exists to fix was a key that was silently missing — so
+// these assertions compare the whole document rather than probing one key at a
+// time. A response-only attribute leaking into the body fails here too.
+func TestMonitorPatchFromModel(t *testing.T) {
+	ctx := context.Background()
+	tags := types.SetValueMust(types.StringType, []attr.Value{types.StringValue("env:prod")})
+
+	// A monitor as the server holds it, which after resolveUnknownsFromState is
+	// also what `desired` looks like. The response-only attributes are populated
+	// on purpose: none of them may appear in any expected document below.
+	stored := monitorResourceModel{
+		ID:                   types.StringValue("3f7c1f5a-1a2b-4c3d-8e9f-0a1b2c3d4e5f"),
+		Name:                 types.StringValue("acc"),
+		Slug:                 types.StringValue("acc"),
+		MonitorType:          types.StringValue("heartbeat"),
+		ScheduleKind:         types.StringValue("simple"),
+		PeriodS:              types.Int64Value(3600),
+		TZ:                   types.StringValue("UTC"),
+		GraceS:               types.Int64Value(1800),
+		Tags:                 tags,
+		RunawayCeiling:       types.Int64Value(40),
+		MonitorFrom:          types.StringValue("2027-01-01T00:00:00Z"),
+		ProbeMethod:          types.StringValue("GET"),
+		ProbeExpectedStatus:  types.Int64Value(200),
+		ProbeTimeoutS:        types.Int64Value(10),
+		ProbeFollowRedirects: types.BoolValue(true),
+		Paused:               types.BoolValue(true),
+		Status:               types.StringValue("up"),
+		PingURL:              types.StringValue("https://ping.lastping.dev/p/abc"),
+		CreatedAt:            types.StringValue("2026-01-01T00:00:00Z"),
+	}
+
+	// cron_expr, probe_expected_body and probe_follow_redirects are always
+	// present even at their zero value: a configured "" must be able to delete
+	// the cron expression or the body assertion, and a configured false must be
+	// able to turn redirect-following off. probe_url and probe_interval_s are
+	// absent because they are unset on a heartbeat monitor.
+	fullyConfigured := client.MonitorPatch{
+		"name":                   "acc",
+		"slug":                   "acc",
+		"monitor_type":           "heartbeat",
+		"schedule_kind":          "simple",
+		"period_s":               int64(3600),
+		"tz":                     "UTC",
+		"grace_s":                int64(1800),
+		"cron_expr":              "",
+		"probe_method":           "GET",
+		"probe_expected_status":  int64(200),
+		"probe_timeout_s":        int64(10),
+		"probe_expected_body":    "",
+		"probe_follow_redirects": true,
+		"tags":                   []string{"env:prod"},
+		"runaway_ceiling":        int64(40),
+		"monitor_from":           "2027-01-01T00:00:00Z",
+	}
+
+	t.Run("attribute present with a value", func(t *testing.T) {
+		got, err := monitorPatchFromModel(ctx, stored, stored)
+		require.NoError(t, err)
+		require.Equal(t, fullyConfigured, got)
+	})
+
+	t.Run("attribute removed from config is an explicit null", func(t *testing.T) {
+		// tags, runaway_ceiling and monitor_from are plain Optional, so deleting
+		// them from the HCL makes them null in both the config and the plan.
+		cfg := stored
+		cfg.Tags = types.SetNull(types.StringType)
+		cfg.RunawayCeiling = types.Int64Null()
+		cfg.MonitorFrom = types.StringNull()
+
+		want := client.MonitorPatch{}
+		for k, v := range fullyConfigured {
+			want[k] = v
+		}
+		want["tags"] = nil
+		want["runaway_ceiling"] = nil
+		want["monitor_from"] = nil
+
+		got, err := monitorPatchFromModel(ctx, cfg, cfg)
+		require.NoError(t, err)
+		require.Equal(t, want, got)
+
+		// nil has to reach the wire as JSON null, not as a dropped key: an
+		// absent key is exactly what the old payload sent and exactly what
+		// merge-patch reads as "leave it alone".
+		body, err := json.Marshal(got)
+		require.NoError(t, err)
+		require.Contains(t, string(body), `"tags":null`)
+		require.Contains(t, string(body), `"runaway_ceiling":null`)
+		require.Contains(t, string(body), `"monitor_from":null`)
+	})
+
+	t.Run("optional+computed absent from config is still sent", func(t *testing.T) {
+		// The server supplies these when the configuration omits them, so they
+		// are null in the config while the plan (after resolveUnknownsFromState)
+		// still holds the stored value. Omitting them would be correct only
+		// against a merge-patch server; against the full-replace server this
+		// provider also supports it would reset them. So: still sent, verbatim.
+		cfg := stored
+		cfg.MonitorType = types.StringNull()
+		cfg.ScheduleKind = types.StringNull()
+		cfg.PeriodS = types.Int64Null()
+		cfg.TZ = types.StringNull()
+		cfg.GraceS = types.Int64Null()
+		cfg.ProbeMethod = types.StringNull()
+		cfg.ProbeExpectedStatus = types.Int64Null()
+		cfg.ProbeTimeoutS = types.Int64Null()
+		cfg.ProbeFollowRedirects = types.BoolNull()
+
+		got, err := monitorPatchFromModel(ctx, stored, cfg)
+		require.NoError(t, err)
+		require.Equal(t, fullyConfigured, got)
+	})
+
+	t.Run("null config clears even when the plan carries a value", func(t *testing.T) {
+		// This shape cannot arise with the current schema: tags,
+		// runaway_ceiling and monitor_from are Optional-only (pinned by
+		// TestMonitorOptionalOnlyAttributesAreNotComputed), so a null config
+		// always means a null plan — which is why the subtests above pass the
+		// same model as both arguments.
+		//
+		// It is asserted anyway, because it is the only case the cfg argument
+		// exists for. Making one of the three Optional+Computed would produce
+		// exactly this shape — config null, plan holding the stored value — on
+		// every apply that does not mention the attribute, and this assertion
+		// is what keeps the defensive branch from rotting into dead code
+		// nobody dares delete.
+		cfg := stored
+		cfg.Tags = types.SetNull(types.StringType)
+		cfg.RunawayCeiling = types.Int64Null()
+		cfg.MonitorFrom = types.StringNull()
+
+		got, err := monitorPatchFromModel(ctx, stored, cfg)
+		require.NoError(t, err)
+
+		require.Contains(t, got, "tags")
+		require.Nil(t, got["tags"], "a null config must clear, not echo the plan's value back")
+		require.Contains(t, got, "runaway_ceiling")
+		require.Nil(t, got["runaway_ceiling"])
+		require.Contains(t, got, "monitor_from")
+		require.Nil(t, got["monitor_from"])
+	})
+
+	t.Run("explicitly empty tags are sent as an empty array", func(t *testing.T) {
+		empty := stored
+		empty.Tags = types.SetValueMust(types.StringType, []attr.Value{})
+
+		// ElementsAs yields a non-nil zero-length slice here, so this reaches
+		// the wire as `[]` and not as `null`. Both clear the tags; the empty
+		// array is the one that says what was configured.
+		got, err := monitorPatchFromModel(ctx, empty, empty)
+		require.NoError(t, err)
+		require.Equal(t, []string{}, got["tags"])
+
+		body, err := json.Marshal(got)
+		require.NoError(t, err)
+		require.Contains(t, string(body), `"tags":[]`)
+	})
 }
 
 // TestTagsValueMapsEmptyToPriorShape: the API always returns an array, so an
