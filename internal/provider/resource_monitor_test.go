@@ -405,6 +405,67 @@ resource "lastping_monitor" "mfclear" {
 	})
 }
 
+// TestAccMonitor_probeExpectedBodyCanBeRemoved is the fourth broken field, and
+// the other meaningful-zero one.
+//
+// probe_expected_body is not null-clearable server-side: "" is what clears it,
+// and "" is exactly what `omitempty` used to drop. So removing the assertion
+// from the configuration left the probe still requiring the substring while
+// plan and state both agreed it was gone — a monitor that keeps failing on a
+// rule its own configuration no longer contains.
+func TestAccMonitor_probeExpectedBodyCanBeRemoved(t *testing.T) {
+	const withBody = `
+resource "lastping_monitor" "body" {
+  name                = "acc-expected-body"
+  slug                = "acc-expected-body"
+  monitor_type        = "http"
+  probe_url           = "https://example.com/health"
+  probe_interval_s    = 300
+  probe_expected_body = "ok"
+}`
+	const withoutBody = `
+resource "lastping_monitor" "body" {
+  name             = "acc-expected-body"
+  slug             = "acc-expected-body"
+  monitor_type     = "http"
+  probe_url        = "https://example.com/health"
+  probe_interval_s = 300
+}`
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: withBody,
+				Check: resource.TestCheckResourceAttr(
+					"lastping_monitor.body", "probe_expected_body", "ok"),
+			},
+			{
+				Config: withoutBody,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr("lastping_monitor.body", "probe_expected_body"),
+					resource.TestCheckResourceAttrWith("lastping_monitor.body", "id", func(id string) error {
+						mon, err := testAccDirectClient(t).GetMonitor(t.Context(), id)
+						if err != nil {
+							return err
+						}
+						if mon.ProbeExpectedBody != "" {
+							return fmt.Errorf("server still holds probe_expected_body=%q, want it cleared",
+								mon.ProbeExpectedBody)
+						}
+						return nil
+					}),
+				),
+			},
+			{
+				Config:   withoutBody,
+				PlanOnly: true,
+			},
+		},
+	})
+}
+
 // TestAccMonitor_probeFollowRedirectsCanBeTurnedOff is the meaningful-zero half
 // of the same bug, and it needs no attribute removal at all to bite.
 //
