@@ -485,17 +485,21 @@ func monitorPatchFromModel(ctx context.Context, desired, cfg monitorResourceMode
 		patch["monitor_from"] = desired.MonitorFrom.ValueString()
 	}
 
-	if cfg.Tags.IsNull() || desired.Tags.IsNull() || desired.Tags.IsUnknown() {
+	// No IsUnknown() arm here on purpose: desired has been through
+	// resolveUnknownsFromState and prior state never holds unknowns, so tags
+	// cannot be unknown at this point. Adding the arm back would also pick the
+	// wrong default — "I don't know what the tags are" must never resolve to
+	// "clear them".
+	if cfg.Tags.IsNull() || desired.Tags.IsNull() {
 		patch["tags"] = nil
 	} else {
+		// An explicit `tags = []` lands here and sends `[]` rather than null.
+		// Both clear the tags, but the empty array says what was configured.
+		// ElementsAs yields a non-nil zero-length slice for an empty set, so no
+		// nil-normalising is needed to get `[]` instead of `null` on the wire.
 		var tags []string
 		if diags := desired.Tags.ElementsAs(ctx, &tags, false); diags.HasError() {
 			return nil, fmt.Errorf("read tags: %v", diags)
-		}
-		if tags == nil {
-			// An explicit `tags = []`. Send the empty array rather than letting
-			// it marshal to null: both clear, but the array says what was meant.
-			tags = []string{}
 		}
 		patch["tags"] = tags
 	}
