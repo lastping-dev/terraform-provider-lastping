@@ -182,9 +182,6 @@ resource "lastping_alert_template" "t" {
 	})
 }
 
-// TestAccAlertTemplate_invalidConfig: a bad key or an un-storable body is a
-// plan-time error naming the attribute, or — for a body the server cannot
-// render — an apply error naming the key, with nothing written either way.
 // TestAccAlertTemplate_successAndStartedKeys covers the two event types the
 // server added alongside every-run. The key grammar is validated at plan time
 // against templateKeyPattern, so a key the API accepts but the pattern does not
@@ -220,6 +217,9 @@ resource "lastping_alert_template" "t" {
 	})
 }
 
+// TestAccAlertTemplate_invalidConfig: a bad key or an un-storable body is a
+// plan-time error naming the attribute, or — for a body the server cannot
+// render — an apply error naming the key, with nothing written either way.
 func TestAccAlertTemplate_invalidConfig(t *testing.T) {
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
