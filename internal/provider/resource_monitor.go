@@ -100,11 +100,11 @@ type monitorResource struct {
 // Optional+Computed is used only where the *server* genuinely supplies a value
 // the configuration cannot: grace_s (floored to 2*probe_interval_s for http
 // monitors), schedule_kind and period_s (derived from probe_interval_s for http
-// monitors), tz (defaults to UTC), the probe_* defaults backed by column
-// defaults, and the attributes carrying a provider-side Default. Everything
-// else is plain Optional so that removing it from the configuration actually
-// unsets it — a blanket Optional+Computed pins the previous value in state
-// forever.
+// monitors), tz (defaults to UTC), failure_threshold (column default 1, always
+// returned), the probe_* defaults backed by column defaults, and the attributes
+// carrying a provider-side Default. Everything else is plain Optional so that
+// removing it from the configuration actually unsets it — a blanket
+// Optional+Computed pins the previous value in state forever.
 type monitorResourceModel struct {
 	ID                   types.String `tfsdk:"id"`
 	Name                 types.String `tfsdk:"name"`
@@ -115,6 +115,8 @@ type monitorResourceModel struct {
 	CronExpr             types.String `tfsdk:"cron_expr"`
 	TZ                   types.String `tfsdk:"tz"`
 	GraceS               types.Int64  `tfsdk:"grace_s"`
+	MaxRuntimeS          types.Int64  `tfsdk:"max_runtime_s"`
+	FailureThreshold     types.Int64  `tfsdk:"failure_threshold"`
 	Tags                 types.Set    `tfsdk:"tags"`
 	RunawayCeiling       types.Int64  `tfsdk:"runaway_ceiling"`
 	MonitorFrom          types.String `tfsdk:"monitor_from"`
@@ -213,6 +215,42 @@ func (r *monitorResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 					"`2 * probe_interval_s`, so omit it to take the floor; a larger value is honoured as-is.",
 				Validators: []validator.Int64{int64validator.Between(60, 31536000)},
 			},
+			"max_runtime_s": schema.Int64Attribute{
+				Optional: true,
+				MarkdownDescription: "How long a single run may take, in seconds, before it is called overdue. " +
+					"Must be between 60 and 31536000 (one year). Measured from a `/start` ping that has not been " +
+					"matched by a completion, so it only means anything on a monitor that reports both.\n\n" +
+					"This replaces `grace_s` for the **overrun deadline only**: the silence rule " +
+					"(`due_at + grace_s`) and the first-run seed (`monitor_from + grace_s`) keep using `grace_s`. " +
+					"That split is the point — it is what makes \"alert if silent for more than 10 minutes, but " +
+					"allow a 4-hour run\" expressible. Omit it and the overrun budget falls back to `grace_s`, " +
+					"exactly as before this attribute existed; removing it from the configuration restores that " +
+					"fallback.\n\n" +
+					"~> **Not supported on `monitor_type = \"http\"`.** A probe has no start/success pair — the " +
+					"prober mints a fresh run id for every probe — so no start is ever outstanding and the " +
+					"overrun rule can never fire. The API rejects it with 400 `MAX_RUNTIME_NOT_SUPPORTED`, and " +
+					"this provider rejects it at plan time. Use `probe_timeout_s` to bound a single probe.",
+				Validators: []validator.Int64{int64validator.Between(60, 31536000)},
+			},
+			"failure_threshold": schema.Int64Attribute{
+				Optional: true,
+				Computed: true,
+				MarkdownDescription: "How many **consecutive** explicit failures are needed before an incident " +
+					"opens — retry-before-alert. Between 1 and 100; the server defaults it to `1`, meaning " +
+					"\"open on the first failure\".\n\n" +
+					"It gates the `fail` cause **only**. `silence`, `overrun`, `never_started` and `runaway` are " +
+					"time- or rate-based, so a consecutive-failure count is meaningless for them and never gates " +
+					"them — raising this does not buy a late monitor any extra time. Below the threshold nothing " +
+					"alerts and the status does not change, but the ping is still recorded, an outstanding run is " +
+					"still ended and the deadlines are still recomputed. Any success resets the counter.\n\n" +
+					"~> **There is no \"unset\" to go back to.** The column is `NOT NULL DEFAULT 1`, so the API " +
+					"cannot clear this the way it clears `runaway_ceiling`: removing the attribute from the " +
+					"configuration leaves the stored value in place rather than returning it to `1`. Set it to " +
+					"`1` explicitly to get the default behaviour back. Changing it also does not reset the " +
+					"monitor's current failure count, so lowering it can open an incident on the very next " +
+					"failure.",
+				Validators: []validator.Int64{int64validator.Between(1, 100)},
+			},
 			"tags": schema.SetAttribute{
 				Optional:            true,
 				ElementType:         types.StringType,
@@ -307,11 +345,23 @@ func (r *monitorResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 	}
 }
 
-// ValidateConfig rejects an http monitor whose grace_s is below the server's
-// floor of 2*probe_interval_s. Without this the configuration plans cleanly and
-// then fails the apply with "provider produced inconsistent result", because
-// Terraform requires a known planned value to survive apply unchanged and the
-// server would have raised the grace.
+// ValidateConfig rejects the two http-monitor configurations the server will
+// not honour as written. Both are caught here rather than at apply time,
+// because a plan-time error names the attribute and costs nothing, while the
+// apply-time failures are opaque: an inconsistent-result panic for the first
+// and a bare 400 for the second, both after Terraform has already started
+// changing things.
+//
+//   - grace_s below the server's floor of 2*probe_interval_s. Terraform requires
+//     a known planned value to survive apply unchanged, and the server would
+//     have raised the grace — so the apply dies with "provider produced
+//     inconsistent result".
+//
+//   - max_runtime_s set at all. An http probe has no start/success pair, so the
+//     overrun rule can never fire and the API answers 400
+//     MAX_RUNTIME_NOT_SUPPORTED. Only a non-null configured value is rejected:
+//     an omitted max_runtime_s still reaches the API as an explicit null on
+//     update (see monitorPatchFromModel), which the API accepts as a no-op.
 func (r *monitorResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
 	var cfg monitorResourceModel
 	resp.Diagnostics.Append(req.Config.Get(ctx, &cfg)...)
@@ -321,6 +371,16 @@ func (r *monitorResource) ValidateConfig(ctx context.Context, req resource.Valid
 	if cfg.MonitorType.IsUnknown() || cfg.MonitorType.ValueString() != "http" {
 		return
 	}
+
+	if !cfg.MaxRuntimeS.IsNull() && !cfg.MaxRuntimeS.IsUnknown() {
+		resp.Diagnostics.AddAttributeError(path.Root("max_runtime_s"),
+			"max_runtime_s is not supported on an http monitor",
+			"The API rejects max_runtime_s on monitor_type = \"http\" with 400 "+
+				"MAX_RUNTIME_NOT_SUPPORTED. An HTTP probe has no start/success pair — the prober mints a "+
+				"fresh run id for every probe — so no start is ever outstanding and the overrun rule can "+
+				"never fire.\n\nRemove max_runtime_s. To bound a single probe, use probe_timeout_s.")
+	}
+
 	if cfg.GraceS.IsNull() || cfg.GraceS.IsUnknown() ||
 		cfg.ProbeIntervalS.IsNull() || cfg.ProbeIntervalS.IsUnknown() {
 		return
@@ -364,6 +424,7 @@ func monitorFromModel(ctx context.Context, m monitorResourceModel) (client.Monit
 		CronExpr:             m.CronExpr.ValueString(),
 		TZ:                   m.TZ.ValueString(),
 		GraceS:               m.GraceS.ValueInt64(),
+		FailureThreshold:     m.FailureThreshold.ValueInt64(),
 		ProbeURL:             m.ProbeURL.ValueString(),
 		ProbeMethod:          m.ProbeMethod.ValueString(),
 		ProbeIntervalS:       m.ProbeIntervalS.ValueInt64(),
@@ -375,6 +436,10 @@ func monitorFromModel(ctx context.Context, m monitorResourceModel) (client.Monit
 	if !m.RunawayCeiling.IsNull() && !m.RunawayCeiling.IsUnknown() {
 		v := m.RunawayCeiling.ValueInt64()
 		out.RunawayCeiling = &v
+	}
+	if !m.MaxRuntimeS.IsNull() && !m.MaxRuntimeS.IsUnknown() {
+		v := m.MaxRuntimeS.ValueInt64()
+		out.MaxRuntimeS = &v
 	}
 	if !m.MonitorFrom.IsNull() && !m.MonitorFrom.IsUnknown() && m.MonitorFrom.ValueString() != "" {
 		v := m.MonitorFrom.ValueString()
@@ -396,7 +461,7 @@ func monitorFromModel(ctx context.Context, m monitorResourceModel) (client.Monit
 //
 //   - desired is the plan with unknowns resolved from the prior state (see
 //     resolveUnknownsFromState), so every value in it is concrete. It supplies
-//     the values — and, with the current schema, presence too: the three
+//     the values — and, with the current schema, presence too: the four
 //     clearable attributes are Optional-only, so removing one from the
 //     configuration plans it as null.
 //   - cfg is the practitioner's literal configuration. Its null-ness is checked
@@ -405,7 +470,7 @@ func monitorFromModel(ctx context.Context, m monitorResourceModel) (client.Monit
 //     dropping the argument would not change a byte of any payload today.
 //
 // The cfg check is kept because it is the signal that stays correct if one of
-// the three is ever made Optional+Computed — and that is exactly the change to
+// the four is ever made Optional+Computed — and that is exactly the change to
 // be careful about. terraform-plugin-framework marks an Optional+Computed
 // attribute absent from the configuration as unknown, which
 // resolveUnknownsFromState then fills from prior state; cfg would be null while
@@ -415,17 +480,18 @@ func monitorFromModel(ctx context.Context, m monitorResourceModel) (client.Monit
 // desired against state and the two would agree.
 //
 // TestMonitorOptionalOnlyAttributesAreNotComputed is the guardrail that keeps
-// tags, runaway_ceiling and monitor_from Optional-only. Read it before making
-// any of them Computed to suppress drift.
+// tags, runaway_ceiling, monitor_from and max_runtime_s Optional-only. Read it
+// before making any of them Computed to suppress drift.
 //
 // The document is sparse (see client.MonitorPatch) and its keys fall into three
 // groups:
 //
-//  1. Clearable — tags, runaway_ceiling, monitor_from. Absent from the
-//     configuration, they are sent as an explicit JSON null. Under merge-patch
-//     that is the only way to clear them; under the older full-replace server a
-//     null decodes to a nil slice / nil pointer and clears them just as an
-//     absent key did. One document is therefore correct against both servers.
+//  1. Clearable — tags, runaway_ceiling, monitor_from, max_runtime_s. Absent
+//     from the configuration, they are sent as an explicit JSON null. Under
+//     merge-patch that is the only way to clear them; under the older
+//     full-replace server a null decodes to a nil slice / nil pointer and clears
+//     them just as an absent key did. One document is therefore correct against
+//     both servers.
 //
 //  2. Meaningful zero — cron_expr, probe_expected_body,
 //     probe_follow_redirects. Always sent, never dropped. A configured "" has
@@ -471,12 +537,29 @@ func monitorPatchFromModel(ctx context.Context, desired, cfg monitorResourceMode
 	putInt64("probe_interval_s", desired.ProbeIntervalS)
 	putInt64("probe_expected_status", desired.ProbeExpectedStatus)
 	putInt64("probe_timeout_s", desired.ProbeTimeoutS)
+	// failure_threshold belongs here and not in group 1: the column is
+	// NOT NULL DEFAULT 1, so the API has no "cleared" state to send it to and
+	// reads an explicit null as an omission. Its valid range starts at 1, so
+	// omit-when-zero never drops a value a practitioner could have written.
+	putInt64("failure_threshold", desired.FailureThreshold)
 
 	// Group 1. A nil value marshals to JSON null, which clears.
 	if cfg.RunawayCeiling.IsNull() || desired.RunawayCeiling.IsNull() {
 		patch["runaway_ceiling"] = nil
 	} else {
 		patch["runaway_ceiling"] = desired.RunawayCeiling.ValueInt64()
+	}
+
+	// max_runtime_s is clearable, so it needs the explicit-null form rather than
+	// omit-when-zero: dropping the key would make "go back to the grace_s
+	// fallback" unreachable, which is the bug tags, runaway_ceiling and
+	// monitor_from all had. The null is safe to send even on an http monitor,
+	// where any non-null value is a 400 — the API accepts a null there as a
+	// no-op, and ValidateConfig has already refused a configured value.
+	if cfg.MaxRuntimeS.IsNull() || desired.MaxRuntimeS.IsNull() {
+		patch["max_runtime_s"] = nil
+	} else {
+		patch["max_runtime_s"] = desired.MaxRuntimeS.ValueInt64()
 	}
 
 	if cfg.MonitorFrom.IsNull() || desired.MonitorFrom.ValueString() == "" {
@@ -588,6 +671,10 @@ func modelFromMonitor(ctx context.Context, mon *client.Monitor, prior monitorRes
 		ProbeURL:     stringOrNull(mon.ProbeURL),
 		ProbeMethod:  types.StringValue(mon.ProbeMethod),
 
+		// failure_threshold is NOT NULL DEFAULT 1 server-side and always comes
+		// back, so it is a concrete number rather than an int64OrNull.
+		FailureThreshold: types.Int64Value(mon.FailureThreshold),
+
 		ProbeIntervalS:       int64OrNull(mon.ProbeIntervalS),
 		ProbeExpectedBody:    stringOrNull(mon.ProbeExpectedBody),
 		ProbeExpectedStatus:  types.Int64Value(mon.ProbeExpectedStatus),
@@ -607,6 +694,13 @@ func modelFromMonitor(ctx context.Context, mon *client.Monitor, prior monitorRes
 		m.RunawayCeiling = types.Int64Value(*mon.RunawayCeiling)
 	} else {
 		m.RunawayCeiling = types.Int64Null()
+	}
+	// The API omits max_runtime_s entirely when it is unset, which is the
+	// "fall back to grace_s" state and has to read as null, not 0.
+	if mon.MaxRuntimeS != nil {
+		m.MaxRuntimeS = types.Int64Value(*mon.MaxRuntimeS)
+	} else {
+		m.MaxRuntimeS = types.Int64Null()
 	}
 	m.MonitorFrom = monitorFromValue(mon.MonitorFrom, prior.MonitorFrom)
 

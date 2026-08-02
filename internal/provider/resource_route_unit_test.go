@@ -27,8 +27,18 @@ func TestParseRouteImportID(t *testing.T) {
 		{name: "monitor slug, not id", id: "my-monitor:down", wantErr: "not a monitor UUID"},
 		{name: "empty monitor", id: ":down", wantErr: "not a monitor UUID"},
 		{name: "every-run", id: monitorID + ":every-run", wantEvent: "every-run"},
-		{name: "unknown event", id: monitorID + ":runaway", wantErr: "not one of down, recovery, fail, every-run"},
-		{name: "empty event", id: monitorID + ":", wantErr: "not one of down, recovery, fail, every-run"},
+		{name: "success", id: monitorID + ":success", wantEvent: "success"},
+		{name: "started", id: monitorID + ":started", wantEvent: "started"},
+		{
+			name:    "unknown event",
+			id:      monitorID + ":runaway",
+			wantErr: "not one of down, recovery, fail, every-run, success, started",
+		},
+		{
+			name:    "empty event",
+			id:      monitorID + ":",
+			wantErr: "not one of down, recovery, fail, every-run, success, started",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			gotMonitor, gotEvent, err := parseRouteImportID(tc.id)
@@ -41,6 +51,31 @@ func TestParseRouteImportID(t *testing.T) {
 			require.Equal(t, monitorID, gotMonitor)
 			require.Equal(t, tc.wantEvent, gotEvent)
 		})
+	}
+}
+
+// TestRouteEventTypeSetsStayDistinct is the guardrail on the one mistake that
+// widening routeEventTypes invites: copying the new event types into
+// defaultAlertEvents as well.
+//
+// The two slices look interchangeable and are not. routeEventTypes is what the
+// API will *route* (api/routes.go: validEventTypes); defaultAlertEvents is the
+// much smaller set the API *auto-attaches* to a new monitor's default email
+// destination (api/defaultdest.go). Only the second one drives
+// routeIsServerDefault's adoption exemption, so an entry added there tells
+// Terraform to silently take over a route a person created by hand — the exact
+// clobber the whole adoption guard exists to prevent.
+func TestRouteEventTypeSetsStayDistinct(t *testing.T) {
+	require.Equal(t,
+		[]string{"down", "recovery", "fail", "every-run", "success", "started"}, routeEventTypes,
+		"routeEventTypes must mirror the API's validEventTypes")
+	require.Equal(t, []string{"down", "fail", "recovery"}, defaultAlertEvents,
+		"defaultAlertEvents mirrors api/defaultdest.go and must not grow with routeEventTypes")
+
+	for _, e := range []string{"every-run", "success", "started"} {
+		require.NotContains(t, defaultAlertEvents, e,
+			"%s is routable but is never auto-routed; listing it here would make routeIsServerDefault "+
+				"adopt a route a person wrote by hand", e)
 	}
 }
 
@@ -139,6 +174,24 @@ func TestRouteIsServerDefault(t *testing.T) {
 			// silently redirect routing nobody asked Terraform to touch.
 			name:          "every-run is never auto-routed, so never adopted",
 			eventType:     "every-run",
+			existing:      []string{defaultEmail},
+			defaultDestID: defaultEmail,
+			want:          false,
+		},
+		{
+			// Same reasoning for the two event types added alongside them.
+			// routeEventTypes grew; defaultAlertEvents deliberately did not, and
+			// these two cases are what would fail if somebody widened it to
+			// match.
+			name:          "success is never auto-routed, so never adopted",
+			eventType:     "success",
+			existing:      []string{defaultEmail},
+			defaultDestID: defaultEmail,
+			want:          false,
+		},
+		{
+			name:          "started is never auto-routed, so never adopted",
+			eventType:     "started",
 			existing:      []string{defaultEmail},
 			defaultDestID: defaultEmail,
 			want:          false,

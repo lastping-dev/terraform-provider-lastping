@@ -101,10 +101,18 @@ func TestAlertTemplateBodyValidation(t *testing.T) {
 // type alone, or event/cause. The cause half stays unconstrained so a cause
 // added by the backend later is not rejected here first.
 func TestTemplateKeyPattern(t *testing.T) {
-	for _, key := range []string{"down", "recovery", "fail", "every-run", "down/silence", "fail/runaway", "fail/ci"} {
+	for _, key := range []string{
+		"down", "recovery", "fail", "every-run", "success", "started",
+		"down/silence", "fail/runaway", "fail/ci", "success/ci", "started/ci",
+	} {
 		require.True(t, templateKeyPattern.MatchString(key), "%q must be accepted", key)
 	}
-	for _, key := range []string{"", "up", "Down", "down/", "/silence", "down-silence", "everyrun"} {
+	for _, key := range []string{
+		"", "up", "Down", "down/", "/silence", "down-silence", "everyrun",
+		// Near-misses on the two new event types. The alternation is anchored,
+		// so a prefix must not slip through on the strength of matching one.
+		"succeeded", "start", "Success",
+	} {
 		require.False(t, templateKeyPattern.MatchString(key), "%q must be rejected", key)
 	}
 }

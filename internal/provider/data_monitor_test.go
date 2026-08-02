@@ -10,16 +10,22 @@ import (
 // dataMonitorFixture is a monitor with every attribute the data source reports
 // set to something distinctive, so a read-back of the wrong field is visible
 // rather than a coincidental match on a default.
+// max_runtime_s and failure_threshold carry non-default values for the same
+// reason as the rest: failure_threshold is 1 on every monitor that never sets
+// it, and max_runtime_s is unset by default, so pairing them against a fixture
+// that omitted them would pass even if the data source read the wrong field.
 const dataMonitorFixture = `
 resource "lastping_monitor" "src" {
-  name            = "acc-data-monitor"
-  slug            = "acc-data-monitor"
-  schedule_kind   = "cron"
-  cron_expr       = "0 3 * * *"
-  tz              = "Europe/Berlin"
-  grace_s         = 1800
-  tags            = ["acc:data-monitor", "env:test"]
-  runaway_ceiling = 42
+  name              = "acc-data-monitor"
+  slug              = "acc-data-monitor"
+  schedule_kind     = "cron"
+  cron_expr         = "0 3 * * *"
+  tz                = "Europe/Berlin"
+  grace_s           = 1800
+  max_runtime_s     = 14400
+  failure_threshold = 3
+  tags              = ["acc:data-monitor", "env:test"]
+  runaway_ceiling   = 42
 }
 `
 
@@ -73,6 +79,25 @@ data "lastping_monitor" "by_slug" {
 						"data.lastping_monitor.by_slug", "probe_expected_status", "lastping_monitor.src", "probe_expected_status"),
 					resource.TestCheckResourceAttrPair(
 						"data.lastping_monitor.by_slug", "runaway_ceiling", "lastping_monitor.src", "runaway_ceiling"),
+					// The two detection attributes. These pairs prove the field
+					// NAMES match and that a set value round-trips identically
+					// on both surfaces — a typo on either side reads as null and
+					// fails here.
+					//
+					// They do NOT prove the null-versus-zero convention holds.
+					// The fixture sets failure_threshold to 3, and the backend
+					// can never answer 0 for it, so a data source that mapped it
+					// through int64OrNull would agree on every monitor that can
+					// exist and this pair would still pass. That case is pinned
+					// in TestMonitorSurfacesAgreeOnEmptyValues, which builds the
+					// empty response by hand precisely because a live backend
+					// cannot produce it.
+					resource.TestCheckResourceAttrPair(
+						"data.lastping_monitor.by_slug", "failure_threshold",
+						"lastping_monitor.src", "failure_threshold"),
+					resource.TestCheckResourceAttrPair(
+						"data.lastping_monitor.by_slug", "max_runtime_s",
+						"lastping_monitor.src", "max_runtime_s"),
 					resource.TestCheckResourceAttrPair(
 						"data.lastping_monitor.by_slug", "paused", "lastping_monitor.src", "paused"),
 					resource.TestCheckResourceAttrPair(

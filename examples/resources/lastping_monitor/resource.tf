@@ -15,6 +15,30 @@ resource "lastping_monitor" "nightly_backup" {
   # scheduler firing every minute instead of once a night). The ceiling is
   # measured per rolling 1-hour window, not per scheduled period.
   runaway_ceiling = 5
+
+  # The backup itself may legitimately run for hours, but it must never go
+  # quiet for more than 15 minutes past its slot. max_runtime_s governs the
+  # overrun deadline only, so the two budgets are set independently: grace_s
+  # (900s) still decides how late the *start* may be.
+  max_runtime_s = 14400
+}
+
+# A flaky-by-nature job: a single failed run is noise, three in a row is a
+# problem. failure_threshold defers the incident until the third consecutive
+# failure, and any success resets the count.
+#
+# It gates the `fail` cause only. Silence, overrun and runaway are time- or
+# rate-based, so this monitor still alerts the moment it goes quiet.
+resource "lastping_monitor" "flaky_import" {
+  name          = "Vendor feed import"
+  slug          = "vendor-feed-import"
+  schedule_kind = "simple"
+  period_s      = 3600
+  grace_s       = 600
+
+  failure_threshold = 3
+
+  tags = ["env:prod", "team:data"]
 }
 
 # An HTTP probe monitor: LastPing actively fetches probe_url on an interval

@@ -182,6 +182,41 @@ resource "lastping_alert_template" "t" {
 	})
 }
 
+// TestAccAlertTemplate_successAndStartedKeys covers the two event types the
+// server added alongside every-run. The key grammar is validated at plan time
+// against templateKeyPattern, so a key the API accepts but the pattern does not
+// would be rejected here before the request was ever made — which is why this
+// asserts against the server rather than stopping at a clean plan.
+func TestAccAlertTemplate_successAndStartedKeys(t *testing.T) {
+	want := map[string]string{
+		"success":    "{check_name} finished cleanly in {duration}.",
+		"started":    "{check_name} started.",
+		"success/ci": "{check_name} passed on {branch} — {run_url}.",
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{{
+			Config: templateMonitor + `
+resource "lastping_alert_template" "t" {
+  monitor_id = lastping_monitor.m.id
+
+  templates = {
+    "success"    = "{check_name} finished cleanly in {duration}."
+    "started"    = "{check_name} started."
+    "success/ci" = "{check_name} passed on {branch} — {run_url}."
+  }
+}`,
+			Check: resource.ComposeAggregateTestCheckFunc(
+				resource.TestCheckResourceAttr("lastping_alert_template.t", "templates.started",
+					"{check_name} started."),
+				checkTemplatesOnServer(t, want),
+			),
+		}},
+	})
+}
+
 // TestAccAlertTemplate_invalidConfig: a bad key or an un-storable body is a
 // plan-time error naming the attribute, or — for a body the server cannot
 // render — an apply error naming the key, with nothing written either way.

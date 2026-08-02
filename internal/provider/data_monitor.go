@@ -33,6 +33,8 @@ type monitorDataModel struct {
 	CronExpr             types.String `tfsdk:"cron_expr"`
 	TZ                   types.String `tfsdk:"tz"`
 	GraceS               types.Int64  `tfsdk:"grace_s"`
+	MaxRuntimeS          types.Int64  `tfsdk:"max_runtime_s"`
+	FailureThreshold     types.Int64  `tfsdk:"failure_threshold"`
 	Tags                 types.Set    `tfsdk:"tags"`
 	RunawayCeiling       types.Int64  `tfsdk:"runaway_ceiling"`
 	MonitorFrom          types.String `tfsdk:"monitor_from"`
@@ -94,6 +96,18 @@ func monitorDataAttributes() map[string]schema.Attribute {
 		"grace_s": schema.Int64Attribute{
 			Computed:            true,
 			MarkdownDescription: "Grace period in seconds after a deadline is missed before alerting.",
+		},
+		"max_runtime_s": schema.Int64Attribute{
+			Computed: true,
+			MarkdownDescription: "How long a single run may take before it is called overdue, in seconds. " +
+				"Governs the overrun deadline only; the silence rule keeps using `grace_s`. Null when " +
+				"unset, in which case the overrun budget falls back to `grace_s`. Never set on an " +
+				"`http` monitor.",
+		},
+		"failure_threshold": schema.Int64Attribute{
+			Computed: true,
+			MarkdownDescription: "Consecutive explicit failures required before an incident opens " +
+				"(the `fail` cause only). Always present; `1` is the default, \"open on the first failure\".",
 		},
 		"tags": schema.SetAttribute{
 			Computed:            true,
@@ -180,13 +194,21 @@ func monitorDataAttributes() map[string]schema.Attribute {
 // comparable values rather than "" or 0 versus null.
 //
 // That parity is deliberate, not automatic: period_s, grace_s,
-// probe_timeout_s and probe_expected_status are never null on either side —
-// the API always reports a concrete number for them (0 is a real answer, e.g.
-// period_s on a cron monitor), so both surfaces report it as 0, not null.
-// probe_interval_s and runaway_ceiling are the opposite: both surfaces map an
-// absent value (0, or a nil pointer) to null, because 0 is not a value either
-// can take on legitimately. data_monitor_test.go pairs every one of these
-// attributes against the resource to keep it that way.
+// failure_threshold, probe_timeout_s and probe_expected_status are never null
+// on either side — the API always reports a concrete number for them (0 is a
+// real answer, e.g. period_s on a cron monitor), so both surfaces report it as
+// 0, not null. probe_interval_s, runaway_ceiling and max_runtime_s are the
+// opposite: both surfaces map an absent value (0, or a nil pointer) to null,
+// because 0 is not a value either can take on legitimately.
+//
+// Two tests keep it that way, and they cover different halves.
+// data_monitor_test.go pairs each of these attributes against the resource
+// against a live backend, which catches a renamed or dropped field. It cannot
+// catch a wrong empty-value mapping for an attribute the backend never returns
+// empty — failure_threshold is NOT NULL DEFAULT 1, so int64OrNull would agree
+// with Int64Value on every monitor that can exist. That half is pinned by
+// TestMonitorSurfacesAgreeOnEmptyValues, which feeds both mappers a hand-built
+// zero/nil response and requires them to agree.
 func monitorDataFromAPI(ctx context.Context, m *client.Monitor) (monitorDataModel, diag.Diagnostics) {
 	tags, diags := types.SetValueFrom(ctx, types.StringType, m.Tags)
 	if m.Tags == nil {
@@ -205,6 +227,7 @@ func monitorDataFromAPI(ctx context.Context, m *client.Monitor) (monitorDataMode
 		CronExpr:             stringOrNull(m.CronExpr),
 		TZ:                   stringOrNull(m.TZ),
 		GraceS:               types.Int64Value(m.GraceS),
+		FailureThreshold:     types.Int64Value(m.FailureThreshold),
 		Tags:                 tags,
 		MonitorFrom:          timestampOrNull(m.MonitorFrom),
 		ProbeURL:             stringOrNull(m.ProbeURL),
@@ -227,6 +250,11 @@ func monitorDataFromAPI(ctx context.Context, m *client.Monitor) (monitorDataMode
 		out.RunawayCeiling = types.Int64Value(*m.RunawayCeiling)
 	} else {
 		out.RunawayCeiling = types.Int64Null()
+	}
+	if m.MaxRuntimeS != nil {
+		out.MaxRuntimeS = types.Int64Value(*m.MaxRuntimeS)
+	} else {
+		out.MaxRuntimeS = types.Int64Null()
 	}
 	return out, diags
 }
