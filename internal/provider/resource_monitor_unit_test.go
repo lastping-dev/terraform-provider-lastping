@@ -3,14 +3,17 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
+	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/stretchr/testify/require"
 
@@ -38,6 +41,102 @@ func validateString(t *testing.T, attrName, value string) validator.StringRespon
 		v.ValidateString(context.Background(), req, &resp)
 	}
 	return resp
+}
+
+// validateInt64 runs every validator declared on an int64 attribute.
+func validateInt64(t *testing.T, attrName string, value int64) validator.Int64Response {
+	t.Helper()
+	attr, ok := monitorSchema(t).Attributes[attrName].(schema.Int64Attribute)
+	require.True(t, ok, "%s must be an int64 attribute", attrName)
+
+	req := validator.Int64Request{ConfigValue: types.Int64Value(value)}
+	resp := validator.Int64Response{}
+	for _, v := range attr.Validators {
+		v.ValidateInt64(context.Background(), req, &resp)
+	}
+	return resp
+}
+
+// monitorValidateConfig runs the resource's ValidateConfig against a model, so
+// the plan-time refusals can be asserted without a live backend.
+func monitorValidateConfig(t *testing.T, m monitorResourceModel) diag.Diagnostics {
+	t.Helper()
+	ctx := context.Background()
+	s := monitorSchema(t)
+
+	objType, ok := s.Type().(types.ObjectType)
+	require.True(t, ok, "a resource schema is always an object")
+
+	obj, diags := types.ObjectValueFrom(ctx, objType.AttributeTypes(), m)
+	require.False(t, diags.HasError(), "%v", diags)
+
+	raw, err := obj.ToTerraformValue(ctx)
+	require.NoError(t, err)
+
+	r, ok := NewMonitorResource().(resource.ResourceWithValidateConfig)
+	require.True(t, ok, "the monitor resource must implement ValidateConfig")
+
+	resp := &resource.ValidateConfigResponse{}
+	r.ValidateConfig(ctx, resource.ValidateConfigRequest{
+		Config: tfsdk.Config{Schema: s, Raw: raw},
+	}, resp)
+	return resp.Diagnostics
+}
+
+// TestMonitorNewInt64Validators pins the two server ranges the provider now
+// mirrors at plan time, so an out-of-range value is a plan error naming the
+// attribute rather than an opaque 400 partway through an apply.
+func TestMonitorNewInt64Validators(t *testing.T) {
+	for _, tc := range []struct {
+		attr  string
+		value int64
+		valid bool
+	}{
+		{"failure_threshold", 1, true},
+		{"failure_threshold", 100, true},
+		{"failure_threshold", 0, false},
+		{"failure_threshold", 101, false},
+		{"max_runtime_s", 60, true},
+		{"max_runtime_s", 31536000, true},
+		{"max_runtime_s", 59, false},
+		{"max_runtime_s", 31536001, false},
+	} {
+		t.Run(fmt.Sprintf("%s=%d", tc.attr, tc.value), func(t *testing.T) {
+			resp := validateInt64(t, tc.attr, tc.value)
+			require.Equal(t, !tc.valid, resp.Diagnostics.HasError(), "%v", resp.Diagnostics)
+		})
+	}
+}
+
+// TestMonitorMaxRuntimeRejectedOnHTTP: the API answers 400
+// MAX_RUNTIME_NOT_SUPPORTED for max_runtime_s on an http monitor, because a
+// probe has no start/success pair for the overrun rule to measure. Catching it
+// in ValidateConfig turns that into a plan-time error on the right attribute.
+func TestMonitorMaxRuntimeRejectedOnHTTP(t *testing.T) {
+	base := monitorResourceModel{
+		Name:        types.StringValue("acc"),
+		MonitorType: types.StringValue("http"),
+		ProbeURL:    types.StringValue("https://example.com/"),
+		// The zero types.Set has no element type, which ObjectValueFrom
+		// rejects; every other zero value is a well-formed null.
+		Tags: types.SetNull(types.StringType),
+	}
+
+	withRuntime := base
+	withRuntime.MaxRuntimeS = types.Int64Value(14400)
+	diags := monitorValidateConfig(t, withRuntime)
+	require.True(t, diags.HasError(), "max_runtime_s on an http monitor must be refused at plan time")
+	require.Contains(t, diags.Errors()[0].Summary(), "max_runtime_s")
+
+	// Omitted on an http monitor: fine. The PATCH still carries an explicit
+	// null, which the API accepts there as a no-op.
+	require.False(t, monitorValidateConfig(t, base).HasError())
+
+	// And it is only http that is refused.
+	heartbeat := withRuntime
+	heartbeat.MonitorType = types.StringValue("heartbeat")
+	heartbeat.ProbeURL = types.StringNull()
+	require.False(t, monitorValidateConfig(t, heartbeat).HasError())
 }
 
 // TestMonitorSlugRejectsUnnormalised: the server normalises slugs (trim +
@@ -83,7 +182,7 @@ func TestMonitorOptionalOnlyAttributesAreNotComputed(t *testing.T) {
 	s := monitorSchema(t)
 	for _, name := range []string{
 		"slug", "cron_expr", "tags", "runaway_ceiling", "monitor_from",
-		"probe_url", "probe_interval_s", "probe_expected_body",
+		"probe_url", "probe_interval_s", "probe_expected_body", "max_runtime_s",
 	} {
 		attr, ok := s.Attributes[name]
 		require.True(t, ok, "missing attribute %s", name)
@@ -93,7 +192,9 @@ func TestMonitorOptionalOnlyAttributesAreNotComputed(t *testing.T) {
 	}
 
 	// The converse: these are genuinely server-supplied and must stay Computed.
-	for _, name := range []string{"grace_s", "monitor_type", "schedule_kind", "period_s", "tz"} {
+	for _, name := range []string{
+		"grace_s", "monitor_type", "schedule_kind", "period_s", "tz", "failure_threshold",
+	} {
 		attr, ok := s.Attributes[name]
 		require.True(t, ok, "missing attribute %s", name)
 		require.True(t, attr.IsComputed(), "%s is server-derived and must stay computed", name)
@@ -183,6 +284,8 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		PeriodS:              types.Int64Value(3600),
 		TZ:                   types.StringValue("UTC"),
 		GraceS:               types.Int64Value(1800),
+		MaxRuntimeS:          types.Int64Value(14400),
+		FailureThreshold:     types.Int64Value(3),
 		Tags:                 tags,
 		RunawayCeiling:       types.Int64Value(40),
 		MonitorFrom:          types.StringValue("2027-01-01T00:00:00Z"),
@@ -209,6 +312,8 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		"period_s":               int64(3600),
 		"tz":                     "UTC",
 		"grace_s":                int64(1800),
+		"max_runtime_s":          int64(14400),
+		"failure_threshold":      int64(3),
 		"cron_expr":              "",
 		"probe_method":           "GET",
 		"probe_expected_status":  int64(200),
@@ -227,12 +332,14 @@ func TestMonitorPatchFromModel(t *testing.T) {
 	})
 
 	t.Run("attribute removed from config is an explicit null", func(t *testing.T) {
-		// tags, runaway_ceiling and monitor_from are plain Optional, so deleting
-		// them from the HCL makes them null in both the config and the plan.
+		// tags, runaway_ceiling, monitor_from and max_runtime_s are plain
+		// Optional, so deleting them from the HCL makes them null in both the
+		// config and the plan.
 		cfg := stored
 		cfg.Tags = types.SetNull(types.StringType)
 		cfg.RunawayCeiling = types.Int64Null()
 		cfg.MonitorFrom = types.StringNull()
+		cfg.MaxRuntimeS = types.Int64Null()
 
 		want := client.MonitorPatch{}
 		for k, v := range fullyConfigured {
@@ -241,6 +348,7 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		want["tags"] = nil
 		want["runaway_ceiling"] = nil
 		want["monitor_from"] = nil
+		want["max_runtime_s"] = nil
 
 		got, err := monitorPatchFromModel(ctx, cfg, cfg)
 		require.NoError(t, err)
@@ -254,6 +362,36 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		require.Contains(t, string(body), `"tags":null`)
 		require.Contains(t, string(body), `"runaway_ceiling":null`)
 		require.Contains(t, string(body), `"monitor_from":null`)
+		require.Contains(t, string(body), `"max_runtime_s":null`)
+	})
+
+	// failure_threshold is the counter-example to the block above: it is
+	// Optional+Computed and NOT NULL DEFAULT 1 server-side, so it belongs in the
+	// omit-when-zero group. Removing it from the configuration must leave the
+	// stored value alone (an absent key), never send a null — the API would read
+	// that as an omission anyway, and sending 0 would be outside its [1, 100]
+	// range. Putting it in the clearable group by mistake is the bug this pins.
+	t.Run("failure_threshold is omitted, never nulled", func(t *testing.T) {
+		cfg := stored
+		cfg.FailureThreshold = types.Int64Null()
+
+		// Optional+Computed: the plan still carries the stored value.
+		got, err := monitorPatchFromModel(ctx, stored, cfg)
+		require.NoError(t, err)
+		require.Equal(t, int64(3), got["failure_threshold"])
+
+		// The shape resolveUnknownsFromState cannot produce, asserted anyway:
+		// with no stored value either, the key must be absent rather than null.
+		unset := stored
+		unset.FailureThreshold = types.Int64Null()
+		got, err = monitorPatchFromModel(ctx, unset, cfg)
+		require.NoError(t, err)
+		require.NotContains(t, got, "failure_threshold",
+			"failure_threshold has no cleared state, so it must be omitted rather than sent as null")
+
+		body, err := json.Marshal(got)
+		require.NoError(t, err)
+		require.NotContains(t, string(body), `"failure_threshold"`)
 	})
 
 	t.Run("optional+computed absent from config is still sent", func(t *testing.T) {
@@ -268,6 +406,7 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		cfg.PeriodS = types.Int64Null()
 		cfg.TZ = types.StringNull()
 		cfg.GraceS = types.Int64Null()
+		cfg.FailureThreshold = types.Int64Null()
 		cfg.ProbeMethod = types.StringNull()
 		cfg.ProbeExpectedStatus = types.Int64Null()
 		cfg.ProbeTimeoutS = types.Int64Null()
@@ -295,6 +434,7 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		cfg.Tags = types.SetNull(types.StringType)
 		cfg.RunawayCeiling = types.Int64Null()
 		cfg.MonitorFrom = types.StringNull()
+		cfg.MaxRuntimeS = types.Int64Null()
 
 		got, err := monitorPatchFromModel(ctx, stored, cfg)
 		require.NoError(t, err)
@@ -305,6 +445,8 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		require.Nil(t, got["runaway_ceiling"])
 		require.Contains(t, got, "monitor_from")
 		require.Nil(t, got["monitor_from"])
+		require.Contains(t, got, "max_runtime_s")
+		require.Nil(t, got["max_runtime_s"])
 	})
 
 	t.Run("explicitly empty tags are sent as an empty array", func(t *testing.T) {
@@ -382,6 +524,8 @@ func TestResolveUnknownsFromState_CoversEveryAttribute(t *testing.T) {
 		CronExpr:             types.StringValue("0 3 * * *"),
 		TZ:                   types.StringValue("Europe/Berlin"),
 		GraceS:               types.Int64Value(1800),
+		MaxRuntimeS:          types.Int64Value(14400),
+		FailureThreshold:     types.Int64Value(3),
 		Tags:                 types.SetValueMust(types.StringType, []attr.Value{types.StringValue("prod")}),
 		RunawayCeiling:       types.Int64Value(40),
 		MonitorFrom:          types.StringValue("2027-01-01T00:00:00Z"),

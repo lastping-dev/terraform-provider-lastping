@@ -30,6 +30,30 @@ resource "lastping_monitor" "nightly_backup" {
   # scheduler firing every minute instead of once a night). The ceiling is
   # measured per rolling 1-hour window, not per scheduled period.
   runaway_ceiling = 5
+
+  # The backup itself may legitimately run for hours, but it must never go
+  # quiet for more than 15 minutes past its slot. max_runtime_s governs the
+  # overrun deadline only, so the two budgets are set independently: grace_s
+  # (900s) still decides how late the *start* may be.
+  max_runtime_s = 14400
+}
+
+# A flaky-by-nature job: a single failed run is noise, three in a row is a
+# problem. failure_threshold defers the incident until the third consecutive
+# failure, and any success resets the count.
+#
+# It gates the `fail` cause only. Silence, overrun and runaway are time- or
+# rate-based, so this monitor still alerts the moment it goes quiet.
+resource "lastping_monitor" "flaky_import" {
+  name          = "Vendor feed import"
+  slug          = "vendor-feed-import"
+  schedule_kind = "simple"
+  period_s      = 3600
+  grace_s       = 600
+
+  failure_threshold = 3
+
+  tags = ["env:prod", "team:data"]
 }
 
 # An HTTP probe monitor: LastPing actively fetches probe_url on an interval
@@ -66,7 +90,17 @@ resource "lastping_monitor" "public_api" {
 ### Optional
 
 - `cron_expr` (String) 5-field cron expression, for `schedule_kind = "cron"`.
+- `failure_threshold` (Number) How many **consecutive** explicit failures are needed before an incident opens — retry-before-alert. Between 1 and 100; the server defaults it to `1`, meaning "open on the first failure".
+
+It gates the `fail` cause **only**. `silence`, `overrun`, `never_started` and `runaway` are time- or rate-based, so a consecutive-failure count is meaningless for them and never gates them — raising this does not buy a late monitor any extra time. Below the threshold nothing alerts and the status does not change, but the ping is still recorded, an outstanding run is still ended and the deadlines are still recomputed. Any success resets the counter.
+
+~> **There is no "unset" to go back to.** The column is `NOT NULL DEFAULT 1`, so the API cannot clear this the way it clears `runaway_ceiling`: removing the attribute from the configuration leaves the stored value in place rather than returning it to `1`. Set it to `1` explicitly to get the default behaviour back. Changing it also does not reset the monitor's current failure count, so lowering it can open an incident on the very next failure.
 - `grace_s` (Number) Grace period in seconds after a deadline is missed before alerting. Must be between 60 and 31536000 (one year). Required by the API for `heartbeat` and `ci` monitors. For `monitor_type = "http"` the server floors the effective grace to `2 * probe_interval_s`, so omit it to take the floor; a larger value is honoured as-is.
+- `max_runtime_s` (Number) How long a single run may take, in seconds, before it is called overdue. Must be between 60 and 31536000 (one year). Measured from a `/start` ping that has not been matched by a completion, so it only means anything on a monitor that reports both.
+
+This replaces `grace_s` for the **overrun deadline only**: the silence rule (`due_at + grace_s`) and the first-run seed (`monitor_from + grace_s`) keep using `grace_s`. That split is the point — it is what makes "alert if silent for more than 10 minutes, but allow a 4-hour run" expressible. Omit it and the overrun budget falls back to `grace_s`, exactly as before this attribute existed; removing it from the configuration restores that fallback.
+
+~> **Not supported on `monitor_type = "http"`.** A probe has no start/success pair — the prober mints a fresh run id for every probe — so no start is ever outstanding and the overrun rule can never fire. The API rejects it with 400 `MAX_RUNTIME_NOT_SUPPORTED`, and this provider rejects it at plan time. Use `probe_timeout_s` to bound a single probe.
 - `monitor_from` (String) RFC 3339 timestamp from which deadlines are computed for a new monitor. The API stores and returns UTC; a value written with a different offset is kept as configured as long as it denotes the same instant.
 - `monitor_type` (String) Kind of monitor: `heartbeat` (default, expects periodic pings), `ci` (bound to a CI provider webhook), or `http` (active probe). The API treats this as create-only — PATCH silently ignores it — so changing it here replaces the resource rather than leaving a permanent, un-appliable diff.
 - `paused` (Boolean) When true, the monitor does not alert regardless of ping status. Maps onto the `pause`/`resume` endpoints on update, not a PATCH field.

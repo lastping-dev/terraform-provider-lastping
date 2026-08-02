@@ -196,6 +196,163 @@ resource "lastping_monitor" "probe" {
 	})
 }
 
+// TestAccMonitor_maxRuntimeRejectedOnHTTP asserts the API's 400
+// MAX_RUNTIME_NOT_SUPPORTED is anticipated at plan time. An http probe has no
+// start/success pair, so the overrun rule the attribute configures can never
+// fire on one.
+func TestAccMonitor_maxRuntimeRejectedOnHTTP(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{{
+			Config: `
+resource "lastping_monitor" "probe" {
+  name             = "acc-http-maxruntime"
+  slug             = "acc-http-maxruntime"
+  monitor_type     = "http"
+  probe_url        = "https://example.com/"
+  probe_interval_s = 300
+  max_runtime_s    = 14400
+}`,
+			PlanOnly:    true,
+			ExpectError: regexp.MustCompile(`max_runtime_s.*not supported`),
+		}},
+	})
+}
+
+// TestAccMonitor_failureThreshold covers the retry-before-alert setting end to
+// end. It is Optional+Computed and NOT NULL DEFAULT 1 server-side, so the two
+// things worth pinning are that a configured value survives the round trip and
+// that omitting it does NOT reset the stored value — there is no cleared state
+// for the API to go back to, and pretending otherwise would produce a perpetual
+// diff.
+func TestAccMonitor_failureThreshold(t *testing.T) {
+	const withThreshold = `
+resource "lastping_monitor" "ft" {
+  name              = "acc-failure-threshold"
+  slug              = "acc-failure-threshold"
+  schedule_kind     = "simple"
+  period_s          = 3600
+  grace_s           = 300
+  failure_threshold = 3
+}`
+	const withoutThreshold = `
+resource "lastping_monitor" "ft" {
+  name          = "acc-failure-threshold"
+  slug          = "acc-failure-threshold"
+  schedule_kind = "simple"
+  period_s      = 3600
+  grace_s       = 300
+}`
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				// Omitted first: the server's own default has to land in state,
+				// or the very next plan shows a diff against nothing.
+				Config: withoutThreshold,
+				Check:  resource.TestCheckResourceAttr("lastping_monitor.ft", "failure_threshold", "1"),
+			},
+			{
+				Config: withThreshold,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("lastping_monitor.ft", "failure_threshold", "3"),
+					resource.TestCheckResourceAttrWith("lastping_monitor.ft", "id", func(id string) error {
+						mon, err := testAccDirectClient(t).GetMonitor(t.Context(), id)
+						if err != nil {
+							return err
+						}
+						if mon.FailureThreshold != 3 {
+							return fmt.Errorf("server holds failure_threshold=%d, want 3", mon.FailureThreshold)
+						}
+						return nil
+					}),
+				),
+			},
+			{
+				// Removing it keeps 3: Optional+Computed, and the column has no
+				// null state. The plan must be empty rather than proposing 1.
+				Config:   withoutThreshold,
+				PlanOnly: true,
+			},
+			{
+				ResourceName:      "lastping_monitor.ft",
+				ImportState:       true,
+				ImportStateId:     "acc-failure-threshold",
+				ImportStateVerify: true,
+			},
+		},
+	})
+}
+
+// TestAccMonitor_maxRuntimeCanBeRemoved is the clearable half of the pair, and
+// the reason max_runtime_s sits in monitorPatchFromModel's explicit-null group
+// rather than the omit-when-zero one: an absent key under merge-patch leaves the
+// stored budget in place, so "go back to the grace_s fallback" would be
+// unreachable — exactly the bug tags, runaway_ceiling and monitor_from had.
+func TestAccMonitor_maxRuntimeCanBeRemoved(t *testing.T) {
+	const withRuntime = `
+resource "lastping_monitor" "mr" {
+  name          = "acc-max-runtime"
+  slug          = "acc-max-runtime"
+  schedule_kind = "simple"
+  period_s      = 3600
+  grace_s       = 600
+  max_runtime_s = 14400
+}`
+	const withoutRuntime = `
+resource "lastping_monitor" "mr" {
+  name          = "acc-max-runtime"
+  slug          = "acc-max-runtime"
+  schedule_kind = "simple"
+  period_s      = 3600
+  grace_s       = 600
+}`
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: withRuntime,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("lastping_monitor.mr", "max_runtime_s", "14400"),
+					// grace_s is untouched by it: the two govern different
+					// deadlines, which is the whole point of the attribute.
+					resource.TestCheckResourceAttr("lastping_monitor.mr", "grace_s", "600"),
+				),
+			},
+			{
+				Config: withoutRuntime,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr("lastping_monitor.mr", "max_runtime_s"),
+					// Read it back from the API: state agreeing with the plan
+					// proves nothing when the plan said "removed" and the server
+					// was never told.
+					resource.TestCheckResourceAttrWith("lastping_monitor.mr", "id", func(id string) error {
+						mon, err := testAccDirectClient(t).GetMonitor(t.Context(), id)
+						if err != nil {
+							return err
+						}
+						if mon.MaxRuntimeS != nil {
+							return fmt.Errorf("server still holds max_runtime_s=%d, want it cleared",
+								*mon.MaxRuntimeS)
+						}
+						return nil
+					}),
+				),
+			},
+			{
+				// And it stays cleared: no perpetual diff on re-plan.
+				Config:   withoutRuntime,
+				PlanOnly: true,
+			},
+		},
+	})
+}
+
 // TestAccMonitor_monitorFromRoundTrips pins the offset-timestamp round trip: the
 // API stores and returns UTC, so a configured +01:00 timestamp comes back as Z.
 // The provider must treat the two as the same instant instead of reporting an

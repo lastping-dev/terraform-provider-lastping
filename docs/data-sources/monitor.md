@@ -73,9 +73,11 @@ variable "slack_webhook_url" {
 - `created_at` (String) RFC 3339 UTC timestamp when the monitor was created.
 - `cron_expr` (String) 5-field cron expression, for `schedule_kind = "cron"`.
 - `due_at` (String) RFC 3339 UTC timestamp of the next expected ping.
+- `failure_threshold` (Number) Consecutive explicit failures required before an incident opens (the `fail` cause only). Always present; `1` is the default, "open on the first failure".
 - `grace_s` (Number) Grace period in seconds after a deadline is missed before alerting.
 - `last_ping_at` (String) RFC 3339 UTC timestamp of the most recent ping. Null until the first ping.
 - `maintenance_until` (String) RFC 3339 UTC timestamp until which alerting is suppressed for maintenance. Null outside a maintenance window.
+- `max_runtime_s` (Number) How long a single run may take before it is called overdue, in seconds. Governs the overrun deadline only; the silence rule keeps using `grace_s`. Null when unset, in which case the overrun budget falls back to `grace_s`. Never set on an `http` monitor.
 - `monitor_from` (String) RFC 3339 UTC timestamp before which deadlines are not computed.
 - `monitor_type` (String) `heartbeat`, `ci`, or `http`.
 - `name` (String) Human-readable name.

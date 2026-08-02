@@ -26,6 +26,8 @@ type Monitor struct {
 	CronExpr             string   `json:"cron_expr,omitempty"`
 	TZ                   string   `json:"tz,omitempty"`
 	GraceS               int64    `json:"grace_s,omitempty"`
+	MaxRuntimeS          *int64   `json:"max_runtime_s,omitempty"`
+	FailureThreshold     int64    `json:"failure_threshold,omitempty"`
 	Tags                 []string `json:"tags,omitempty"`
 	RunawayCeiling       *int64   `json:"runaway_ceiling,omitempty"`
 	MonitorFrom          *string  `json:"monitor_from,omitempty"`
@@ -108,8 +110,11 @@ func (c *Client) GetMonitorBySlug(ctx context.Context, slug string) (*Monitor, e
 //
 //   - a key that is absent leaves the stored value alone;
 //   - a key whose value is nil serialises as JSON `null`, which clears the
-//     field — the API honours that for runaway_ceiling, monitor_from, tags,
-//     ci_workflow and ci_branch, and treats it as "absent" everywhere else;
+//     field — the API honours that for runaway_ceiling, max_runtime_s,
+//     monitor_from, tags, ci_workflow and ci_branch, and treats it as "absent"
+//     everywhere else. failure_threshold is deliberately NOT in that list: its
+//     column is NOT NULL DEFAULT 1, so a null there is read as an omission and
+//     leaves the stored value alone;
 //   - any other value replaces the stored one.
 //
 // slug, monitor_type, ci_provider and ci_secret are create-only and ignored if
