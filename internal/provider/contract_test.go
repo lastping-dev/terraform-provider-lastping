@@ -61,6 +61,14 @@ const specPath = "../../testdata/openapi.yaml"
 // through an exempt map. The last three entries (maintenance_until on the
 // monitor resource and both monitor data sources) went when the monorepo added
 // the property to components.schemas.Check.
+//
+// step_timeout_s did NOT need an entry, and the near miss is worth recording:
+// the deployed https://app.lastping.dev/openapi.yaml — what `make sync-openapi`
+// fetches — was behind the monorepo and omitted the property, while
+// api/swagger/openapi.yaml on main declared it on CheckCreate, Check and
+// CheckPatch all along. A deployment lag reads exactly like a spec gap from
+// here, so confirm against the monorepo's file, not the served document, before
+// adding an entry.
 var knownSpecGaps = map[string]string{}
 
 // destinationConfigExempt is the reason every per-kind credential attribute on

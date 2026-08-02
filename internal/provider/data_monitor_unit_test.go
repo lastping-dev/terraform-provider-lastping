@@ -42,6 +42,7 @@ func TestMonitorSurfacesAgreeOnEmptyValues(t *testing.T) {
 				PeriodS: 3600, TZ: "UTC", GraceS: 1800,
 				FailureThreshold: 3,
 				MaxRuntimeS:      ptrTo(int64(14400)),
+				StepTimeoutS:     ptrTo(int64(900)),
 			},
 		},
 		{
@@ -56,6 +57,7 @@ func TestMonitorSurfacesAgreeOnEmptyValues(t *testing.T) {
 				PeriodS: 3600, TZ: "UTC", GraceS: 1800,
 				FailureThreshold: 0,
 				MaxRuntimeS:      nil,
+				StepTimeoutS:     nil,
 			},
 		},
 	} {
@@ -74,6 +76,9 @@ func TestMonitorSurfacesAgreeOnEmptyValues(t *testing.T) {
 			require.Equal(t, res.MaxRuntimeS, data.MaxRuntimeS,
 				"max_runtime_s must read identically on both surfaces; the API omits it when "+
 					"unset, so both sides must report null rather than 0")
+			require.Equal(t, res.StepTimeoutS, data.StepTimeoutS,
+				"step_timeout_s must read identically on both surfaces; the API omits it when "+
+					"stall detection is off, so both sides must report null rather than 0")
 		})
 	}
 }

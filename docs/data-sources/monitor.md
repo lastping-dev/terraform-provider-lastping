@@ -94,5 +94,6 @@ variable "slack_webhook_url" {
 - `runaway_ceiling` (Number) Cap on pings per rolling 1-hour window, above which a `runaway` incident opens. Null when disabled.
 - `schedule_kind` (String) `simple` (fixed `period_s`) or `cron` (`cron_expr` + `tz`).
 - `status` (String) Current status: `new`, `up`, `late`, or `down`.
+- `step_timeout_s` (Number) How long an armed run may go without reporting a step before a `stalled` incident opens, in seconds. Null when unset, in which case stall detection is off. Always strictly below the effective run budget (`max_runtime_s`, or `grace_s` when that is unset), and never set on an `http` monitor.
 - `tags` (Set of String) Labels attached to this monitor. Empty when it has none.
 - `tz` (String) IANA timezone used to evaluate `cron_expr`.

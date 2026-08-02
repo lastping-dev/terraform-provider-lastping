@@ -100,6 +100,10 @@ func TestMonitorNewInt64Validators(t *testing.T) {
 		{"max_runtime_s", 31536000, true},
 		{"max_runtime_s", 59, false},
 		{"max_runtime_s", 31536001, false},
+		{"step_timeout_s", 10, true},
+		{"step_timeout_s", 86400, true},
+		{"step_timeout_s", 9, false},
+		{"step_timeout_s", 86401, false},
 	} {
 		t.Run(fmt.Sprintf("%s=%d", tc.attr, tc.value), func(t *testing.T) {
 			resp := validateInt64(t, tc.attr, tc.value)
@@ -137,6 +141,102 @@ func TestMonitorMaxRuntimeRejectedOnHTTP(t *testing.T) {
 	heartbeat.MonitorType = types.StringValue("heartbeat")
 	heartbeat.ProbeURL = types.StringNull()
 	require.False(t, monitorValidateConfig(t, heartbeat).HasError())
+}
+
+// TestMonitorStepTimeoutRejectedOnHTTP: the API answers 400
+// STEP_TIMEOUT_NOT_SUPPORTED for step_timeout_s on an http monitor. A probe
+// never arms a run and has no /step endpoint to call, so the stall rule is not
+// merely unlikely to fire there — it is unreachable.
+func TestMonitorStepTimeoutRejectedOnHTTP(t *testing.T) {
+	base := monitorResourceModel{
+		Name:        types.StringValue("acc"),
+		MonitorType: types.StringValue("http"),
+		ProbeURL:    types.StringValue("https://example.com/"),
+		// The zero types.Set has no element type, which ObjectValueFrom
+		// rejects; every other zero value is a well-formed null.
+		Tags: types.SetNull(types.StringType),
+	}
+
+	withStep := base
+	withStep.StepTimeoutS = types.Int64Value(300)
+	diags := monitorValidateConfig(t, withStep)
+	require.True(t, diags.HasError(), "step_timeout_s on an http monitor must be refused at plan time")
+	require.Contains(t, diags.Errors()[0].Summary(), "step_timeout_s")
+
+	// Omitted on an http monitor: fine. The PATCH still carries an explicit
+	// null, which the API accepts there as a no-op.
+	require.False(t, monitorValidateConfig(t, base).HasError())
+
+	// And it is only http that is refused. grace_s gives the heartbeat a budget
+	// for the step timeout to sit inside, so the budget rule below cannot be
+	// what makes this pass or fail.
+	heartbeat := withStep
+	heartbeat.MonitorType = types.StringValue("heartbeat")
+	heartbeat.ProbeURL = types.StringNull()
+	heartbeat.GraceS = types.Int64Value(3600)
+	require.False(t, monitorValidateConfig(t, heartbeat).HasError())
+}
+
+// TestMonitorStepTimeoutBudgetRule mirrors the server's
+// STEP_TIMEOUT_EXCEEDS_BUDGET rule at plan time: step_timeout_s must be
+// strictly below the effective budget, which is max_runtime_s when it is set
+// and grace_s otherwise. At or above it, the stall window is empty and the rule
+// can never fire — which is why the API refuses the configuration rather than
+// storing a setting that does nothing.
+//
+// The unknowable cases are asserted too, and they matter as much as the
+// rejections: a false plan-time error on a configuration the API would have
+// accepted is unfixable by the practitioner.
+func TestMonitorStepTimeoutBudgetRule(t *testing.T) {
+	base := monitorResourceModel{
+		Name:         types.StringValue("acc"),
+		MonitorType:  types.StringValue("heartbeat"),
+		ScheduleKind: types.StringValue("simple"),
+		PeriodS:      types.Int64Value(3600),
+		Tags:         types.SetNull(types.StringType),
+	}
+
+	for _, tc := range []struct {
+		name       string
+		grace      types.Int64
+		maxRuntime types.Int64
+		step       types.Int64
+		wantError  bool
+	}{
+		// max_runtime_s is the budget whenever it is set, even though grace_s
+		// is smaller here: a step timeout of 600 is fine against a 4-hour run
+		// budget and would be refused against the 300s grace.
+		{"below max_runtime", types.Int64Value(300), types.Int64Value(14400), types.Int64Value(600), false},
+		{"equal to max_runtime", types.Int64Value(300), types.Int64Value(600), types.Int64Value(600), true},
+		{"above max_runtime", types.Int64Value(300), types.Int64Value(600), types.Int64Value(900), true},
+
+		// With max_runtime_s unset the budget falls back to grace_s. This is
+		// the exact shape the API's own test calls out: grace 300,
+		// step_timeout 600, no max_runtime — dead on arrival.
+		{"below grace", types.Int64Value(3600), types.Int64Null(), types.Int64Value(300), false},
+		{"equal to grace", types.Int64Value(300), types.Int64Null(), types.Int64Value(300), true},
+		{"above grace", types.Int64Value(300), types.Int64Null(), types.Int64Value(600), true},
+
+		// Not knowable from the configuration: defer to the API rather than
+		// invent an error. grace_s omitted is the common one — it is
+		// Optional+Computed, so the server supplies it.
+		{"grace omitted", types.Int64Null(), types.Int64Null(), types.Int64Value(600), false},
+		{"grace unknown", types.Int64Unknown(), types.Int64Null(), types.Int64Value(600), false},
+		{"max_runtime unknown", types.Int64Value(300), types.Int64Unknown(), types.Int64Value(600), false},
+		{"step unknown", types.Int64Value(300), types.Int64Null(), types.Int64Unknown(), false},
+		{"step omitted", types.Int64Value(300), types.Int64Null(), types.Int64Null(), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := base
+			m.GraceS, m.MaxRuntimeS, m.StepTimeoutS = tc.grace, tc.maxRuntime, tc.step
+
+			diags := monitorValidateConfig(t, m)
+			require.Equal(t, tc.wantError, diags.HasError(), "%v", diags)
+			if tc.wantError {
+				require.Contains(t, diags.Errors()[0].Summary(), "step_timeout_s")
+			}
+		})
+	}
 }
 
 // TestMonitorSlugRejectsUnnormalised: the server normalises slugs (trim +
@@ -183,6 +283,7 @@ func TestMonitorOptionalOnlyAttributesAreNotComputed(t *testing.T) {
 	for _, name := range []string{
 		"slug", "cron_expr", "tags", "runaway_ceiling", "monitor_from",
 		"probe_url", "probe_interval_s", "probe_expected_body", "max_runtime_s",
+		"step_timeout_s",
 	} {
 		attr, ok := s.Attributes[name]
 		require.True(t, ok, "missing attribute %s", name)
@@ -285,6 +386,7 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		TZ:                   types.StringValue("UTC"),
 		GraceS:               types.Int64Value(1800),
 		MaxRuntimeS:          types.Int64Value(14400),
+		StepTimeoutS:         types.Int64Value(900),
 		FailureThreshold:     types.Int64Value(3),
 		Tags:                 tags,
 		RunawayCeiling:       types.Int64Value(40),
@@ -313,6 +415,7 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		"tz":                     "UTC",
 		"grace_s":                int64(1800),
 		"max_runtime_s":          int64(14400),
+		"step_timeout_s":         int64(900),
 		"failure_threshold":      int64(3),
 		"cron_expr":              "",
 		"probe_method":           "GET",
@@ -332,14 +435,15 @@ func TestMonitorPatchFromModel(t *testing.T) {
 	})
 
 	t.Run("attribute removed from config is an explicit null", func(t *testing.T) {
-		// tags, runaway_ceiling, monitor_from and max_runtime_s are plain
-		// Optional, so deleting them from the HCL makes them null in both the
-		// config and the plan.
+		// tags, runaway_ceiling, monitor_from, max_runtime_s and step_timeout_s
+		// are plain Optional, so deleting them from the HCL makes them null in
+		// both the config and the plan.
 		cfg := stored
 		cfg.Tags = types.SetNull(types.StringType)
 		cfg.RunawayCeiling = types.Int64Null()
 		cfg.MonitorFrom = types.StringNull()
 		cfg.MaxRuntimeS = types.Int64Null()
+		cfg.StepTimeoutS = types.Int64Null()
 
 		want := client.MonitorPatch{}
 		for k, v := range fullyConfigured {
@@ -349,6 +453,7 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		want["runaway_ceiling"] = nil
 		want["monitor_from"] = nil
 		want["max_runtime_s"] = nil
+		want["step_timeout_s"] = nil
 
 		got, err := monitorPatchFromModel(ctx, cfg, cfg)
 		require.NoError(t, err)
@@ -363,6 +468,7 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		require.Contains(t, string(body), `"runaway_ceiling":null`)
 		require.Contains(t, string(body), `"monitor_from":null`)
 		require.Contains(t, string(body), `"max_runtime_s":null`)
+		require.Contains(t, string(body), `"step_timeout_s":null`)
 	})
 
 	// failure_threshold is the counter-example to the block above: it is
@@ -435,6 +541,7 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		cfg.RunawayCeiling = types.Int64Null()
 		cfg.MonitorFrom = types.StringNull()
 		cfg.MaxRuntimeS = types.Int64Null()
+		cfg.StepTimeoutS = types.Int64Null()
 
 		got, err := monitorPatchFromModel(ctx, stored, cfg)
 		require.NoError(t, err)
@@ -447,6 +554,8 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		require.Nil(t, got["monitor_from"])
 		require.Contains(t, got, "max_runtime_s")
 		require.Nil(t, got["max_runtime_s"])
+		require.Contains(t, got, "step_timeout_s")
+		require.Nil(t, got["step_timeout_s"])
 	})
 
 	t.Run("explicitly empty tags are sent as an empty array", func(t *testing.T) {
@@ -525,6 +634,7 @@ func TestResolveUnknownsFromState_CoversEveryAttribute(t *testing.T) {
 		TZ:                   types.StringValue("Europe/Berlin"),
 		GraceS:               types.Int64Value(1800),
 		MaxRuntimeS:          types.Int64Value(14400),
+		StepTimeoutS:         types.Int64Value(900),
 		FailureThreshold:     types.Int64Value(3),
 		Tags:                 types.SetValueMust(types.StringType, []attr.Value{types.StringValue("prod")}),
 		RunawayCeiling:       types.Int64Value(40),

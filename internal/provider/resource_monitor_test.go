@@ -353,6 +353,177 @@ resource "lastping_monitor" "mr" {
 	})
 }
 
+// TestAccMonitor_stepTimeoutCanBeRemoved is the clearable proof for
+// step_timeout_s, and the reason it sits in monitorPatchFromModel's
+// explicit-null group rather than the omit-when-zero one.
+//
+// Under merge-patch an absent key leaves the stored timeout in place, so a
+// step_timeout_s in the omit-when-zero group could be set through Terraform and
+// then never turned off again: the practitioner deletes the attribute, plan and
+// state both say it is gone, and the monitor keeps opening `stalled` incidents
+// nobody can find the source of. That is exactly the bug tags, runaway_ceiling
+// and monitor_from shipped with, and the reason the API reads step_timeout_s
+// null as "clear" at all.
+//
+// The middle step therefore reads the monitor back through the API rather than
+// trusting state: state agreeing with the plan proves nothing when the plan
+// said "removed" and the server was never told.
+func TestAccMonitor_stepTimeoutCanBeRemoved(t *testing.T) {
+	const withStep = `
+resource "lastping_monitor" "st" {
+  name           = "acc-step-timeout"
+  slug           = "acc-step-timeout"
+  schedule_kind  = "simple"
+  period_s       = 3600
+  grace_s        = 600
+  max_runtime_s  = 14400
+  step_timeout_s = 900
+}`
+	const withoutStep = `
+resource "lastping_monitor" "st" {
+  name          = "acc-step-timeout"
+  slug          = "acc-step-timeout"
+  schedule_kind = "simple"
+  period_s      = 3600
+  grace_s       = 600
+  max_runtime_s = 14400
+}`
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: withStep,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("lastping_monitor.st", "step_timeout_s", "900"),
+					// Neither budget is disturbed by it: the three clocks are
+					// independent, which is the point of the attribute.
+					resource.TestCheckResourceAttr("lastping_monitor.st", "grace_s", "600"),
+					resource.TestCheckResourceAttr("lastping_monitor.st", "max_runtime_s", "14400"),
+					resource.TestCheckResourceAttrWith("lastping_monitor.st", "id", func(id string) error {
+						mon, err := testAccDirectClient(t).GetMonitor(t.Context(), id)
+						if err != nil {
+							return err
+						}
+						if mon.StepTimeoutS == nil || *mon.StepTimeoutS != 900 {
+							return fmt.Errorf("server holds step_timeout_s=%v, want 900", mon.StepTimeoutS)
+						}
+						return nil
+					}),
+				),
+			},
+			{
+				Config: withoutStep,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr("lastping_monitor.st", "step_timeout_s"),
+					resource.TestCheckResourceAttrWith("lastping_monitor.st", "id", func(id string) error {
+						mon, err := testAccDirectClient(t).GetMonitor(t.Context(), id)
+						if err != nil {
+							return err
+						}
+						if mon.StepTimeoutS != nil {
+							return fmt.Errorf("server still holds step_timeout_s=%d, want it cleared",
+								*mon.StepTimeoutS)
+						}
+						// The clear must not have taken the neighbouring budget
+						// with it: both are sent as explicit nulls or values in
+						// the same document.
+						if mon.MaxRuntimeS == nil || *mon.MaxRuntimeS != 14400 {
+							return fmt.Errorf("clearing step_timeout_s disturbed max_runtime_s=%v",
+								mon.MaxRuntimeS)
+						}
+						return nil
+					}),
+				),
+			},
+			{
+				// And it stays cleared: no perpetual diff on re-plan.
+				Config:   withoutStep,
+				PlanOnly: true,
+			},
+			{
+				ResourceName:      "lastping_monitor.st",
+				ImportState:       true,
+				ImportStateId:     "acc-step-timeout",
+				ImportStateVerify: true,
+			},
+		},
+	})
+}
+
+// TestAccMonitor_stepTimeoutRejectedOnHTTP asserts the API's 400
+// STEP_TIMEOUT_NOT_SUPPORTED is anticipated at plan time. An http probe never
+// arms a run and has no /step endpoint, so the stall rule the attribute
+// configures is unreachable on one.
+func TestAccMonitor_stepTimeoutRejectedOnHTTP(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{{
+			Config: `
+resource "lastping_monitor" "probe" {
+  name             = "acc-http-steptimeout"
+  slug             = "acc-http-steptimeout"
+  monitor_type     = "http"
+  probe_url        = "https://example.com/"
+  probe_interval_s = 300
+  step_timeout_s   = 300
+}`,
+			PlanOnly:    true,
+			ExpectError: regexp.MustCompile(`step_timeout_s.*not supported`),
+		}},
+	})
+}
+
+// TestAccMonitor_stepTimeoutAboveBudgetRejected covers the interaction rule the
+// server enforces as 400 STEP_TIMEOUT_EXCEEDS_BUDGET.
+//
+// The first step is the shape that is easiest to write by accident: no
+// max_runtime_s, so the budget is grace_s, and a step timeout at or above it
+// leaves an empty stall window. The API refuses it rather than storing a rule
+// that can never fire, and the provider says so at plan time whenever both
+// values are known.
+//
+// The second step is the guard against over-eager validation: the same 600 is
+// legitimate once max_runtime_s raises the budget above it, and a plan-time
+// check that got the COALESCE backwards would refuse a configuration the API
+// accepts — an error the practitioner could do nothing about.
+func TestAccMonitor_stepTimeoutAboveBudgetRejected(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "lastping_monitor" "budget" {
+  name           = "acc-step-budget"
+  slug           = "acc-step-budget"
+  schedule_kind  = "simple"
+  period_s       = 3600
+  grace_s        = 300
+  step_timeout_s = 600
+}`,
+				PlanOnly:    true,
+				ExpectError: regexp.MustCompile(`step_timeout_s.*(budget|less than)`),
+			},
+			{
+				Config: `
+resource "lastping_monitor" "budget" {
+  name           = "acc-step-budget"
+  slug           = "acc-step-budget"
+  schedule_kind  = "simple"
+  period_s       = 3600
+  grace_s        = 300
+  max_runtime_s  = 14400
+  step_timeout_s = 600
+}`,
+				Check: resource.TestCheckResourceAttr("lastping_monitor.budget", "step_timeout_s", "600"),
+			},
+		},
+	})
+}
+
 // TestAccMonitor_monitorFromRoundTrips pins the offset-timestamp round trip: the
 // API stores and returns UTC, so a configured +01:00 timestamp comes back as Z.
 // The provider must treat the two as the same instant instead of reporting an

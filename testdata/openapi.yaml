@@ -157,6 +157,36 @@ components:
             start is ever outstanding and the overrun rule can never fire.
             Use `probe_timeout_s` to bound a single probe.
           example: 14400
+        step_timeout_s:
+          type: [integer, "null"]
+          format: int64
+          minimum: 10
+          maximum: 86400
+          description: |
+            Progress budget in seconds: how long an armed run may go without
+            posting a `/step` before a `stalled` incident opens.  The anchor is
+            the LATER of the run's `/start` and its most recent `/step`, so a
+            run that wedges before its first step is caught too.
+
+            Null or omitted disables stall detection entirely, which is how
+            every monitor behaved before this field existed.
+
+            A step resets the stall clock ONLY — it never extends
+            `max_runtime_s`, so an agent that reports progress forever still
+            overruns.
+
+            **Must be strictly less than the effective run budget,
+            `COALESCE(max_runtime_s, grace_s)`**, or the request is rejected
+            with 400 (`STEP_TIMEOUT_EXCEEDS_BUDGET`).  The stall rule fires only
+            inside that budget — past it the run is an overrun and `overrun` is
+            the truer cause — so a step timeout at or above the budget leaves an
+            empty window and the rule could never fire.
+
+            **Rejected with 400 (`STEP_TIMEOUT_NOT_SUPPORTED`) when
+            `monitor_type` is `http`.**  An HTTP probe never arms a run, so
+            there is nothing for a step to report progress within.  Use
+            `probe_timeout_s` to bound a single probe.
+          example: 300
         failure_threshold:
           type: integer
           format: int64
@@ -292,9 +322,9 @@ components:
         - **No field is required** — a body may contain a single key.
         - **Omitted field** — the stored value is left unchanged.
         - **Explicit `null`** — clears the value. Accepted only by
-          `runaway_ceiling`, `max_runtime_s`, `monitor_from`, `ci_workflow`,
-          `ci_branch` and `tags`; those are the six properties typed to allow
-          `null` below.
+          `runaway_ceiling`, `max_runtime_s`, `step_timeout_s`, `monitor_from`,
+          `ci_workflow`, `ci_branch` and `tags`; those are the seven properties
+          typed to allow `null` below.
         - **Any other value** — replaces the stored value.
 
         `slug`, `monitor_type`, `ci_provider` and `ci_secret` are immutable on
@@ -354,6 +384,28 @@ components:
             start/success pair, so the overrun rule can never fire.  An
             explicit `null` on an `http` monitor is accepted as a no-op.
           example: 14400
+        step_timeout_s:
+          type: [integer, "null"]
+          format: int64
+          minimum: 10
+          maximum: 86400
+          description: |
+            Progress budget in seconds for the **stall rule only**.
+
+            Explicit `null` disables stall detection; omitting the field leaves
+            it as stored.
+
+            The merged value must stay strictly below the merged effective run
+            budget `COALESCE(max_runtime_s, grace_s)`, and this is checked from
+            BOTH directions: a PATCH that only raises `grace_s`, or only clears
+            `max_runtime_s`, is rejected with 400
+            (`STEP_TIMEOUT_EXCEEDS_BUDGET`) when it would push the stored
+            `step_timeout_s` out of the window.
+
+            **Rejected with 400 (`STEP_TIMEOUT_NOT_SUPPORTED`) on an `http`
+            monitor** when sent with a non-null value.  An explicit `null` on an
+            `http` monitor is accepted as a no-op.
+          example: 300
         failure_threshold:
           type: integer
           format: int64
@@ -510,6 +562,14 @@ components:
             **Omitted from the response when unset**, in which case the overrun
             rule falls back to `grace_s`.  Never set on `http` monitors.
           example: 14400
+        step_timeout_s:
+          type: [integer, "null"]
+          format: int64
+          description: |
+            Progress budget in seconds for the stall rule.  **Omitted from the
+            response when unset**, in which case stall detection is disabled.
+            Never set on `http` monitors.
+          example: 300
         failure_threshold:
           type: integer
           format: int64
@@ -994,6 +1054,28 @@ components:
           format: date-time
           description: RFC 3339 UTC timestamp when the ping was received.
           example: "2026-07-20T10:00:00Z"
+        rid:
+          type: string
+          description: |
+            Run id this ping carried (`?rid=`), omitted when the ping carried
+            none. It is the key `steps` are matched on.
+          example: "9876543210"
+        steps:
+          type: array
+          description: |
+            Progress markers the run reported to `/<uuid>/step?rid=…`, in the
+            order they happened. Omitted entirely when the run reported none —
+            an absent `steps` means the run was not instrumented with steps, not
+            that it reported zero.
+
+            Steps are matched on `rid`, so a CI run only carries them when the
+            job posted `/step` with the same run id the CI webhook reports. The
+            two pings of one run (its `start` and its terminal ping) share a rid
+            and therefore both carry that run's timeline.
+
+            At most 100 steps are stored per run.
+          items:
+            $ref: "#/components/schemas/RunStep"
         run_url:
           type: string
           description: Direct URL to the CI/CD run page (omitted when unavailable).
@@ -1012,7 +1094,20 @@ components:
           example: "octocat"
         failing_stage:
           type: string
-          description: Name of the failing step or job (omitted when unavailable).
+          description: |
+            Name of the failing step or job (omitted when unavailable).
+
+            Availability differs by provider:
+              * **GitLab CI** — always populated on a failed pipeline, from the
+                stage of the first failed entry in the hook's `builds[]`.
+              * **GitHub Actions** — requires the repository webhook to
+                subscribe to **Workflow jobs** (`workflow_job`) in addition to
+                **Workflow runs**. Only `workflow_job` carries per-step
+                conclusions; with `workflow_run` alone this field is always
+                omitted.
+              * **Jenkins** — never populated. The Notification Plugin payload
+                reports only the build's overall result and carries no
+                per-stage or per-step detail.
           example: "go test ./..."
         duration_s:
           type: integer
@@ -1041,6 +1136,34 @@ components:
             True when the correlated incident has been closed (resolved). False when
             the incident is still open or when no incident correlates.
           example: false
+
+    RunStep:
+      type: object
+      description: |
+        One progress marker reported inside an armed run via
+        `GET|HEAD|POST https://ping.lastping.dev/<uuid>/step?rid=<run-id>&step=<name>`.
+
+        A step resets the monitor's stall clock (`step_timeout_s`) and is
+        recorded on the run's timeline. It does **not** change the monitor's
+        status, does not count as a ping for silence detection, and does not
+        extend the run budget `COALESCE(max_runtime_s, grace_s)`.
+      properties:
+        seq:
+          type: integer
+          format: int32
+          description: 1-based position of this step within its run.
+          example: 2
+        name:
+          type: string
+          description: |
+            Step label from `?step=`, trimmed and truncated to 200 characters.
+            Defaults to `step` when the parameter is absent or blank.
+          example: "db migrate"
+        at:
+          type: string
+          format: date-time
+          description: RFC 3339 UTC timestamp when the step ping was received.
+          example: "2026-07-20T10:04:00Z"
 
     StatusPageCreate:
       type: object
@@ -1456,8 +1579,9 @@ paths:
 
         - **Omitted field** — the stored value is left unchanged.
         - **Explicit `null`** — clears the value. Supported on `runaway_ceiling`,
-          `max_runtime_s`, `monitor_from`, `ci_workflow`, `ci_branch`, and
-          `tags` only; for `tags`, explicit `null` is equivalent to sending `[]`.
+          `max_runtime_s`, `step_timeout_s`, `monitor_from`, `ci_workflow`,
+          `ci_branch`, and `tags` only; for `tags`, explicit `null` is
+          equivalent to sending `[]`.
           `failure_threshold` is NOT clearable (the column is `NOT NULL DEFAULT
           1`); a `null` there is treated as omission.
         - **Any other value** — replaces the stored value.
@@ -1802,7 +1926,21 @@ paths:
         `{check_name}`, `{event}`, `{status}`, `{cause}`, `{last_ping}`,
         `{schedule}`, `{incident_url}`, `{run_url}`, `{branch}`, `{commit}`,
         `{actor}`, `{failing_stage}`, `{duration}`, `{latency}`, `{status_code}`,
-        `{url}`.  Unknown placeholders are **rejected** at write time.
+        `{url}`, `{last_step}`, `{step_count}`, `{run_duration}`.  Unknown
+        placeholders are **rejected** at write time.
+
+        `{last_step}`, `{step_count}` and `{run_duration}` describe the run that
+        was in flight when the incident opened, and are populated on `stalled`
+        and `overrun` incidents only — elsewhere they render empty rather than
+        report a number about a different run.  `{run_duration}` is the absolute
+        elapsed time from the run's `/start`; a run that wedged before its first
+        `/step` leaves `{last_step}` and `{step_count}` empty rather than `0`.
+
+        Not every placeholder is populated for every provider. `{failing_stage}`
+        in particular renders empty on Jenkins (its Notification Plugin payload
+        has no step detail) and on GitHub unless the repository webhook also
+        subscribes to **Workflow jobs** — see the `failing_stage` field on the
+        `CIMeta` schema.
       tags: [Checks]
       security:
         - ApiKeyAuth: []
@@ -3273,6 +3411,12 @@ paths:
         ping) exists, `incident_cause`, `incident_detail`, and `incident_resolved`
         are populated — enabling unattended failure triage without following links
         to the CI provider.
+
+        Each entry also carries the run id (`rid`) and, when the run reported
+        progress markers to `/<uuid>/step?rid=…`, the `steps` it reached. A run
+        that stalled therefore names the step it wedged on without a second
+        call. Steps are matched on `rid`, so they appear only when the job posts
+        `/step` with the same run id the CI webhook reports.
 
         Always returns a JSON array (never null).
       tags: [CI]

@@ -116,6 +116,7 @@ type monitorResourceModel struct {
 	TZ                   types.String `tfsdk:"tz"`
 	GraceS               types.Int64  `tfsdk:"grace_s"`
 	MaxRuntimeS          types.Int64  `tfsdk:"max_runtime_s"`
+	StepTimeoutS         types.Int64  `tfsdk:"step_timeout_s"`
 	FailureThreshold     types.Int64  `tfsdk:"failure_threshold"`
 	Tags                 types.Set    `tfsdk:"tags"`
 	RunawayCeiling       types.Int64  `tfsdk:"runaway_ceiling"`
@@ -232,6 +233,31 @@ func (r *monitorResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 					"this provider rejects it at plan time. Use `probe_timeout_s` to bound a single probe.",
 				Validators: []validator.Int64{int64validator.Between(60, 31536000)},
 			},
+			"step_timeout_s": schema.Int64Attribute{
+				Optional: true,
+				MarkdownDescription: "How long an armed run may go without reporting a **step** before a " +
+					"`stalled` incident opens, in seconds. Between 10 and 86400. Opt-in: omit it and stall " +
+					"detection is off, which is how every monitor behaved before this attribute existed; " +
+					"removing it from the configuration turns it back off.\n\n" +
+					"A step is a liveness marker the job posts inside a run it has already started " +
+					"(`POST /ping/{id}/step?rid=…&name=…`). `max_runtime_s` alone only catches a wedged job " +
+					"once its whole run budget is spent; `step_timeout_s` catches it within one step interval " +
+					"and names the last step that did report. A job that never posts steps will therefore " +
+					"open a `stalled` incident on **every** run — set this attribute and instrument the job in " +
+					"the same change.\n\n" +
+					"~> **It must be strictly less than the effective run budget**, which is `max_runtime_s`, " +
+					"or `grace_s` when `max_runtime_s` is unset. The stall window is the interval between the " +
+					"step timeout and the end of the budget, so a value at or above the budget leaves that " +
+					"window empty and the rule could never fire — the API rejects it with 400 " +
+					"`STEP_TIMEOUT_EXCEEDS_BUDGET` rather than storing a setting that does nothing. The " +
+					"provider anticipates that at plan time whenever both values are known in the " +
+					"configuration.\n\n" +
+					"~> **Not supported on `monitor_type = \"http\"`.** A probe never arms a run and has no " +
+					"`/step` endpoint to call, so the stall rule is unreachable there. The API rejects it " +
+					"with 400 `STEP_TIMEOUT_NOT_SUPPORTED`, and this provider rejects it at plan time. Use " +
+					"`probe_timeout_s` to bound a single probe.",
+				Validators: []validator.Int64{int64validator.Between(10, 86400)},
+			},
 			"failure_threshold": schema.Int64Attribute{
 				Optional: true,
 				Computed: true,
@@ -345,12 +371,13 @@ func (r *monitorResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 	}
 }
 
-// ValidateConfig rejects the two http-monitor configurations the server will
-// not honour as written. Both are caught here rather than at apply time,
-// because a plan-time error names the attribute and costs nothing, while the
-// apply-time failures are opaque: an inconsistent-result panic for the first
-// and a bare 400 for the second, both after Terraform has already started
-// changing things.
+// ValidateConfig rejects the configurations the server will not honour as
+// written. They are caught here rather than at apply time, because a plan-time
+// error names the attribute and costs nothing, while the apply-time failures
+// are opaque: an inconsistent-result panic for the first and a bare 400 for the
+// rest, all after Terraform has already started changing things.
+//
+// The http-monitor rules:
 //
 //   - grace_s below the server's floor of 2*probe_interval_s. Terraform requires
 //     a known planned value to survive apply unchanged, and the server would
@@ -362,14 +389,40 @@ func (r *monitorResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 //     MAX_RUNTIME_NOT_SUPPORTED. Only a non-null configured value is rejected:
 //     an omitted max_runtime_s still reaches the API as an explicit null on
 //     update (see monitorPatchFromModel), which the API accepts as a no-op.
+//
+//   - step_timeout_s set at all, for the stricter version of the same reason:
+//     an http probe never arms a run and has no /step endpoint, so the stall
+//     rule is unreachable. 400 STEP_TIMEOUT_NOT_SUPPORTED, and — as with
+//     max_runtime_s — the explicit null the update path always sends is a no-op
+//     the API accepts.
+//
+// And one rule that is not about http at all: step_timeout_s must be strictly
+// below the effective run budget. See validateStepTimeoutBudget.
 func (r *monitorResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
 	var cfg monitorResourceModel
 	resp.Diagnostics.Append(req.Config.Get(ctx, &cfg)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
+
 	if cfg.MonitorType.IsUnknown() || cfg.MonitorType.ValueString() != "http" {
+		// Not an http monitor, so step_timeout_s is legal — but it still has to
+		// fit inside the run budget. The check is skipped for http monitors
+		// below, where the attribute is refused outright and the server's own
+		// grace floor (2*probe_interval_s) would make any budget quoted here
+		// wrong anyway.
+		validateStepTimeoutBudget(cfg, resp)
 		return
+	}
+
+	if !cfg.StepTimeoutS.IsNull() && !cfg.StepTimeoutS.IsUnknown() {
+		resp.Diagnostics.AddAttributeError(path.Root("step_timeout_s"),
+			"step_timeout_s is not supported on an http monitor",
+			"The API rejects step_timeout_s on monitor_type = \"http\" with 400 "+
+				"STEP_TIMEOUT_NOT_SUPPORTED. An HTTP probe never arms a run — the prober mints a fresh "+
+				"run id for every probe, and there is no /step endpoint a probe could call — so the "+
+				"stall rule can never fire.\n\nRemove step_timeout_s. To bound a single probe, use "+
+				"probe_timeout_s.")
 	}
 
 	if !cfg.MaxRuntimeS.IsNull() && !cfg.MaxRuntimeS.IsUnknown() {
@@ -391,6 +444,55 @@ func (r *monitorResource) ValidateConfig(ctx context.Context, req resource.Valid
 				"(here: at least %d), so %d would never be applied as written.\n\nSet grace_s to at least %d, "+
 				"or omit it to take the server floor.",
 				floor, cfg.GraceS.ValueInt64(), floor))
+	}
+}
+
+// validateStepTimeoutBudget mirrors the server's STEP_TIMEOUT_EXCEEDS_BUDGET
+// rule: step_timeout_s must be STRICTLY less than the effective run budget,
+// which is max_runtime_s, or grace_s when max_runtime_s is unset.
+//
+// The rule is not a style preference. The stall window is the interval between
+// the step timeout and the end of the run budget, so a step_timeout_s at or
+// above the budget leaves it empty and the rule can never fire, for any input —
+// the monitor would carry stall detection that is permanently, invisibly off.
+// That is why the API refuses it instead of storing it.
+//
+// It is only checked when the answer is knowable from the configuration alone:
+//
+//   - step_timeout_s null or unknown — nothing to check.
+//   - max_runtime_s unknown — the budget itself is unknown. Deferred to the API.
+//   - max_runtime_s known and non-null — it IS the budget. Compare against it.
+//   - max_runtime_s null — the budget is grace_s. grace_s is Optional+Computed,
+//     so a configuration that omits it leaves the server to supply the value
+//     (an http probe floor, or the stored value on update) and the budget is
+//     unknowable here; only a grace_s written in the configuration is compared.
+//
+// Deferring those cases costs nothing but a later error: the API still enforces
+// the rule on the merged check, which is the only place it can be enforced in
+// full — a PATCH that raises grace_s alone can push an already-stored
+// step_timeout_s over the budget, and the configuration under validation here
+// need not mention either attribute.
+func validateStepTimeoutBudget(cfg monitorResourceModel, resp *resource.ValidateConfigResponse) {
+	if cfg.StepTimeoutS.IsNull() || cfg.StepTimeoutS.IsUnknown() || cfg.MaxRuntimeS.IsUnknown() {
+		return
+	}
+
+	budget, source := cfg.MaxRuntimeS.ValueInt64(), "max_runtime_s"
+	if cfg.MaxRuntimeS.IsNull() {
+		if cfg.GraceS.IsNull() || cfg.GraceS.IsUnknown() {
+			return
+		}
+		budget, source = cfg.GraceS.ValueInt64(), "grace_s"
+	}
+
+	if step := cfg.StepTimeoutS.ValueInt64(); step >= budget {
+		resp.Diagnostics.AddAttributeError(path.Root("step_timeout_s"),
+			"step_timeout_s is not below the run budget",
+			fmt.Sprintf("step_timeout_s (%d) must be strictly less than the effective run budget, "+
+				"which is %s = %d here. The stall rule only fires between the step timeout and the end "+
+				"of that budget, so %d could never fire — the API rejects it with 400 "+
+				"STEP_TIMEOUT_EXCEEDS_BUDGET.\n\nLower step_timeout_s below %d, or raise the budget "+
+				"above it.", step, source, budget, step, budget))
 	}
 }
 
@@ -441,6 +543,10 @@ func monitorFromModel(ctx context.Context, m monitorResourceModel) (client.Monit
 		v := m.MaxRuntimeS.ValueInt64()
 		out.MaxRuntimeS = &v
 	}
+	if !m.StepTimeoutS.IsNull() && !m.StepTimeoutS.IsUnknown() {
+		v := m.StepTimeoutS.ValueInt64()
+		out.StepTimeoutS = &v
+	}
 	if !m.MonitorFrom.IsNull() && !m.MonitorFrom.IsUnknown() && m.MonitorFrom.ValueString() != "" {
 		v := m.MonitorFrom.ValueString()
 		out.MonitorFrom = &v
@@ -461,7 +567,7 @@ func monitorFromModel(ctx context.Context, m monitorResourceModel) (client.Monit
 //
 //   - desired is the plan with unknowns resolved from the prior state (see
 //     resolveUnknownsFromState), so every value in it is concrete. It supplies
-//     the values — and, with the current schema, presence too: the four
+//     the values — and, with the current schema, presence too: the five
 //     clearable attributes are Optional-only, so removing one from the
 //     configuration plans it as null.
 //   - cfg is the practitioner's literal configuration. Its null-ness is checked
@@ -480,13 +586,14 @@ func monitorFromModel(ctx context.Context, m monitorResourceModel) (client.Monit
 // desired against state and the two would agree.
 //
 // TestMonitorOptionalOnlyAttributesAreNotComputed is the guardrail that keeps
-// tags, runaway_ceiling, monitor_from and max_runtime_s Optional-only. Read it
-// before making any of them Computed to suppress drift.
+// tags, runaway_ceiling, monitor_from, max_runtime_s and step_timeout_s
+// Optional-only. Read it before making any of them Computed to suppress drift.
 //
 // The document is sparse (see client.MonitorPatch) and its keys fall into three
 // groups:
 //
-//  1. Clearable — tags, runaway_ceiling, monitor_from, max_runtime_s. Absent
+//  1. Clearable — tags, runaway_ceiling, monitor_from, max_runtime_s,
+//     step_timeout_s. Absent
 //     from the configuration, they are sent as an explicit JSON null. Under
 //     merge-patch that is the only way to clear them; under the older
 //     full-replace server a null decodes to a nil slice / nil pointer and clears
@@ -560,6 +667,20 @@ func monitorPatchFromModel(ctx context.Context, desired, cfg monitorResourceMode
 		patch["max_runtime_s"] = nil
 	} else {
 		patch["max_runtime_s"] = desired.MaxRuntimeS.ValueInt64()
+	}
+
+	// step_timeout_s is clearable in exactly the same way, and belongs in this
+	// group for exactly the same reason: an absent key under merge-patch leaves
+	// the stored timeout in place, so "turn stall detection back off" would be
+	// unreachable through Terraform. Its range starts at 10, so omit-when-zero
+	// would have looked harmless while quietly pinning the attribute forever.
+	// The null is safe on an http monitor too — the API keys its
+	// STEP_TIMEOUT_NOT_SUPPORTED refusal off a non-null incoming value, and
+	// ValidateConfig has already refused a configured one.
+	if cfg.StepTimeoutS.IsNull() || desired.StepTimeoutS.IsNull() {
+		patch["step_timeout_s"] = nil
+	} else {
+		patch["step_timeout_s"] = desired.StepTimeoutS.ValueInt64()
 	}
 
 	if cfg.MonitorFrom.IsNull() || desired.MonitorFrom.ValueString() == "" {
@@ -701,6 +822,14 @@ func modelFromMonitor(ctx context.Context, mon *client.Monitor, prior monitorRes
 		m.MaxRuntimeS = types.Int64Value(*mon.MaxRuntimeS)
 	} else {
 		m.MaxRuntimeS = types.Int64Null()
+	}
+	// Likewise for step_timeout_s: absent means stall detection is off, which
+	// has to read as null rather than as a 0 no practitioner could have written
+	// (the valid range starts at 10).
+	if mon.StepTimeoutS != nil {
+		m.StepTimeoutS = types.Int64Value(*mon.StepTimeoutS)
+	} else {
+		m.StepTimeoutS = types.Int64Null()
 	}
 	m.MonitorFrom = monitorFromValue(mon.MonitorFrom, prior.MonitorFrom)
 

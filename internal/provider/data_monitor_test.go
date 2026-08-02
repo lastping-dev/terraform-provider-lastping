@@ -10,10 +10,11 @@ import (
 // dataMonitorFixture is a monitor with every attribute the data source reports
 // set to something distinctive, so a read-back of the wrong field is visible
 // rather than a coincidental match on a default.
-// max_runtime_s and failure_threshold carry non-default values for the same
-// reason as the rest: failure_threshold is 1 on every monitor that never sets
-// it, and max_runtime_s is unset by default, so pairing them against a fixture
-// that omitted them would pass even if the data source read the wrong field.
+// max_runtime_s, step_timeout_s and failure_threshold carry non-default values
+// for the same reason as the rest: failure_threshold is 1 on every monitor that
+// never sets it, and max_runtime_s and step_timeout_s are unset by default, so
+// pairing them against a fixture that omitted them would pass even if the data
+// source read the wrong field.
 const dataMonitorFixture = `
 resource "lastping_monitor" "src" {
   name              = "acc-data-monitor"
@@ -23,6 +24,7 @@ resource "lastping_monitor" "src" {
   tz                = "Europe/Berlin"
   grace_s           = 1800
   max_runtime_s     = 14400
+  step_timeout_s    = 900
   failure_threshold = 3
   tags              = ["acc:data-monitor", "env:test"]
   runaway_ceiling   = 42
@@ -98,6 +100,18 @@ data "lastping_monitor" "by_slug" {
 					resource.TestCheckResourceAttrPair(
 						"data.lastping_monitor.by_slug", "max_runtime_s",
 						"lastping_monitor.src", "max_runtime_s"),
+					resource.TestCheckResourceAttrPair(
+						"data.lastping_monitor.by_slug", "step_timeout_s",
+						"lastping_monitor.src", "step_timeout_s"),
+					// Pinned as a literal as well as a pair, because the pair
+					// alone passes vacuously if the fixture ever stops setting
+					// step_timeout_s: both surfaces would then read null and
+					// agree. Every monitor that does not ask for the attribute
+					// leaves it unset, so that is a live way for this pair to
+					// quietly stop testing anything — mutating the fixture to
+					// drop it leaves the pair green and fails only here.
+					resource.TestCheckResourceAttr(
+						"data.lastping_monitor.by_slug", "step_timeout_s", "900"),
 					resource.TestCheckResourceAttrPair(
 						"data.lastping_monitor.by_slug", "paused", "lastping_monitor.src", "paused"),
 					resource.TestCheckResourceAttrPair(

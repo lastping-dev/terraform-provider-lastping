@@ -36,6 +36,18 @@ resource "lastping_monitor" "nightly_backup" {
   # overrun deadline only, so the two budgets are set independently: grace_s
   # (900s) still decides how late the *start* may be.
   max_runtime_s = 14400
+
+  # The third and tightest clock. A run that reports no step for 10 minutes is
+  # wedged, and waiting out the whole 4-hour max_runtime_s to hear about it is
+  # the difference between noticing before breakfast and noticing after. It
+  # must be strictly below the effective budget (max_runtime_s here, grace_s
+  # when that is unset), or the stall window is empty and the rule could never
+  # fire — the API rejects that rather than storing it.
+  #
+  # Only set it if the job actually reports steps (POST /ping/{id}/step inside
+  # a run it has already started): a job that never does opens a stalled
+  # incident on every run.
+  step_timeout_s = 600
 }
 
 # A flaky-by-nature job: a single failed run is noise, three in a row is a
@@ -115,6 +127,13 @@ This replaces `grace_s` for the **overrun deadline only**: the silence rule (`du
 - `runaway_ceiling` (Number) Optional cap on pings per rolling 1-hour window. Exceeding it opens a "runaway" incident. Omit to disable.
 - `schedule_kind` (String) `simple` (fixed `period_s` interval) or `cron` (`cron_expr` + `tz`). Computed for `monitor_type = "http"`, which the server always schedules as `simple` from `probe_interval_s`.
 - `slug` (String) Stable, project-scoped identifier used for import and for `If-None-Match` collision detection. The API has no path to change a monitor's slug, so changing this attribute replaces the resource. Must already be in normalised form: lowercase, trimmed, matching `^[a-z0-9][a-z0-9-]{1,48}[a-z0-9]$`, and not UUID-shaped.
+- `step_timeout_s` (Number) How long an armed run may go without reporting a **step** before a `stalled` incident opens, in seconds. Between 10 and 86400. Opt-in: omit it and stall detection is off, which is how every monitor behaved before this attribute existed; removing it from the configuration turns it back off.
+
+A step is a liveness marker the job posts inside a run it has already started (`POST /ping/{id}/step?rid=…&name=…`). `max_runtime_s` alone only catches a wedged job once its whole run budget is spent; `step_timeout_s` catches it within one step interval and names the last step that did report. A job that never posts steps will therefore open a `stalled` incident on **every** run — set this attribute and instrument the job in the same change.
+
+~> **It must be strictly less than the effective run budget**, which is `max_runtime_s`, or `grace_s` when `max_runtime_s` is unset. The stall window is the interval between the step timeout and the end of the budget, so a value at or above the budget leaves that window empty and the rule could never fire — the API rejects it with 400 `STEP_TIMEOUT_EXCEEDS_BUDGET` rather than storing a setting that does nothing. The provider anticipates that at plan time whenever both values are known in the configuration.
+
+~> **Not supported on `monitor_type = "http"`.** A probe never arms a run and has no `/step` endpoint to call, so the stall rule is unreachable there. The API rejects it with 400 `STEP_TIMEOUT_NOT_SUPPORTED`, and this provider rejects it at plan time. Use `probe_timeout_s` to bound a single probe.
 - `tags` (Set of String) Labels attached to this monitor. Removing them from the configuration clears them.
 - `tz` (String) IANA timezone for cron evaluation. Defaults to `UTC` when unset.
 
