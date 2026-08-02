@@ -57,7 +57,8 @@ components:
     CheckCreate:
       type: object
       description: |
-        Body for creating or updating a check (POST /api/v1/checks or PATCH /api/v1/checks/{id}).
+        Body for creating a check (POST /api/v1/checks).  The update body is a
+        separate schema — see `CheckPatch` for PATCH /api/v1/checks/{id}.
 
         **Monitor types:**
         - `heartbeat` (default) — expects your service to ping the `ping_url` on schedule.
@@ -128,8 +129,57 @@ components:
         grace_s:
           type: integer
           format: int64
-          description: Grace period in seconds after a ping is due before the check is considered late.
+          description: |
+            Grace period in seconds after a ping is due before the check is
+            considered late.  This is the **silence** tolerance and the
+            first-run (`monitor_from`) deadline.  It is also the fallback
+            run-duration budget when `max_runtime_s` is not set.
           example: 600
+        max_runtime_s:
+          type: [integer, "null"]
+          format: int64
+          minimum: 60
+          maximum: 31536000
+          description: |
+            Run-duration budget in seconds, measured from an unmatched
+            `/start` ping.  It replaces `grace_s` for the **overrun deadline
+            only** — the silence rule (`alert_after = due_at + grace_s`) and
+            the first-run seed (`alert_after = monitor_from + grace_s`) keep
+            using `grace_s`.  This is what makes "alert if silent for more
+            than 10 minutes, but allow a 4-hour run" expressible.
+
+            Null or omitted falls back to `grace_s`, so a monitor that never
+            sets it behaves exactly as before this field existed.
+
+            **Rejected with 400 (`MAX_RUNTIME_NOT_SUPPORTED`) when
+            `monitor_type` is `http`.**  An HTTP probe has no start/success
+            pair — the prober mints a fresh run id for every probe — so no
+            start is ever outstanding and the overrun rule can never fire.
+            Use `probe_timeout_s` to bound a single probe.
+          example: 14400
+        failure_threshold:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 100
+          default: 1
+          description: |
+            Number of **consecutive explicit failures** required before an
+            incident opens — retry-before-alert.  Applies to the `fail` cause
+            ONLY: `silence`, `overrun`, `never_started` and `runaway` are time-
+            or rate-based, so a consecutive-failure count is meaningless for
+            them and never gates them.
+
+            Below the threshold nothing alerts and the status does not change,
+            but the ping is still recorded, an outstanding run is still ended,
+            and deadlines are still recomputed — the failed run did happen,
+            only the alert is deferred.  Any success resets the counter to
+            zero; a cancel does not.
+
+            Defaults to `1` (open on the first failure) when omitted, which is
+            the pre-existing behaviour.  Applies to `http` monitors too: a
+            failed probe is a real `fail` signal.
+          example: 3
         monitor_from:
           type: [string, "null"]
           format: date-time
@@ -169,7 +219,10 @@ components:
           format: int64
           description: |
             HTTP status code the probe must receive to count as success.
-            Defaults to 200 when omitted.
+            No default is applied on create: an omitted (or `0`) value means
+            "any 2xx response counts as success". Set it explicitly to require
+            one exact status. On PATCH, an omitted field retains the stored
+            value.
           example: 200
         probe_timeout_s:
           type: integer
@@ -181,7 +234,9 @@ components:
         probe_follow_redirects:
           type: boolean
           description: |
-            Whether the probe should follow HTTP redirects.  Defaults to `false`.
+            Whether the probe should follow HTTP redirects.  Defaults to `false`
+            when omitted on create. On PATCH, an omitted field retains the
+            stored value.
           example: false
         ci_provider:
           type: string
@@ -223,6 +278,189 @@ components:
             deduplicated. The `agent:` prefix is a convention for AI-provisioned monitors.
           example: ["agent:claude", "env:prod"]
 
+    CheckPatch:
+      type: object
+      description: |
+        Body for updating a check (PATCH /api/v1/checks/{id}), using JSON Merge
+        Patch semantics (RFC 7396).
+
+        This is deliberately NOT `CheckCreate`: on create an omitted field means
+        "use the default", so `name` is required and nothing is nullable; on
+        update an omitted field means "leave the stored value unchanged", and
+        an explicit `null` is the only way to clear a value.
+
+        - **No field is required** — a body may contain a single key.
+        - **Omitted field** — the stored value is left unchanged.
+        - **Explicit `null`** — clears the value. Accepted only by
+          `runaway_ceiling`, `max_runtime_s`, `monitor_from`, `ci_workflow`,
+          `ci_branch` and `tags`; those are the six properties typed to allow
+          `null` below.
+        - **Any other value** — replaces the stored value.
+
+        `slug`, `monitor_type`, `ci_provider` and `ci_secret` are immutable on
+        update and are ignored if present.
+      properties:
+        name:
+          type: string
+          description: Human-readable name for the check.
+          example: "Daily backup job"
+        schedule_kind:
+          type: string
+          enum: [simple, cron]
+          description: |
+            `simple` uses a fixed period; `cron` uses a cron expression.
+            Ignored when the monitor's type is `http` (schedule is driven by
+            `probe_interval_s`).
+          example: "simple"
+        period_s:
+          type: integer
+          format: int64
+          description: Expected ping interval in seconds.  Applies when schedule_kind is `simple`.
+          example: 86400
+        cron_expr:
+          type: string
+          description: Cron expression (5-field).  Applies when schedule_kind is `cron`.
+          example: "0 3 * * *"
+        tz:
+          type: string
+          description: IANA timezone for cron evaluation.
+          example: "Europe/London"
+        grace_s:
+          type: integer
+          format: int64
+          description: |
+            Grace period in seconds after a ping is due before the check is
+            considered late.  For an `http` monitor the effective grace is
+            derived as 2 × `probe_interval_s`; a larger explicit `grace_s` sent
+            in the same request is honoured instead.
+
+            `grace_s` is the silence tolerance and the first-run deadline; the
+            overrun deadline uses `max_runtime_s` when that is set.
+          example: 600
+        max_runtime_s:
+          type: [integer, "null"]
+          format: int64
+          minimum: 60
+          maximum: 31536000
+          description: |
+            Run-duration budget in seconds for the **overrun deadline only**;
+            the silence rule and the first-run seed keep using `grace_s`.
+
+            Explicit `null` clears it, restoring the fallback to `grace_s`;
+            omitting the field leaves it as stored.
+
+            **Rejected with 400 (`MAX_RUNTIME_NOT_SUPPORTED`) on an `http`
+            monitor** when sent with a non-null value — an HTTP probe has no
+            start/success pair, so the overrun rule can never fire.  An
+            explicit `null` on an `http` monitor is accepted as a no-op.
+          example: 14400
+        failure_threshold:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 100
+          description: |
+            Consecutive explicit failures required before an incident opens.
+            Applies to the `fail` cause ONLY — `silence`, `overrun`,
+            `never_started` and `runaway` are time- or rate-based and are never
+            gated by it.
+
+            Not nullable: the column is `NOT NULL DEFAULT 1`, so there is no
+            "unset" state to return to.  An omitted field (or an explicit
+            `null`, treated the same as omission) leaves the stored value
+            unchanged.
+
+            **Changing it does NOT reset `consecutive_failures`.**  With the
+            counter at 3 and the threshold lowered from 5 to 2, the very next
+            failure opens an incident.  This is deliberate: the counter is a
+            factual record of failures that really happened, and lowering the
+            threshold means "that many is now enough" — resetting would discard
+            true information.  Raising it likewise keeps the counter, so a
+            monitor already past the new threshold alerts on its next failure.
+          example: 3
+        monitor_from:
+          type: [string, "null"]
+          format: date-time
+          description: |
+            RFC 3339 timestamp.  Deadlines are not computed before this time.
+            Explicit `null` clears it.
+          example: "2026-01-01T00:00:00Z"
+        probe_url:
+          type: string
+          format: uri
+          description: Absolute `http` or `https` URL for LastPing to probe (`http` monitors).
+          example: "https://example.com/healthz"
+        probe_method:
+          type: string
+          enum: [GET, HEAD, POST]
+          description: HTTP method for the probe request.
+          example: "GET"
+        probe_expected_body:
+          type: string
+          description: |
+            Substring that must appear in the response body for the probe to be
+            considered successful.  Send `""` to skip body matching.
+          example: "\"status\":\"ok\""
+        probe_interval_s:
+          type: integer
+          format: int64
+          description: |
+            How often (in seconds) LastPing should probe the URL.
+            Must be between 30 and 86400.
+          example: 60
+        probe_expected_status:
+          type: integer
+          format: int64
+          description: |
+            HTTP status code the probe must receive to count as success.
+            `0` means "any 2xx response counts as success".
+          example: 200
+        probe_timeout_s:
+          type: integer
+          format: int64
+          description: Probe HTTP request timeout in seconds.  Must be between 1 and 30.
+          example: 10
+        probe_follow_redirects:
+          type: boolean
+          description: Whether the probe should follow HTTP redirects.
+          example: false
+        ci_workflow:
+          type: [string, "null"]
+          description: |
+            CI workflow name to filter inbound webhooks by (provider-specific).
+            Deliberately deviates from strict RFC 7396: an explicit empty string
+            `""` preserves the stored value, the same as omitting the field, so
+            that full-body clients (e.g. Terraform) which always send `""` for an
+            unset filter cannot silently unbind a live filter.  Explicit `null`
+            clears it.
+          example: "ci.yml"
+        ci_branch:
+          type: [string, "null"]
+          description: |
+            Branch name to filter inbound webhooks by.  Same empty-string
+            preservation rule as `ci_workflow`; explicit `null` clears it.
+          example: "main"
+        runaway_ceiling:
+          type: [integer, "null"]
+          format: int64
+          description: |
+            Maximum pings allowed in a rolling 1-hour window. Exceeding it opens a
+            `runaway`-cause incident, which detects a looping agent or job pinging
+            abnormally fast.  Explicit `null` disables the check; omitting the
+            field leaves it as stored.
+          example: 20
+        tags:
+          type: [array, "null"]
+          items:
+            type: string
+          maxItems: 20
+          description: |
+            Labels for namespace scoping and auditing.  Replaced wholesale, not
+            merged. Max 20 tags; each tag max 50 characters. Duplicate tags are
+            silently deduplicated.  Send `[]` or `null` to remove all tags;
+            omitting the field leaves the stored tags alone.
+          example: ["agent:claude", "env:prod"]
+
     Check:
       type: object
       description: A check resource returned by the API.
@@ -260,8 +498,26 @@ components:
         grace_s:
           type: integer
           format: int64
-          description: Grace period in seconds.
+          description: |
+            Grace period in seconds — the silence tolerance and the first-run
+            deadline, and the overrun budget when `max_runtime_s` is unset.
           example: 600
+        max_runtime_s:
+          type: [integer, "null"]
+          format: int64
+          description: |
+            Run-duration budget in seconds for the overrun deadline only.
+            **Omitted from the response when unset**, in which case the overrun
+            rule falls back to `grace_s`.  Never set on `http` monitors.
+          example: 14400
+        failure_threshold:
+          type: integer
+          format: int64
+          description: |
+            Consecutive explicit failures required before an incident opens
+            (`fail` cause only).  Always present; `1` means "open on the first
+            failure", the default.
+          example: 3
         monitor_from:
           type: [string, "null"]
           format: date-time
@@ -635,8 +891,17 @@ components:
       properties:
         event_type:
           type: string
-          enum: [down, recovery, fail]
-          description: The check event that triggers this route.
+          enum: [down, recovery, fail, every-run, success, started]
+          description: >-
+            The check event that triggers this route. `down`, `recovery` and `fail`
+            fire on a state change. `every-run`, `success` and `started` are
+            informational: `every-run` fires once per completed run (success or
+            failure), `success` fires only on a successful run, and `started`
+            fires when a run begins. All three are bounded only by how often the
+            monitor runs (not by state changes), and they share one per-channel
+            rate budget (default 60/hr) separate from down/fail/recovery — a
+            chatty monitor routed to any combination of the three can starve its
+            own notifications once that shared budget is exhausted.
           example: "down"
         channel_ids:
           type: array
@@ -672,6 +937,15 @@ components:
           format: date-time
           description: RFC 3339 UTC timestamp when the ping was received.
           example: "2026-07-10T03:00:05Z"
+        duration_ms:
+          type: integer
+          format: int64
+          description: >-
+            Wall-clock duration in milliseconds of the run this ping completed.
+            Present only when this ping is a `success` that paired with a
+            preceding `start` on the same `rid`; omitted otherwise (never `0`
+            or `null` as a stand-in for "absent").
+          example: 1523
 
     Incident:
       type: object
@@ -945,7 +1219,8 @@ components:
             Map of template key → custom template body.
 
             **Key format:**
-            - Event-type-wide: `"down"`, `"fail"`, `"recovery"`, `"every-run"`.
+            - Event-type-wide: `"down"`, `"fail"`, `"recovery"`, `"every-run"`,
+              `"success"`, `"started"`.
             - Per-cause override: `"event_type/cause"`, e.g. `"down/silence"`,
               `"down/overrun"`, `"down/never_started"`, `"fail/runaway"`.
               Per-cause keys take priority over the event-type-wide key.
@@ -1177,8 +1452,32 @@ paths:
       operationId: updateCheck
       summary: Update a check
       description: |
-        Replaces the check's schedule configuration.  The `slug` is preserved from
-        creation and cannot be changed via PATCH.
+        Partially updates a monitor using JSON Merge Patch semantics (RFC 7396):
+
+        - **Omitted field** — the stored value is left unchanged.
+        - **Explicit `null`** — clears the value. Supported on `runaway_ceiling`,
+          `max_runtime_s`, `monitor_from`, `ci_workflow`, `ci_branch`, and
+          `tags` only; for `tags`, explicit `null` is equivalent to sending `[]`.
+          `failure_threshold` is NOT clearable (the column is `NOT NULL DEFAULT
+          1`); a `null` there is treated as omission.
+        - **Any other value** — replaces the stored value.
+
+        Changing `failure_threshold` does **not** reset `consecutive_failures`:
+        lowering it means "that many failures is now enough", so a monitor
+        already at or above the new threshold alerts on its next failure.
+
+        `tags` is replaced wholesale, not merged; send `[]` or `null` to remove
+        all tags. `slug`, `monitor_type`, `ci_provider` and `ci_secret` are
+        immutable and are ignored if present.
+
+        `ci_workflow` and `ci_branch` deliberately deviate from strict RFC 7396:
+        an explicit empty string `""` preserves the stored value, the same as
+        omitting the field. This protects full-body clients (e.g. Terraform)
+        that always send `""` for an unset filter from silently unbinding a
+        live CI filter. Explicit `null` is the documented way to clear either
+        field.
+
+        Sending a complete body remains valid and behaves as a full replace.
       tags: [Checks]
       security:
         - ApiKeyAuth: []
@@ -1187,7 +1486,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/CheckCreate"
+              $ref: "#/components/schemas/CheckPatch"
             example:
               name: "Daily backup job"
               schedule_kind: "simple"
@@ -1494,10 +1793,10 @@ paths:
         built-in plain-language defaults are used.
 
         **Key format:** keys are either a bare event type (`down`, `recovery`,
-        `fail`, `every-run`) or an `event_type/cause` pair for a per-cause
-        override (e.g. `down/silence`, `down/overrun`, `down/never_started`,
-        `fail/runaway`).  Per-cause entries take priority over the event-type-wide
-        entry at notification time.
+        `fail`, `every-run`, `success`, `started`) or an `event_type/cause` pair
+        for a per-cause override (e.g. `down/silence`, `down/overrun`,
+        `down/never_started`, `fail/runaway`).  Per-cause entries take priority
+        over the event-type-wide entry at notification time.
 
         Template bodies may reference allowlisted `{variable}` placeholders:
         `{check_name}`, `{event}`, `{status}`, `{cause}`, `{last_ping}`,
@@ -1550,10 +1849,11 @@ paths:
         template body references an unknown `{variable}`, the entire request is
         rejected with `400` and **nothing is written**.
 
-        **Key format:** bare event type (`down`, `recovery`, `fail`, `every-run`)
-        or `event_type/cause` for a per-cause override (e.g. `"down/silence"`,
-        `"down/overrun"`, `"down/never_started"`, `"fail/runaway"`).  Per-cause
-        entries take priority over the event-type-wide entry for that event.
+        **Key format:** bare event type (`down`, `recovery`, `fail`, `every-run`,
+        `success`, `started`) or `event_type/cause` for a per-cause override
+        (e.g. `"down/silence"`, `"down/overrun"`, `"down/never_started"`,
+        `"fail/runaway"`).  Per-cause entries take priority over the
+        event-type-wide entry for that event.
 
         Returns the resulting set (same shape as `GET`) on success.
       tags: [Checks]
@@ -1574,8 +1874,9 @@ paths:
                     Map of template key → template body.
 
                     Keys are a bare event type (`down`, `recovery`, `fail`,
-                    `every-run`) or `event_type/cause` (e.g. `"down/silence"`,
-                    `"down/overrun"`, `"down/never_started"`, `"fail/runaway"`).
+                    `every-run`, `success`, `started`) or `event_type/cause`
+                    (e.g. `"down/silence"`, `"down/overrun"`,
+                    `"down/never_started"`, `"fail/runaway"`).
 
                     Absent keys or empty-string values reset that key to the
                     built-in plain-language default.
@@ -1616,8 +1917,8 @@ paths:
         "400":
           description: |
             Invalid request — one of:
-            - Invalid key: event type part must be `down`, `recovery`, `fail`, or `every-run`
-              (e.g. `"down"` or `"down/silence"`).
+            - Invalid key: event type part must be `down`, `recovery`, `fail`,
+              `every-run`, `success`, or `started` (e.g. `"down"` or `"down/silence"`).
             - Template body references an unknown `{variable}`.
             - Malformed JSON body.
             Nothing is written when any entry fails validation.
@@ -2085,8 +2386,8 @@ paths:
       summary: List routes for a check
       description: |
         Returns all routing rules for the check.  Each rule maps an event type
-        (`down`, `recovery`, `fail`) to a list of channel UUIDs.
-        Always returns a JSON array (never null).
+        (`down`, `recovery`, `fail`, `every-run`, `success`, `started`) to a list
+        of channel UUIDs. Always returns a JSON array (never null).
       tags: [Routes]
       security:
         - ApiKeyAuth: []
@@ -2127,10 +2428,19 @@ paths:
       - name: event_type
         in: path
         required: true
-        description: Event type to route.
+        description: >-
+            Event type to route. `every-run`, `success` and `started` are not
+            state changes: `every-run` notifies once per completed run, `success`
+            only on a successful run, and `started` when a run begins. None of
+            the three is flap-damped, and all three share one per-channel rate
+            budget (default 60/hr, LP_CHANNEL_RATE_MAX) that is separate from the
+            budget down/recovery/fail draw from — a chatty monitor routed to any
+            combination of the three can exhaust that shared budget and suppress
+            its own later notifications on that channel. Prefer a low-stakes
+            destination for them.
         schema:
           type: string
-          enum: [down, recovery, fail]
+          enum: [down, recovery, fail, every-run, success, started]
         example: "down"
 
     put:
@@ -2201,7 +2511,7 @@ paths:
         "204":
           description: Route deleted.
         "400":
-          description: id is not a valid UUID, or event_type is not one of down/recovery/fail.
+          description: id is not a valid UUID, or event_type is not one of down/recovery/fail/every-run/success/started.
           content:
             application/problem+json:
               schema:
