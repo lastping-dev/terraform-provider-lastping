@@ -49,6 +49,12 @@ resource "lastping_alert_template" "checkout_api" {
     # Runaway means the monitor pinged far more often than its ceiling allows —
     # usually a retry loop rather than an outage.
     "fail/runaway" = "{check_name} is pinging in a loop ({cause}). {incident_url}"
+
+    # "started" and "success" are informational rather than state changes. A
+    # template only decides the wording — these reach someone only if a
+    # lastping_route sends that event type to a destination.
+    "started" = "{check_name} started."
+    "success" = "{check_name} finished in {duration}."
   }
 }
 
@@ -63,7 +69,7 @@ resource "lastping_alert_template" "checkout_api" {
 ### Required
 
 - `monitor_id` (String) UUID of the monitor these messages belong to. Templates live at a path keyed on this id, so changing it replaces the resource — which clears the old monitor's templates and writes them onto the new one.
-- `templates` (Map of String) Message bodies keyed by event. A key is either an event type on its own — `down`, `recovery`, `fail`, `every-run` — which covers every cause, or `event/cause` for a narrower override such as `down/silence`, `fail/runaway` or `fail/ci`. The more specific key wins when both are present. Removing a key removes the message server-side and restores the default wording for that event; an empty map is valid and means "use the defaults everywhere".
+- `templates` (Map of String) Message bodies keyed by event. A key is either an event type on its own — `down`, `recovery`, `fail`, `every-run`, `success`, `started` — which covers every cause, or `event/cause` for a narrower override such as `down/silence`, `fail/runaway` or `fail/ci`. The more specific key wins when both are present. Removing a key removes the message server-side and restores the default wording for that event; an empty map is valid and means "use the defaults everywhere".
 
 ## Import
 

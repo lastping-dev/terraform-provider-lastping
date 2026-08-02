@@ -74,14 +74,32 @@ resource "lastping_route" "backup_fail" {
   destination_ids = []
 }
 
-# "every-run" notifies once per completed run rather than on a state change, so
-# it is far chattier than the other three and is not flap-damped. The delivery
-# rate cap is per destination and shared across event types, so a busy every-run
-# route can use up the budget a real "down" alert needs — give it a low-stakes
-# destination rather than the one that pages someone.
+# "every-run", "success" and "started" notify per run rather than on a state
+# change, so they are far chattier than the three above and none of them is
+# flap-damped. They also share one per-destination rate budget, separate from the
+# one down/fail/recovery draws from, so a busy informational route can exhaust it
+# and suppress the later informational alerts on that same destination. Give them
+# a low-stakes destination rather than the one that pages someone.
 resource "lastping_route" "backup_every_run" {
   monitor_id      = lastping_monitor.nightly_backup.id
   event_type      = "every-run"
+  destination_ids = [lastping_destination.backup_owner.id]
+}
+
+# "success" is the narrower half of "every-run": it fires only when a run
+# completes successfully, where "every-run" fires on success and failure alike.
+# Use it where a failure must not land on this destination at all.
+resource "lastping_route" "backup_success" {
+  monitor_id      = lastping_monitor.nightly_backup.id
+  event_type      = "success"
+  destination_ids = [lastping_destination.backup_owner.id]
+}
+
+# "started" fires when a run begins — useful for a long job where "did it start
+# at all" is the question, since the overrun rule only reports much later.
+resource "lastping_route" "backup_started" {
+  monitor_id      = lastping_monitor.nightly_backup.id
+  event_type      = "started"
   destination_ids = [lastping_destination.backup_owner.id]
 }
 
@@ -97,9 +115,11 @@ variable "slack_webhook_url" {
 ### Required
 
 - `destination_ids` (List of String) Destinations notified for this event, as a **list**: the API stores and returns the array in the order given, and that order is the order alerts are dispatched in. An empty list is valid and means "deliver nowhere for this event", which is not the same as removing the resource. Duplicates are rejected at plan time because the API silently de-duplicates them, which would otherwise fail the apply as an inconsistent result.
-- `event_type` (String) Which event this route covers: `down`, `recovery`, `fail`, `every-run`. `down` fires when a monitor misses its deadline, `recovery` when it comes back, and `fail` when a run reports failure explicitly. Part of the resource's identity, so changing it replaces the resource.
+- `event_type` (String) Which event this route covers: `down`, `recovery`, `fail`, `every-run`, `success`, `started`. Part of the resource's identity, so changing it replaces the resource.
 
-~> **`every-run` is much chattier than the other three.** They fire on a state change, so their volume is bounded by how often the monitor changes state. `every-run` fires once per completed run, success or failure, so its volume is bounded only by how often the monitor runs. It is also not flap-damped: a `fail` is held for the flap window so a short blip can be cancelled before it pages, while an `every-run` is released immediately. Most importantly the delivery rate cap is **per destination and the same for every event type** (60 notifications per hour by default), so a busy `every-run` route can use up a destination's budget and cause a later `down` or `fail` on that same destination to be dropped rather than delivered. Point `every-run` at a low-stakes destination, not at the one that pages someone.
+The first three fire on a **state change**: `down` when a monitor misses its deadline, `recovery` when it comes back, and `fail` when a run reports failure explicitly. The other three are **informational** and fire per run: `every-run` once per completed run whether it succeeded or failed, `success` only on a successful completion, and `started` when a run begins. Use `success` rather than `every-run` where a failure is not wanted on the same channel — `every-run` conflates the two.
+
+~> **The three informational events are much chattier, and they compete with each other.** A state-change event's volume is bounded by how often the monitor changes state; theirs is bounded only by how often the monitor runs. None of them is flap-damped either — a `fail` is held for the flap window so a short blip can be cancelled before it pages, while an `every-run` is released immediately. Most importantly they share **one per-destination rate budget** (60 notifications per hour by default) that is separate from the one `down`, `fail` and `recovery` draw from: a chatty monitor routed to any combination of the three can exhaust that shared budget and suppress its own later informational notifications on that destination. Point them at a low-stakes destination, not at the one that pages someone.
 - `monitor_id` (String) UUID of the monitor whose alerts are being routed. The route lives at a path keyed on this id, so changing it replaces the resource.
 
 ## Import

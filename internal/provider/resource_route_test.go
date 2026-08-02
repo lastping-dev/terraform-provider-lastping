@@ -315,6 +315,85 @@ resource "lastping_route" "down" {
 	})
 }
 
+// TestAccRoute_successAndStarted covers the two event types added after
+// every-run. `success` fires only on a successful run completion — which
+// every-run cannot express, because it conflates success and failure — and
+// `started` fires when a run begins.
+//
+// Both are routed in the same apply on purpose: they are separate rows keyed on
+// (monitor_id, event_type), so a bug that keyed only on the monitor would show
+// up here as one route overwriting the other rather than as two coexisting.
+// Neither goes through the auto-route adoption exemption; the API attaches
+// down/fail/recovery to a new monitor and nothing else.
+func TestAccRoute_successAndStarted(t *testing.T) {
+	config := routeFixtures + `
+resource "lastping_route" "success" {
+  monitor_id      = lastping_monitor.m.id
+  event_type      = "success"
+  destination_ids = [lastping_destination.first.id]
+}
+
+resource "lastping_route" "started" {
+  monitor_id      = lastping_monitor.m.id
+  event_type      = "started"
+  destination_ids = [lastping_destination.second.id]
+}`
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("lastping_route.success", "event_type", "success"),
+					resource.TestCheckResourceAttr("lastping_route.started", "event_type", "started"),
+					resource.TestCheckResourceAttrPair("lastping_route.success", "destination_ids.0",
+						"lastping_destination.first", "id"),
+					resource.TestCheckResourceAttrPair("lastping_route.started", "destination_ids.0",
+						"lastping_destination.second", "id"),
+					// Confirm against the API rather than trusting state: what is
+					// being widened is a server-side validator, so state agreeing
+					// with the plan proves nothing on its own.
+					resource.TestCheckResourceAttrWith("lastping_route.success", "monitor_id",
+						func(id string) error {
+							routes, err := testAccDirectClient(t).GetRoutes(t.Context(), id)
+							if err != nil {
+								return err
+							}
+							seen := map[string]bool{}
+							for _, rt := range routes {
+								seen[rt.EventType] = true
+							}
+							for _, want := range []string{"success", "started"} {
+								if !seen[want] {
+									return fmt.Errorf("the API has no %s route for monitor %s: %+v",
+										want, id, routes)
+								}
+							}
+							return nil
+						}),
+				),
+			},
+			{
+				// The import ID is "<monitor_id>:<event_type>", so this pins that
+				// parseRouteImportID accepts the new values too.
+				ResourceName:                         "lastping_route.started",
+				ImportState:                          true,
+				ImportStateVerify:                    true,
+				ImportStateVerifyIdentifierAttribute: "monitor_id",
+				ImportStateIdFunc: func(s *terraform.State) (string, error) {
+					rs, ok := s.RootModule().Resources["lastping_route.started"]
+					if !ok {
+						return "", fmt.Errorf("lastping_route.started not found in state")
+					}
+					return rs.Primary.Attributes["monitor_id"] + ":started", nil
+				},
+			},
+		},
+	})
+}
+
 // TestAccRoute_deletedOutOfBand: a route removed through the dashboard must be
 // recreated on the next apply, not fail the plan.
 func TestAccRoute_deletedOutOfBand(t *testing.T) {
@@ -430,7 +509,8 @@ resource "lastping_route" "down" {
 				ResourceName:  "lastping_route.down",
 				ImportState:   true,
 				ImportStateId: "3f7c1f5a-1a2b-4c3d-8e9f-0a1b2c3d4e5f:sideways",
-				ExpectError:   regexp.MustCompile(`(?s)not one of down, recovery, fail, every-run`),
+				ExpectError: regexp.MustCompile(
+					`(?s)not one of down, recovery, fail, every-run, success, started`),
 			},
 		},
 	})

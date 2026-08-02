@@ -47,14 +47,32 @@ resource "lastping_route" "backup_fail" {
   destination_ids = []
 }
 
-# "every-run" notifies once per completed run rather than on a state change, so
-# it is far chattier than the other three and is not flap-damped. The delivery
-# rate cap is per destination and shared across event types, so a busy every-run
-# route can use up the budget a real "down" alert needs — give it a low-stakes
-# destination rather than the one that pages someone.
+# "every-run", "success" and "started" notify per run rather than on a state
+# change, so they are far chattier than the three above and none of them is
+# flap-damped. They also share one per-destination rate budget, separate from the
+# one down/fail/recovery draws from, so a busy informational route can exhaust it
+# and suppress the later informational alerts on that same destination. Give them
+# a low-stakes destination rather than the one that pages someone.
 resource "lastping_route" "backup_every_run" {
   monitor_id      = lastping_monitor.nightly_backup.id
   event_type      = "every-run"
+  destination_ids = [lastping_destination.backup_owner.id]
+}
+
+# "success" is the narrower half of "every-run": it fires only when a run
+# completes successfully, where "every-run" fires on success and failure alike.
+# Use it where a failure must not land on this destination at all.
+resource "lastping_route" "backup_success" {
+  monitor_id      = lastping_monitor.nightly_backup.id
+  event_type      = "success"
+  destination_ids = [lastping_destination.backup_owner.id]
+}
+
+# "started" fires when a run begins — useful for a long job where "did it start
+# at all" is the question, since the overrun rule only reports much later.
+resource "lastping_route" "backup_started" {
+  monitor_id      = lastping_monitor.nightly_backup.id
+  event_type      = "started"
   destination_ids = [lastping_destination.backup_owner.id]
 }
 

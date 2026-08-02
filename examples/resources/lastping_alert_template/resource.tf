@@ -25,6 +25,12 @@ resource "lastping_alert_template" "checkout_api" {
     # Runaway means the monitor pinged far more often than its ceiling allows —
     # usually a retry loop rather than an outage.
     "fail/runaway" = "{check_name} is pinging in a loop ({cause}). {incident_url}"
+
+    # "started" and "success" are informational rather than state changes. A
+    # template only decides the wording — these reach someone only if a
+    # lastping_route sends that event type to a destination.
+    "started" = "{check_name} started."
+    "success" = "{check_name} finished in {duration}."
   }
 }
 
