@@ -339,6 +339,11 @@ resource "lastping_route" "started" {
   destination_ids = [lastping_destination.second.id]
 }`
 
+	// Captured during the apply so the import step can assert against the real
+	// ids: ImportStateCheck is handed only the imported instance, with no view
+	// of the rest of the state.
+	var monitorID, startedDestID string
+
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
@@ -346,6 +351,8 @@ resource "lastping_route" "started" {
 			{
 				Config: config,
 				Check: resource.ComposeAggregateTestCheckFunc(
+					captureAttr("lastping_monitor.m", "id", &monitorID),
+					captureAttr("lastping_destination.second", "id", &startedDestID),
 					resource.TestCheckResourceAttr("lastping_route.success", "event_type", "success"),
 					resource.TestCheckResourceAttr("lastping_route.started", "event_type", "started"),
 					resource.TestCheckResourceAttrPair("lastping_route.success", "destination_ids.0",
@@ -378,16 +385,37 @@ resource "lastping_route" "started" {
 			{
 				// The import ID is "<monitor_id>:<event_type>", so this pins that
 				// parseRouteImportID accepts the new values too.
-				ResourceName:                         "lastping_route.started",
-				ImportState:                          true,
-				ImportStateVerify:                    true,
-				ImportStateVerifyIdentifierAttribute: "monitor_id",
-				ImportStateIdFunc: func(s *terraform.State) (string, error) {
-					rs, ok := s.RootModule().Resources["lastping_route.started"]
-					if !ok {
-						return "", fmt.Errorf("lastping_route.started not found in state")
+				//
+				// Checked with ImportStateCheck rather than ImportStateVerify.
+				// Verification compares the imported instance against one found
+				// in prior state, and a route has no id of its own, so the only
+				// attribute available to find it by is monitor_id — which both
+				// routes in this config deliberately share. The framework matched
+				// the imported `started` route against `success` and failed on
+				// the difference between them. ImportStateCheck is handed the
+				// imported instance directly, so no sibling can be confused for
+				// it, and asserting on the attributes is stricter than the
+				// equivalence check it replaces.
+				ResourceName:      "lastping_route.started",
+				ImportState:       true,
+				ImportStateIdFunc: importStateIDFunc("lastping_route.started"),
+				ImportStateCheck: func(states []*terraform.InstanceState) error {
+					if len(states) != 1 {
+						return fmt.Errorf("expected 1 imported instance, got %d", len(states))
 					}
-					return rs.Primary.Attributes["monitor_id"] + ":started", nil
+					attrs := states[0].Attributes
+					for _, tc := range []struct{ attr, want string }{
+						{"monitor_id", monitorID},
+						{"event_type", "started"},
+						{"destination_ids.#", "1"},
+						{"destination_ids.0", startedDestID},
+					} {
+						if got := attrs[tc.attr]; got != tc.want {
+							return fmt.Errorf("imported %s = %q, want %q (attrs: %+v)",
+								tc.attr, got, tc.want, attrs)
+						}
+					}
+					return nil
 				},
 			},
 		},
