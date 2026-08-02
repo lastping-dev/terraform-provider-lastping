@@ -200,8 +200,15 @@ func monitorDataAttributes() map[string]schema.Attribute {
 // 0, not null. probe_interval_s, runaway_ceiling and max_runtime_s are the
 // opposite: both surfaces map an absent value (0, or a nil pointer) to null,
 // because 0 is not a value either can take on legitimately.
-// data_monitor_test.go pairs every one of these attributes against the resource
-// to keep it that way.
+//
+// Two tests keep it that way, and they cover different halves.
+// data_monitor_test.go pairs each of these attributes against the resource
+// against a live backend, which catches a renamed or dropped field. It cannot
+// catch a wrong empty-value mapping for an attribute the backend never returns
+// empty — failure_threshold is NOT NULL DEFAULT 1, so int64OrNull would agree
+// with Int64Value on every monitor that can exist. That half is pinned by
+// TestMonitorSurfacesAgreeOnEmptyValues, which feeds both mappers a hand-built
+// zero/nil response and requires them to agree.
 func monitorDataFromAPI(ctx context.Context, m *client.Monitor) (monitorDataModel, diag.Diagnostics) {
 	tags, diags := types.SetValueFrom(ctx, types.StringType, m.Tags)
 	if m.Tags == nil {
