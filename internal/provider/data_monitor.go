@@ -34,6 +34,7 @@ type monitorDataModel struct {
 	TZ                   types.String `tfsdk:"tz"`
 	GraceS               types.Int64  `tfsdk:"grace_s"`
 	MaxRuntimeS          types.Int64  `tfsdk:"max_runtime_s"`
+	StepTimeoutS         types.Int64  `tfsdk:"step_timeout_s"`
 	FailureThreshold     types.Int64  `tfsdk:"failure_threshold"`
 	Tags                 types.Set    `tfsdk:"tags"`
 	RunawayCeiling       types.Int64  `tfsdk:"runaway_ceiling"`
@@ -103,6 +104,13 @@ func monitorDataAttributes() map[string]schema.Attribute {
 				"Governs the overrun deadline only; the silence rule keeps using `grace_s`. Null when " +
 				"unset, in which case the overrun budget falls back to `grace_s`. Never set on an " +
 				"`http` monitor.",
+		},
+		"step_timeout_s": schema.Int64Attribute{
+			Computed: true,
+			MarkdownDescription: "How long an armed run may go without reporting a step before a " +
+				"`stalled` incident opens, in seconds. Null when unset, in which case stall detection " +
+				"is off. Always strictly below the effective run budget (`max_runtime_s`, or `grace_s` " +
+				"when that is unset), and never set on an `http` monitor.",
 		},
 		"failure_threshold": schema.Int64Attribute{
 			Computed: true,
@@ -197,9 +205,10 @@ func monitorDataAttributes() map[string]schema.Attribute {
 // failure_threshold, probe_timeout_s and probe_expected_status are never null
 // on either side — the API always reports a concrete number for them (0 is a
 // real answer, e.g. period_s on a cron monitor), so both surfaces report it as
-// 0, not null. probe_interval_s, runaway_ceiling and max_runtime_s are the
-// opposite: both surfaces map an absent value (0, or a nil pointer) to null,
-// because 0 is not a value either can take on legitimately.
+// 0, not null. probe_interval_s, runaway_ceiling, max_runtime_s and
+// step_timeout_s are the opposite: both surfaces map an absent value (0, or a
+// nil pointer) to null, because 0 is not a value either can take on
+// legitimately.
 //
 // Two tests keep it that way, and they cover different halves.
 // data_monitor_test.go pairs each of these attributes against the resource
@@ -255,6 +264,11 @@ func monitorDataFromAPI(ctx context.Context, m *client.Monitor) (monitorDataMode
 		out.MaxRuntimeS = types.Int64Value(*m.MaxRuntimeS)
 	} else {
 		out.MaxRuntimeS = types.Int64Null()
+	}
+	if m.StepTimeoutS != nil {
+		out.StepTimeoutS = types.Int64Value(*m.StepTimeoutS)
+	} else {
+		out.StepTimeoutS = types.Int64Null()
 	}
 	return out, diags
 }

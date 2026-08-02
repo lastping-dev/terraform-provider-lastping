@@ -21,6 +21,18 @@ resource "lastping_monitor" "nightly_backup" {
   # overrun deadline only, so the two budgets are set independently: grace_s
   # (900s) still decides how late the *start* may be.
   max_runtime_s = 14400
+
+  # The third and tightest clock. A run that reports no step for 10 minutes is
+  # wedged, and waiting out the whole 4-hour max_runtime_s to hear about it is
+  # the difference between noticing before breakfast and noticing after. It
+  # must be strictly below the effective budget (max_runtime_s here, grace_s
+  # when that is unset), or the stall window is empty and the rule could never
+  # fire — the API rejects that rather than storing it.
+  #
+  # Only set it if the job actually reports steps (POST /ping/{id}/step inside
+  # a run it has already started): a job that never does opens a stalled
+  # incident on every run.
+  step_timeout_s = 600
 }
 
 # A flaky-by-nature job: a single failed run is noise, three in a row is a
