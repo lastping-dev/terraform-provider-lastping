@@ -39,6 +39,13 @@ type Monitor struct {
 	ProbeExpectedStatus  int64    `json:"probe_expected_status,omitempty"`
 	ProbeTimeoutS        int64    `json:"probe_timeout_s,omitempty"`
 	ProbeFollowRedirects bool     `json:"probe_follow_redirects,omitempty"`
+	// AgentID attaches this monitor to an agent, by either the agent's id or
+	// its slug (api/checks.go: createCheckRequest.AgentID / checkResponse.AgentID).
+	// Empty/omitted means "no attachment" on create, and is never populated by a
+	// response that reports one — see modelFromMonitor's use of stringOrNull.
+	// Updates go through MonitorPatch, not this field, the same as every other
+	// clearable attribute.
+	AgentID string `json:"agent_id,omitempty"`
 
 	// Computed.
 	Paused           bool    `json:"paused,omitempty"`

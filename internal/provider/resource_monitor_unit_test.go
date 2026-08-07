@@ -275,6 +275,20 @@ func TestMonitorMonitorFromRejectsNonRFC3339(t *testing.T) {
 	require.False(t, validateString(t, "monitor_from", "2027-01-01T00:00:00+01:00").Diagnostics.HasError())
 }
 
+// TestMonitorAgentIDRequiresUUID pins the deliberate divergence from the API:
+// resolveAgentID (api/agents_api.go) accepts either an agent's id or its slug,
+// but the response always echoes back the canonical UUID, never the slug it
+// was attached with. Because agent_id is plain Optional (not Computed), a
+// slug written here would apply cleanly and then desync state from plan on
+// every later refresh. The provider closes that gap by requiring the UUID
+// form at plan time.
+func TestMonitorAgentIDRequiresUUID(t *testing.T) {
+	require.False(t, validateString(t, "agent_id", "3f7c1f5a-1a2b-4c3d-8e9f-0a1b2c3d4e5f").Diagnostics.HasError())
+	require.True(t, validateString(t, "agent_id", "nightly-etl-bot").Diagnostics.HasError(),
+		"a slug must be rejected at plan time, even though the API itself would accept it")
+	require.True(t, validateString(t, "agent_id", "").Diagnostics.HasError())
+}
+
 // TestMonitorOptionalOnlyAttributesAreNotComputed pins the "attributes can never
 // be unset" regression: a purely user-supplied attribute marked Computed keeps
 // its old value in state when it is removed from the configuration.
@@ -283,7 +297,7 @@ func TestMonitorOptionalOnlyAttributesAreNotComputed(t *testing.T) {
 	for _, name := range []string{
 		"slug", "cron_expr", "tags", "runaway_ceiling", "monitor_from",
 		"probe_url", "probe_interval_s", "probe_expected_body", "max_runtime_s",
-		"step_timeout_s",
+		"step_timeout_s", "agent_id",
 	} {
 		attr, ok := s.Attributes[name]
 		require.True(t, ok, "missing attribute %s", name)
@@ -391,6 +405,7 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		Tags:                 tags,
 		RunawayCeiling:       types.Int64Value(40),
 		MonitorFrom:          types.StringValue("2027-01-01T00:00:00Z"),
+		AgentID:              types.StringValue("11111111-2222-4333-8444-555555555555"),
 		ProbeMethod:          types.StringValue("GET"),
 		ProbeExpectedStatus:  types.Int64Value(200),
 		ProbeTimeoutS:        types.Int64Value(10),
@@ -426,6 +441,7 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		"tags":                   []string{"env:prod"},
 		"runaway_ceiling":        int64(40),
 		"monitor_from":           "2027-01-01T00:00:00Z",
+		"agent_id":               "11111111-2222-4333-8444-555555555555",
 	}
 
 	t.Run("attribute present with a value", func(t *testing.T) {
@@ -435,15 +451,16 @@ func TestMonitorPatchFromModel(t *testing.T) {
 	})
 
 	t.Run("attribute removed from config is an explicit null", func(t *testing.T) {
-		// tags, runaway_ceiling, monitor_from, max_runtime_s and step_timeout_s
-		// are plain Optional, so deleting them from the HCL makes them null in
-		// both the config and the plan.
+		// tags, runaway_ceiling, monitor_from, max_runtime_s, step_timeout_s and
+		// agent_id are plain Optional, so deleting them from the HCL makes them
+		// null in both the config and the plan.
 		cfg := stored
 		cfg.Tags = types.SetNull(types.StringType)
 		cfg.RunawayCeiling = types.Int64Null()
 		cfg.MonitorFrom = types.StringNull()
 		cfg.MaxRuntimeS = types.Int64Null()
 		cfg.StepTimeoutS = types.Int64Null()
+		cfg.AgentID = types.StringNull()
 
 		want := client.MonitorPatch{}
 		for k, v := range fullyConfigured {
@@ -454,6 +471,7 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		want["monitor_from"] = nil
 		want["max_runtime_s"] = nil
 		want["step_timeout_s"] = nil
+		want["agent_id"] = nil
 
 		got, err := monitorPatchFromModel(ctx, cfg, cfg)
 		require.NoError(t, err)
@@ -461,7 +479,9 @@ func TestMonitorPatchFromModel(t *testing.T) {
 
 		// nil has to reach the wire as JSON null, not as a dropped key: an
 		// absent key is exactly what the old payload sent and exactly what
-		// merge-patch reads as "leave it alone".
+		// merge-patch reads as "leave it alone". For agent_id specifically,
+		// that null is what api/checks_patch.go reads as "detach from the
+		// agent" — the whole point of the attribute being clearable.
 		body, err := json.Marshal(got)
 		require.NoError(t, err)
 		require.Contains(t, string(body), `"tags":null`)
@@ -469,6 +489,7 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		require.Contains(t, string(body), `"monitor_from":null`)
 		require.Contains(t, string(body), `"max_runtime_s":null`)
 		require.Contains(t, string(body), `"step_timeout_s":null`)
+		require.Contains(t, string(body), `"agent_id":null`)
 	})
 
 	// failure_threshold is the counter-example to the block above: it is
@@ -542,6 +563,7 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		cfg.MonitorFrom = types.StringNull()
 		cfg.MaxRuntimeS = types.Int64Null()
 		cfg.StepTimeoutS = types.Int64Null()
+		cfg.AgentID = types.StringNull()
 
 		got, err := monitorPatchFromModel(ctx, stored, cfg)
 		require.NoError(t, err)
@@ -556,6 +578,8 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		require.Nil(t, got["max_runtime_s"])
 		require.Contains(t, got, "step_timeout_s")
 		require.Nil(t, got["step_timeout_s"])
+		require.Contains(t, got, "agent_id")
+		require.Nil(t, got["agent_id"])
 	})
 
 	t.Run("explicitly empty tags are sent as an empty array", func(t *testing.T) {
@@ -639,6 +663,7 @@ func TestResolveUnknownsFromState_CoversEveryAttribute(t *testing.T) {
 		Tags:                 types.SetValueMust(types.StringType, []attr.Value{types.StringValue("prod")}),
 		RunawayCeiling:       types.Int64Value(40),
 		MonitorFrom:          types.StringValue("2027-01-01T00:00:00Z"),
+		AgentID:              types.StringValue("11111111-2222-4333-8444-555555555555"),
 		ProbeURL:             types.StringValue("https://example.com/health"),
 		ProbeMethod:          types.StringValue("HEAD"),
 		ProbeIntervalS:       types.Int64Value(120),
