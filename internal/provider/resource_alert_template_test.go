@@ -310,9 +310,13 @@ resource "lastping_alert_template" "t" {
     "down" = "terraform wording for down"
   }
 }`,
+				// The "terraform import ..." line is long enough on its own to
+				// be re-wrapped by the renderer, so the space before the UUID
+				// has to tolerate becoming a newline too (see the identical
+				// note on the route import-ID test).
 				ExpectError: regexp.MustCompile(
 					`(?s)Alert templates already exist.*"down", "fail/runaway".*` +
-						`terraform import lastping_alert_template\.<name> [0-9a-f-]+`),
+						`terraform\s+import\s+lastping_alert_template\.<name>\s+[0-9a-f-]+`),
 			},
 			{
 				// Assert against the server: the resource never entered state,
