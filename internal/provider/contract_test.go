@@ -179,6 +179,14 @@ func contractCases() map[string]contractCase {
 			response: schema("ApiKeyCreated"),
 		},
 		{
+			// AgentCreate carries only name and description; slug is derived
+			// server-side and is not a request property, which the send
+			// direction gets right for free because `slug` is computed-only.
+			name:     "resource.lastping_agent",
+			request:  schema("AgentCreate"),
+			response: schema("Agent"),
+		},
+		{
 			name:     "ephemeral.lastping_api_key",
 			request:  schema("ApiKeyCreate"),
 			response: schema("ApiKeyCreated"),

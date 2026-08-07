@@ -538,7 +538,7 @@ resource "lastping_route" "down" {
 				ImportState:   true,
 				ImportStateId: "3f7c1f5a-1a2b-4c3d-8e9f-0a1b2c3d4e5f:sideways",
 				ExpectError: regexp.MustCompile(
-					`(?s)not one of down, recovery, fail, every-run, success, started`),
+					`(?s)not one of down, recovery, fail, every-run, success, started, blocked, note`),
 			},
 		},
 	})

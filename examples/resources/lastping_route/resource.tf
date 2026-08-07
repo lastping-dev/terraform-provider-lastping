@@ -76,6 +76,25 @@ resource "lastping_route" "backup_started" {
   destination_ids = [lastping_destination.backup_owner.id]
 }
 
+# "blocked" fires immediately when an agent reports it is waiting on a human via
+# a blocked ping. Unlike the three informational events above, it draws on the
+# same alert budget as down/fail/recovery rather than the shared informational
+# one, so a blocked run cannot be starved by chatty per-run traffic — point it
+# at the same destination that pages someone for "down".
+resource "lastping_route" "backup_blocked" {
+  monitor_id      = lastping_monitor.nightly_backup.id
+  event_type      = "blocked"
+  destination_ids = [lastping_destination.oncall_slack.id]
+}
+
+# "note" is an agent-reported free-text signal with no state change. It shares
+# the every-run/success/started informational budget.
+resource "lastping_route" "backup_note" {
+  monitor_id      = lastping_monitor.nightly_backup.id
+  event_type      = "note"
+  destination_ids = [lastping_destination.backup_owner.id]
+}
+
 variable "slack_webhook_url" {
   type      = string
   sensitive = true

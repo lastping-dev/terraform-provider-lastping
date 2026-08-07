@@ -12,6 +12,7 @@ for what has shipped.
 | Resource | Purpose |
 |---|---|
 | `lastping_monitor` | A heartbeat, CI, or HTTP-probe monitor. |
+| `lastping_agent` | An autonomous worker that owns monitors, with a live health rollup. |
 | `lastping_destination` | Where alerts are delivered (Slack, email, webhook, …). |
 | `lastping_route` | Which destinations a monitor notifies for one event type. |
 | `lastping_alert_template` | Custom alert message bodies for a monitor. |
