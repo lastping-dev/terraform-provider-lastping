@@ -135,6 +135,13 @@ data "lastping_monitor" "by_slug" {
 					// probe_* belong to http monitors; a cron monitor leaves them unset.
 					resource.TestCheckNoResourceAttr(
 						"data.lastping_monitor.by_slug", "probe_url"),
+					// The fixture attaches no agent, so both surfaces must agree on
+					// null rather than one reporting "" — the same stringOrNull
+					// convention pinned above for cron_expr/probe_url.
+					resource.TestCheckNoResourceAttr(
+						"data.lastping_monitor.by_slug", "agent_id"),
+					resource.TestCheckNoResourceAttr(
+						"lastping_monitor.src", "agent_id"),
 				),
 			},
 		},

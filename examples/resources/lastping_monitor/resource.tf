@@ -75,3 +75,34 @@ resource "lastping_monitor" "public_api" {
 
   tags = ["env:prod", "kind:http"]
 }
+
+# A monitor owned by an autonomous agent, the whole point of pairing
+# lastping_agent with agent_id: register the agent once, and every monitor it
+# owns rolls up into its status and monitor_count instead of sitting there as
+# an unrelated pile of checks.
+#
+# Reference the agent's `id`, not its `slug`: the API accepts either, but
+# always echoes back the canonical UUID, and only the UUID round-trips
+# cleanly through Terraform's plan/apply consistency check.
+resource "lastping_agent" "nightly_etl" {
+  name        = "Nightly ETL bot"
+  description = "Runs the nightly ETL pipeline and owns its monitors."
+}
+
+resource "lastping_monitor" "etl_ingest" {
+  name          = "ETL ingest"
+  slug          = "etl-ingest"
+  schedule_kind = "simple"
+  period_s      = 3600
+  grace_s       = 600
+
+  agent_id = lastping_agent.nightly_etl.id
+
+  tags = ["env:prod", "team:data"]
+}
+
+# agent_id is an in-place update, not a replacement: re-pointing a monitor at
+# a different agent, or removing the attribute to detach it, PATCHes the
+# monitor rather than destroying and recreating it. Detaching does not delete
+# either resource — the monitor keeps its ping history and simply becomes
+# unowned, same as `terraform destroy` on the agent itself.

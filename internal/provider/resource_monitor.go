@@ -121,6 +121,7 @@ type monitorResourceModel struct {
 	Tags                 types.Set    `tfsdk:"tags"`
 	RunawayCeiling       types.Int64  `tfsdk:"runaway_ceiling"`
 	MonitorFrom          types.String `tfsdk:"monitor_from"`
+	AgentID              types.String `tfsdk:"agent_id"`
 	ProbeURL             types.String `tfsdk:"probe_url"`
 	ProbeMethod          types.String `tfsdk:"probe_method"`
 	ProbeIntervalS       types.Int64  `tfsdk:"probe_interval_s"`
@@ -293,6 +294,26 @@ func (r *monitorResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 					"The API stores and returns UTC; a value written with a different offset is kept as " +
 					"configured as long as it denotes the same instant.",
 				Validators: []validator.String{rfc3339Validator{}},
+			},
+			"agent_id": schema.StringAttribute{
+				Optional: true,
+				MarkdownDescription: "Attach this monitor to the `lastping_agent` that owns it, for " +
+					"example `lastping_agent.nightly_etl.id`. An in-place update: the API applies it " +
+					"through the same `PATCH` as every other attribute here, so changing it re-attaches " +
+					"the monitor rather than replacing the resource. Removing it from the configuration " +
+					"detaches the monitor (`agent_id` goes back to null) without deleting either resource — " +
+					"the same as setting it to `null` explicitly.\n\n" +
+					"~> **Naming an agent that does not exist, or belongs to another project, is a plan-time " +
+					"or apply-time error — never an implicit `register_agent`.** The API answers with 400 " +
+					"`UNKNOWN_AGENT`.\n\n" +
+					"~> **Reference the agent's `id`, not its `slug`, even though the API itself accepts " +
+					"either.** The API always echoes back the canonical UUID — `GET`/`PATCH` on a monitor " +
+					"never reports the slug it was attached with — so writing a slug here would apply " +
+					"cleanly and then fail with \"provider produced inconsistent result after apply\" on " +
+					"every subsequent plan, because the state Terraform is required to match is the UUID, " +
+					"not the string the configuration wrote. This provider enforces the UUID form at plan " +
+					"time for that reason, not because the API itself is that strict.",
+				Validators: []validator.String{uuidValidator{}},
 			},
 			"probe_url": schema.StringAttribute{
 				Optional:            true,
@@ -551,6 +572,10 @@ func monitorFromModel(ctx context.Context, m monitorResourceModel) (client.Monit
 		v := m.MonitorFrom.ValueString()
 		out.MonitorFrom = &v
 	}
+	// Attach at create time when configured. Empty/unknown is left as the zero
+	// value, which client.Monitor's `omitempty` drops from the wire — exactly
+	// "no attachment", the same as omitting the field entirely.
+	out.AgentID = m.AgentID.ValueString()
 	if !m.Tags.IsNull() && !m.Tags.IsUnknown() {
 		var tags []string
 		if err := m.Tags.ElementsAs(ctx, &tags, false); err != nil {
@@ -567,7 +592,7 @@ func monitorFromModel(ctx context.Context, m monitorResourceModel) (client.Monit
 //
 //   - desired is the plan with unknowns resolved from the prior state (see
 //     resolveUnknownsFromState), so every value in it is concrete. It supplies
-//     the values — and, with the current schema, presence too: the five
+//     the values — and, with the current schema, presence too: the six
 //     clearable attributes are Optional-only, so removing one from the
 //     configuration plans it as null.
 //   - cfg is the practitioner's literal configuration. Its null-ness is checked
@@ -586,14 +611,15 @@ func monitorFromModel(ctx context.Context, m monitorResourceModel) (client.Monit
 // desired against state and the two would agree.
 //
 // TestMonitorOptionalOnlyAttributesAreNotComputed is the guardrail that keeps
-// tags, runaway_ceiling, monitor_from, max_runtime_s and step_timeout_s
-// Optional-only. Read it before making any of them Computed to suppress drift.
+// tags, runaway_ceiling, monitor_from, max_runtime_s, step_timeout_s and
+// agent_id Optional-only. Read it before making any of them Computed to
+// suppress drift.
 //
 // The document is sparse (see client.MonitorPatch) and its keys fall into three
 // groups:
 //
 //  1. Clearable — tags, runaway_ceiling, monitor_from, max_runtime_s,
-//     step_timeout_s. Absent
+//     step_timeout_s, agent_id. Absent
 //     from the configuration, they are sent as an explicit JSON null. Under
 //     merge-patch that is the only way to clear them; under the older
 //     full-replace server a null decodes to a nil slice / nil pointer and clears
@@ -687,6 +713,20 @@ func monitorPatchFromModel(ctx context.Context, desired, cfg monitorResourceMode
 		patch["monitor_from"] = nil
 	} else {
 		patch["monitor_from"] = desired.MonitorFrom.ValueString()
+	}
+
+	// agent_id is clearable for the same reason as the rest of this group: an
+	// absent key under merge-patch leaves the stored attachment alone, so
+	// "detach this monitor from its agent" would be unreachable through
+	// Terraform if the key were only ever omitted. api/checks_patch.go resolves
+	// an explicit null to SetCheckAgent(agent_id = NULL) — always a 200, never
+	// a 400, so sending it on every PATCH (even one that never had an
+	// attachment) is a harmless no-op, exactly like monitor_from and the
+	// budgets above.
+	if cfg.AgentID.IsNull() || desired.AgentID.IsNull() {
+		patch["agent_id"] = nil
+	} else {
+		patch["agent_id"] = desired.AgentID.ValueString()
 	}
 
 	// No IsUnknown() arm here on purpose: desired has been through
@@ -791,6 +831,11 @@ func modelFromMonitor(ctx context.Context, mon *client.Monitor, prior monitorRes
 		GraceS:       types.Int64Value(mon.GraceS),
 		ProbeURL:     stringOrNull(mon.ProbeURL),
 		ProbeMethod:  types.StringValue(mon.ProbeMethod),
+
+		// agent_id: the API omits it entirely when the monitor is unattached
+		// (checkResponse.AgentID has `omitempty`), and always reports the
+		// canonical UUID — never the slug a caller may have attached it with.
+		AgentID: stringOrNull(mon.AgentID),
 
 		// failure_threshold is NOT NULL DEFAULT 1 server-side and always comes
 		// back, so it is a concrete number rather than an int64OrNull.

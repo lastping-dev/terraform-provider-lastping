@@ -353,6 +353,119 @@ resource "lastping_monitor" "mr" {
 	})
 }
 
+// TestAccMonitor_agentIDAttachAndDetach is the clearable proof for agent_id,
+// the same shape as TestAccMonitor_maxRuntimeCanBeRemoved: attach at create,
+// re-attach to a different agent in place (no replacement), then remove the
+// attribute and confirm the server actually cleared it rather than trusting
+// state, which would prove nothing if Terraform merely stopped asking.
+//
+// It is also the only acceptance test that exercises agent_id and a
+// lastping_agent resource in the same apply, which is the scenario the whole
+// feature exists for: a Terraform-managed fleet where monitor_count and
+// status roll up from monitors this same configuration attached.
+func TestAccMonitor_agentIDAttachAndDetach(t *testing.T) {
+	const attachedToFirst = `
+resource "lastping_agent" "a" {
+  name = "acc-agent-id-first"
+}
+resource "lastping_agent" "b" {
+  name = "acc-agent-id-second"
+}
+resource "lastping_monitor" "ag" {
+  name          = "acc-agent-id"
+  slug          = "acc-agent-id"
+  schedule_kind = "simple"
+  period_s      = 3600
+  grace_s       = 600
+  agent_id      = lastping_agent.a.id
+}`
+	const attachedToSecond = `
+resource "lastping_agent" "a" {
+  name = "acc-agent-id-first"
+}
+resource "lastping_agent" "b" {
+  name = "acc-agent-id-second"
+}
+resource "lastping_monitor" "ag" {
+  name          = "acc-agent-id"
+  slug          = "acc-agent-id"
+  schedule_kind = "simple"
+  period_s      = 3600
+  grace_s       = 600
+  agent_id      = lastping_agent.b.id
+}`
+	const detached = `
+resource "lastping_agent" "a" {
+  name = "acc-agent-id-first"
+}
+resource "lastping_agent" "b" {
+  name = "acc-agent-id-second"
+}
+resource "lastping_monitor" "ag" {
+  name          = "acc-agent-id"
+  slug          = "acc-agent-id"
+  schedule_kind = "simple"
+  period_s      = 3600
+  grace_s       = 600
+}`
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: attachedToFirst,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrPair("lastping_monitor.ag", "agent_id", "lastping_agent.a", "id"),
+					resource.TestCheckResourceAttr("lastping_agent.a", "monitor_count", "1"),
+					resource.TestCheckResourceAttr("lastping_agent.b", "monitor_count", "0"),
+				),
+			},
+			{
+				// Re-attaching to a different agent is an in-place PATCH, not a
+				// replacement: the API supports agent_id on PATCH, so there is
+				// nothing here that forces RequiresReplace.
+				Config: attachedToSecond,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("lastping_monitor.ag", plancheck.ResourceActionUpdate),
+					},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrPair("lastping_monitor.ag", "agent_id", "lastping_agent.b", "id"),
+					resource.TestCheckResourceAttr("lastping_agent.a", "monitor_count", "0"),
+					resource.TestCheckResourceAttr("lastping_agent.b", "monitor_count", "1"),
+				),
+			},
+			{
+				Config: detached,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr("lastping_monitor.ag", "agent_id"),
+					resource.TestCheckResourceAttr("lastping_agent.b", "monitor_count", "0"),
+					// Read it back from the API: state agreeing with the plan
+					// proves nothing when the plan said "removed" and the server
+					// was never told.
+					resource.TestCheckResourceAttrWith("lastping_monitor.ag", "id", func(id string) error {
+						mon, err := testAccDirectClient(t).GetMonitor(t.Context(), id)
+						if err != nil {
+							return err
+						}
+						if mon.AgentID != "" {
+							return fmt.Errorf("server still holds agent_id=%q, want it cleared", mon.AgentID)
+						}
+						return nil
+					}),
+				),
+			},
+			{
+				// And it stays cleared: no perpetual diff on re-plan.
+				Config:   detached,
+				PlanOnly: true,
+			},
+		},
+	})
+}
+
 // TestAccMonitor_stepTimeoutCanBeRemoved is the clearable proof for
 // step_timeout_s, and the reason it sits in monitorPatchFromModel's
 // explicit-null group rather than the omit-when-zero one.

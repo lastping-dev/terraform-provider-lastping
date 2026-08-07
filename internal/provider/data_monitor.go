@@ -39,6 +39,7 @@ type monitorDataModel struct {
 	Tags                 types.Set    `tfsdk:"tags"`
 	RunawayCeiling       types.Int64  `tfsdk:"runaway_ceiling"`
 	MonitorFrom          types.String `tfsdk:"monitor_from"`
+	AgentID              types.String `tfsdk:"agent_id"`
 	ProbeURL             types.String `tfsdk:"probe_url"`
 	ProbeMethod          types.String `tfsdk:"probe_method"`
 	ProbeIntervalS       types.Int64  `tfsdk:"probe_interval_s"`
@@ -130,6 +131,11 @@ func monitorDataAttributes() map[string]schema.Attribute {
 		"monitor_from": schema.StringAttribute{
 			Computed:            true,
 			MarkdownDescription: "RFC 3339 UTC timestamp before which deadlines are not computed.",
+		},
+		"agent_id": schema.StringAttribute{
+			Computed: true,
+			MarkdownDescription: "UUID of the `lastping_agent` that owns this monitor. Null when the " +
+				"monitor is unattached — including right after its owning agent was deleted.",
 		},
 		"probe_url": schema.StringAttribute{
 			Computed:            true,
@@ -239,6 +245,7 @@ func monitorDataFromAPI(ctx context.Context, m *client.Monitor) (monitorDataMode
 		FailureThreshold:     types.Int64Value(m.FailureThreshold),
 		Tags:                 tags,
 		MonitorFrom:          timestampOrNull(m.MonitorFrom),
+		AgentID:              stringOrNull(m.AgentID),
 		ProbeURL:             stringOrNull(m.ProbeURL),
 		ProbeMethod:          stringOrNull(m.ProbeMethod),
 		ProbeIntervalS:       int64OrNull(m.ProbeIntervalS),
