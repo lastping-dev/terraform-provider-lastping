@@ -301,14 +301,14 @@ func (r *monitorResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 					"example `lastping_agent.nightly_etl.id`. An in-place update: the API applies it " +
 					"through the same `PATCH` as every other attribute here, so changing it re-attaches " +
 					"the monitor rather than replacing the resource. Removing it from the configuration " +
-					"detaches the monitor (`agent_id` goes back to null) without deleting either resource — " +
+					"detaches the monitor (`agent_id` goes back to null) without deleting either resource — " +
 					"the same as setting it to `null` explicitly.\n\n" +
 					"~> **Naming an agent that does not exist, or belongs to another project, is a plan-time " +
-					"or apply-time error — never an implicit `register_agent`.** The API answers with 400 " +
+					"or apply-time error — never an implicit `register_agent`.** The API answers with 400 " +
 					"`UNKNOWN_AGENT`.\n\n" +
 					"~> **Reference the agent's `id`, not its `slug`, even though the API itself accepts " +
-					"either.** The API always echoes back the canonical UUID — `GET`/`PATCH` on a monitor " +
-					"never reports the slug it was attached with — so writing a slug here would apply " +
+					"either.** The API always echoes back the canonical UUID — `GET`/`PATCH` on a monitor " +
+					"never reports the slug it was attached with — so writing a slug here would apply " +
 					"cleanly and then fail with \"provider produced inconsistent result after apply\" on " +
 					"every subsequent plan, because the state Terraform is required to match is the UUID, " +
 					"not the string the configuration wrote. This provider enforces the UUID form at plan " +

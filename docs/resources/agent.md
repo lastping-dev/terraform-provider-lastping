@@ -51,6 +51,20 @@ output "nightly_etl_status" {
   value = lastping_agent.nightly_etl.status
 }
 
+# An agent alone owns nothing — attach a lastping_monitor to it with agent_id
+# to give it something to be watched by. Once attached, nightly_etl_status and
+# monitor_count above stop being permanently "idle" / 0 and start rolling up
+# this monitor's health.
+resource "lastping_monitor" "etl_ingest" {
+  name          = "ETL ingest"
+  slug          = "etl-ingest"
+  schedule_kind = "simple"
+  period_s      = 3600
+  grace_s       = 600
+
+  agent_id = lastping_agent.nightly_etl.id
+}
+
 # Registering an agent is create-only, not an upsert. A name whose derived slug
 # is already taken in this project fails the apply with a clear error instead of
 # silently adopting an agent this configuration does not own — import it

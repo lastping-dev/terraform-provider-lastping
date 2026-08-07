@@ -64,6 +64,7 @@ output "paused_monitors" {
 
 Read-Only:
 
+- `agent_id` (String) UUID of the `lastping_agent` that owns this monitor. Null when the monitor is unattached — including right after its owning agent was deleted.
 - `alert_after` (String) RFC 3339 UTC timestamp after which a missing ping raises an incident.
 - `created_at` (String) RFC 3339 UTC timestamp when the monitor was created.
 - `cron_expr` (String) 5-field cron expression, for `schedule_kind = "cron"`.
