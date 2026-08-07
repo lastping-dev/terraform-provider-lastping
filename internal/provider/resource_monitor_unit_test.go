@@ -64,6 +64,19 @@ func monitorValidateConfig(t *testing.T, m monitorResourceModel) diag.Diagnostic
 	ctx := context.Background()
 	s := monitorSchema(t)
 
+	// A zero-value types.Set carries no element type, which ObjectValueFrom
+	// below rejects. Terraform itself can never hand the provider one — every
+	// block attribute arrives typed, null or not — so this is purely a
+	// test-fixture convenience: a fixture that says nothing about a block set
+	// means "no blocks configured". Normalising here rather than in every
+	// fixture keeps adding a block from breaking a dozen unrelated tests.
+	if m.Assertions.IsNull() && m.Assertions.ElementType(ctx) == nil {
+		m.Assertions = monitorAssertionSetNull()
+	}
+	if m.Guards.IsNull() && m.Guards.ElementType(ctx) == nil {
+		m.Guards = monitorGuardSetNull()
+	}
+
 	objType, ok := s.Type().(types.ObjectType)
 	require.True(t, ok, "a resource schema is always an object")
 
@@ -689,6 +702,15 @@ func TestResolveUnknownsFromState_CoversEveryAttribute(t *testing.T) {
 				"value": types.StringValue("0"),
 				"path":  types.StringValue("result.rows_processed"),
 				"op":    types.StringValue("gt"),
+			}),
+		}),
+		Guards: types.SetValueMust(guardObjectType(), []attr.Value{
+			types.ObjectValueMust(guardObjectType().AttrTypes, map[string]attr.Value{
+				"name":        types.StringValue("daily spend"),
+				"path":        types.StringValue("cost.usd"),
+				"window_s":    types.Int64Value(86400),
+				"ceiling":     types.Float64Value(50),
+				"aggregation": types.StringValue("sum"),
 			}),
 		}),
 	}

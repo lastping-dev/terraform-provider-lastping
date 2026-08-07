@@ -154,3 +154,65 @@ resource "lastping_monitor" "warehouse_export" {
     value = "^export complete: [0-9]+ rows$"
   }
 }
+
+# Metric guards: the opposite failure. An assertion catches a run that did
+# nothing; a guard catches one that did far too much. An agent that loops,
+# retries and burns $400 in a single call is not pinging fast, so a
+# pings-per-hour ceiling never sees it — but the number is right there in the
+# body the run already sends.
+#
+# A guard reads one number out of that body at a dotted path, rolls it up over
+# a trailing window, and opens an incident with cause `runaway` when the result
+# EXCEEDS the ceiling. Equal does not trip. The guard's name is written to the
+# incident detail, which is what tells it apart from a ping-rate runaway in the
+# alert.
+#
+#   curl -fsS -d '{"cost":{"usd":0.42},"usage":{"total_tokens":18320}}' "$PING_URL"
+#
+# Two caps, both measured cost rather than policy: at most 5 guards per
+# monitor, and window_s at most 604800 (7 days). A guard re-aggregates every
+# ping body in its window on every ping, so the per-ping work is linear in both
+# the window and the number of guards.
+#
+# Like `assertion`, the blocks REPLACE the whole set.
+resource "lastping_monitor" "research_agent" {
+  name          = "Research agent"
+  slug          = "research-agent"
+  schedule_kind = "on_demand"
+  grace_s       = 900
+
+  # The budget. Sum every dollar the agent reported over a rolling day; alert
+  # once the day's total passes $50, whether that was one runaway call or two
+  # hundred ordinary ones.
+  metric_guard {
+    name        = "daily spend"
+    path        = "cost.usd"
+    window_s    = 86400
+    ceiling     = 50
+    aggregation = "sum"
+  }
+
+  # The blast radius. `max` asks a different question from `sum`: not "have we
+  # spent too much today" but "did any single run go off the rails". A loop
+  # that burns its whole budget in one call trips this an hour before the daily
+  # total would have noticed.
+  metric_guard {
+    name        = "worst single run"
+    path        = "usage.total_tokens"
+    window_s    = 3600
+    ceiling     = 200000
+    aggregation = "max"
+  }
+
+  # `avg` is for creep rather than spikes: a prompt change that quietly doubles
+  # the typical run's cost never trips a max, and takes all day to trip a sum.
+  # Pings that report no number at this path are skipped, not counted as zero,
+  # so `start` pings do not drag the average down.
+  metric_guard {
+    name        = "average run cost"
+    path        = "cost.usd"
+    window_s    = 21600
+    ceiling     = 0.75
+    aggregation = "avg"
+  }
+}
