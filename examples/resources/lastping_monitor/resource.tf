@@ -106,3 +106,51 @@ resource "lastping_monitor" "etl_ingest" {
 # monitor rather than destroying and recreating it. Detaching does not delete
 # either resource — the monitor keeps its ping history and simply becomes
 # unowned, same as `terraform destroy` on the agent itself.
+
+# Output assertions: the job runs on time, exits zero — and produced nothing.
+# A dead-man's-switch alone cannot tell that apart from a healthy run, because
+# nothing ever looks at what the run reported. An assertion does: it inspects
+# the body of the success ping, and when it does not hold the ping opens an
+# incident with cause `assertion` naming the assertion that failed.
+#
+# The job has to send a body for any of this to mean anything, e.g.
+#   curl -fsS -d '{"result":{"rows_processed":128}}' "$PING_URL"
+#
+# The blocks REPLACE the whole set: these three are the monitor's complete
+# assertion set after an apply, and deleting them all removes them all.
+resource "lastping_monitor" "warehouse_export" {
+  name          = "Nightly warehouse export"
+  slug          = "warehouse-export"
+  schedule_kind = "cron"
+  cron_expr     = "0 2 * * *"
+  grace_s       = 1800
+
+  # The one that matters: an export that wrote zero rows is a failure, however
+  # cleanly the process exited. Both sides parse as numbers here, so the
+  # comparison is numeric — "12" > "3" the way you would expect, not the way
+  # string ordering would have it.
+  assertion {
+    name  = "rows were written"
+    kind  = "json_path"
+    path  = "result.rows_processed"
+    op    = "gt"
+    value = "0"
+  }
+
+  # A job that catches its own exceptions and still exits zero leaves the
+  # evidence in its output. This turns that into an alert.
+  assertion {
+    name  = "no traceback in output"
+    kind  = "not_contains"
+    value = "Traceback (most recent call last)"
+  }
+
+  # `matches` is a Go RE2 regular expression — no backtracking, so pattern
+  # complexity is not a denial-of-service risk, and the pattern is capped at
+  # 1000 bytes.
+  assertion {
+    name  = "reported a completion line"
+    kind  = "matches"
+    value = "^export complete: [0-9]+ rows$"
+  }
+}

@@ -137,6 +137,12 @@ type monitorResourceModel struct {
 	DueAt                types.String `tfsdk:"due_at"`
 	AlertAfter           types.String `tfsdk:"alert_after"`
 	MaintenanceUntil     types.String `tfsdk:"maintenance_until"`
+
+	// Assertions is the `assertion` nested block set. It is NOT part of the
+	// monitor payload: assertions are a sub-resource with their own
+	// replace-the-set PUT, so they are read and written separately from every
+	// other attribute here. See monitor_assertions.go.
+	Assertions types.Set `tfsdk:"assertion"`
 }
 
 func (r *monitorResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -389,6 +395,9 @@ func (r *monitorResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 					"Set through the API or dashboard, not by Terraform.",
 			},
 		},
+		Blocks: map[string]schema.Block{
+			"assertion": monitorAssertionBlock(),
+		},
 	}
 }
 
@@ -417,14 +426,22 @@ func (r *monitorResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 //     max_runtime_s — the explicit null the update path always sends is a no-op
 //     the API accepts.
 //
-// And one rule that is not about http at all: step_timeout_s must be strictly
-// below the effective run budget. See validateStepTimeoutBudget.
+// And two rules that are not about http at all: step_timeout_s must be strictly
+// below the effective run budget (see validateStepTimeoutBudget), and every
+// `assertion` block must be one core/assertion.Validate would accept (see
+// validateAssertions, which also refuses assertions on an http monitor — a
+// probe has no ping body, so they could never be evaluated).
 func (r *monitorResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
 	var cfg monitorResourceModel
 	resp.Diagnostics.Append(req.Config.Get(ctx, &cfg)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
+
+	// Assertions are validated for every monitor type — the http rule for them
+	// lives inside validateAssertions — so this runs before the http early
+	// return below rather than inside either branch.
+	validateAssertions(ctx, cfg, resp)
 
 	if cfg.MonitorType.IsUnknown() || cfg.MonitorType.ValueString() != "http" {
 		// Not an http monitor, so step_timeout_s is legal — but it still has to
@@ -932,6 +949,35 @@ func (r *monitorResource) Create(ctx context.Context, req resource.CreateRequest
 		resp.Diagnostics.AddError("Unable to process monitor response", err.Error())
 		return
 	}
+
+	// Assertions are a sub-resource, applied after the monitor exists. A freshly
+	// created monitor has none, so the current set is known to be empty without
+	// asking — and when the configuration has no assertion blocks either, there
+	// is nothing to write at all.
+	desiredAssertions, err := assertionsFromModel(ctx, plan.Assertions)
+	if err != nil {
+		resp.Diagnostics.AddError("Unable to build assertions payload", err.Error())
+		return
+	}
+	appliedAssertions, err := r.syncAssertions(ctx, out.ID, desiredAssertions, []client.Assertion{})
+	if err != nil {
+		// The monitor itself exists. Saving state before returning the error is
+		// what stops the next apply from trying to create it a second time and
+		// hitting the If-None-Match slug collision instead of retrying the
+		// assertions.
+		resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
+		resp.Diagnostics.AddError("Unable to set monitor assertions",
+			fmt.Sprintf("The monitor was created, but its output assertions were not written: %s\n\n"+
+				"The monitor is in state; re-running the apply will retry the assertions alone.", err))
+		return
+	}
+	assertionSet, diags := assertionsToModel(ctx, appliedAssertions, plan.Assertions)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	state.Assertions = assertionSet
+
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
@@ -958,6 +1004,23 @@ func (r *monitorResource) Read(ctx context.Context, req resource.ReadRequest, re
 		resp.Diagnostics.AddError("Unable to process monitor response", err.Error())
 		return
 	}
+
+	// Assertions live behind their own endpoint, so refreshing the monitor does
+	// not refresh them. Without this call an assertion added or removed outside
+	// Terraform is invisible to `terraform plan` — the attribute would only ever
+	// echo back whatever the last apply wrote.
+	current, err := r.client.GetAssertions(ctx, state.ID.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddError("Unable to read monitor assertions", err.Error())
+		return
+	}
+	assertionSet, diags := assertionsToModel(ctx, current, state.Assertions)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	newState.Assertions = assertionSet
+
 	resp.Diagnostics.Append(resp.State.Set(ctx, &newState)...)
 }
 
@@ -1088,6 +1151,30 @@ func (r *monitorResource) Update(ctx context.Context, req resource.UpdateRequest
 		resp.Diagnostics.AddError("Unable to process monitor response", err.Error())
 		return
 	}
+
+	// Assertions come from the CONFIGURATION, not from `desired`: the block is
+	// Optional-only, so removing every block plans as a null set, and a null set
+	// has to mean "clear them" — assertionsFromModel turns it into the empty
+	// array the replace-the-set PUT needs. Passing nil as current makes
+	// syncAssertions read the stored set first, so an apply that leaves the
+	// assertions alone issues no write at all.
+	desiredAssertions, err := assertionsFromModel(ctx, cfg.Assertions)
+	if err != nil {
+		resp.Diagnostics.AddError("Unable to build assertions payload", err.Error())
+		return
+	}
+	appliedAssertions, err := r.syncAssertions(ctx, id, desiredAssertions, nil)
+	if err != nil {
+		resp.Diagnostics.AddError("Unable to update monitor assertions", err.Error())
+		return
+	}
+	assertionSet, diags := assertionsToModel(ctx, appliedAssertions, plan.Assertions)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	newState.Assertions = assertionSet
+
 	resp.Diagnostics.Append(resp.State.Set(ctx, &newState)...)
 }
 
