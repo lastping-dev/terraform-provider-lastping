@@ -123,7 +123,8 @@ func TestMonitorMaxRuntimeRejectedOnHTTP(t *testing.T) {
 		ProbeURL:    types.StringValue("https://example.com/"),
 		// The zero types.Set has no element type, which ObjectValueFrom
 		// rejects; every other zero value is a well-formed null.
-		Tags: types.SetNull(types.StringType),
+		Tags:       types.SetNull(types.StringType),
+		Assertions: monitorAssertionSetNull(),
 	}
 
 	withRuntime := base
@@ -154,7 +155,8 @@ func TestMonitorStepTimeoutRejectedOnHTTP(t *testing.T) {
 		ProbeURL:    types.StringValue("https://example.com/"),
 		// The zero types.Set has no element type, which ObjectValueFrom
 		// rejects; every other zero value is a well-formed null.
-		Tags: types.SetNull(types.StringType),
+		Tags:       types.SetNull(types.StringType),
+		Assertions: monitorAssertionSetNull(),
 	}
 
 	withStep := base
@@ -194,6 +196,7 @@ func TestMonitorStepTimeoutBudgetRule(t *testing.T) {
 		ScheduleKind: types.StringValue("simple"),
 		PeriodS:      types.Int64Value(3600),
 		Tags:         types.SetNull(types.StringType),
+		Assertions:   monitorAssertionSetNull(),
 	}
 
 	for _, tc := range []struct {
@@ -679,6 +682,15 @@ func TestResolveUnknownsFromState_CoversEveryAttribute(t *testing.T) {
 		DueAt:                types.StringValue("2026-01-03T00:00:00Z"),
 		AlertAfter:           types.StringValue("2026-01-04T00:00:00Z"),
 		MaintenanceUntil:     types.StringValue("2026-01-05T00:00:00Z"),
+		Assertions: types.SetValueMust(assertionObjectType(), []attr.Value{
+			types.ObjectValueMust(assertionObjectType().AttrTypes, map[string]attr.Value{
+				"name":  types.StringValue("rows written"),
+				"kind":  types.StringValue("json_path"),
+				"value": types.StringValue("0"),
+				"path":  types.StringValue("result.rows_processed"),
+				"op":    types.StringValue("gt"),
+			}),
+		}),
 	}
 
 	// Every field unknown, and every field of `state` set to a distinctive
