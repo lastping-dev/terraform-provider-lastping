@@ -31,6 +31,12 @@ resource "lastping_alert_template" "checkout_api" {
     # lastping_route sends that event type to a destination.
     "started" = "{check_name} started."
     "success" = "{check_name} finished in {duration}."
+
+    # "blocked" fires when an agent reports it is waiting on a human.
+    "blocked" = "{check_name} is blocked and needs a human."
+
+    # "note" is an agent-reported free-text signal with no state change.
+    "note" = "{check_name} sent a note."
   }
 }
 

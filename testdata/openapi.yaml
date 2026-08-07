@@ -951,7 +951,7 @@ components:
       properties:
         event_type:
           type: string
-          enum: [down, recovery, fail, every-run, success, started]
+          enum: [down, recovery, fail, every-run, success, started, blocked, note]
           description: >-
             The check event that triggers this route. `down`, `recovery` and `fail`
             fire on a state change. `every-run`, `success` and `started` are
@@ -961,7 +961,19 @@ components:
             monitor runs (not by state changes), and they share one per-channel
             rate budget (default 60/hr) separate from down/fail/recovery — a
             chatty monitor routed to any combination of the three can starve its
-            own notifications once that shared budget is exhausted.
+            own notifications once that shared budget is exhausted. `blocked`
+            fires immediately when the agent reports it is blocked (waiting
+            on a human) via a `blocked` ping — it is agent-reported rather
+            than a system-derived state change, but it draws on the
+            down/recovery/fail alert budget rather than the info one, because
+            a blocked run needs a human and must not be starved by chatty
+            info traffic. It is distinct from the `blocked`-CAUSE incident:
+            if the block outlasts `blocked_timeout_s`, a separate `down`
+            event fires with cause `blocked` (routable via the bare `down`
+            route or a `down/blocked` per-cause override), not another
+            `blocked`-event-type notification. `note` is an agent-reported,
+            informational free-text signal (no state change) and shares the
+            every-run/success/started info budget.
           example: "down"
         channel_ids:
           type: array
@@ -1343,7 +1355,7 @@ components:
 
             **Key format:**
             - Event-type-wide: `"down"`, `"fail"`, `"recovery"`, `"every-run"`,
-              `"success"`, `"started"`.
+              `"success"`, `"started"`, `"blocked"`, `"note"`.
             - Per-cause override: `"event_type/cause"`, e.g. `"down/silence"`,
               `"down/overrun"`, `"down/never_started"`, `"fail/runaway"`.
               Per-cause keys take priority over the event-type-wide key.
@@ -1917,10 +1929,17 @@ paths:
         built-in plain-language defaults are used.
 
         **Key format:** keys are either a bare event type (`down`, `recovery`,
-        `fail`, `every-run`, `success`, `started`) or an `event_type/cause` pair
-        for a per-cause override (e.g. `down/silence`, `down/overrun`,
-        `down/never_started`, `fail/runaway`).  Per-cause entries take priority
-        over the event-type-wide entry at notification time.
+        `fail`, `every-run`, `success`, `started`, `blocked`, `note`) or an
+        `event_type/cause` pair for a per-cause override (e.g. `down/silence`,
+        `down/overrun`, `down/never_started`, `fail/runaway`).  Per-cause
+        entries take priority over the event-type-wide entry at notification
+        time. Like `every-run`, `success` and `started`, the `blocked` and
+        `note` events are always recorded with an empty cause — they are not
+        incident-backed — so only the bare `blocked`/`note` keys are ever
+        matched; a `blocked/`-prefixed per-cause key is accepted but never
+        selected. (The `blocked`-CAUSE `down` incident that opens when a
+        block outlasts `blocked_timeout_s` is a separate event, templated via
+        the `down` or `down/blocked` keys.)
 
         Template bodies may reference allowlisted `{variable}` placeholders:
         `{check_name}`, `{event}`, `{status}`, `{cause}`, `{last_ping}`,
@@ -1988,10 +2007,10 @@ paths:
         rejected with `400` and **nothing is written**.
 
         **Key format:** bare event type (`down`, `recovery`, `fail`, `every-run`,
-        `success`, `started`) or `event_type/cause` for a per-cause override
-        (e.g. `"down/silence"`, `"down/overrun"`, `"down/never_started"`,
-        `"fail/runaway"`).  Per-cause entries take priority over the
-        event-type-wide entry for that event.
+        `success`, `started`, `blocked`, `note`) or `event_type/cause` for a
+        per-cause override (e.g. `"down/silence"`, `"down/overrun"`,
+        `"down/never_started"`, `"fail/runaway"`).  Per-cause entries take
+        priority over the event-type-wide entry for that event.
 
         Returns the resulting set (same shape as `GET`) on success.
       tags: [Checks]
@@ -2012,8 +2031,8 @@ paths:
                     Map of template key → template body.
 
                     Keys are a bare event type (`down`, `recovery`, `fail`,
-                    `every-run`, `success`, `started`) or `event_type/cause`
-                    (e.g. `"down/silence"`, `"down/overrun"`,
+                    `every-run`, `success`, `started`, `blocked`, `note`) or
+                    `event_type/cause` (e.g. `"down/silence"`, `"down/overrun"`,
                     `"down/never_started"`, `"fail/runaway"`).
 
                     Absent keys or empty-string values reset that key to the
@@ -2056,7 +2075,8 @@ paths:
           description: |
             Invalid request — one of:
             - Invalid key: event type part must be `down`, `recovery`, `fail`,
-              `every-run`, `success`, or `started` (e.g. `"down"` or `"down/silence"`).
+              `every-run`, `success`, `started`, `blocked`, or `note`
+              (e.g. `"down"` or `"down/silence"`).
             - Template body references an unknown `{variable}`.
             - Malformed JSON body.
             Nothing is written when any entry fails validation.
@@ -2524,8 +2544,9 @@ paths:
       summary: List routes for a check
       description: |
         Returns all routing rules for the check.  Each rule maps an event type
-        (`down`, `recovery`, `fail`, `every-run`, `success`, `started`) to a list
-        of channel UUIDs. Always returns a JSON array (never null).
+        (`down`, `recovery`, `fail`, `every-run`, `success`, `started`,
+        `blocked`, `note`) to a list of channel UUIDs. Always returns a JSON
+        array (never null).
       tags: [Routes]
       security:
         - ApiKeyAuth: []
@@ -2575,10 +2596,16 @@ paths:
             budget down/recovery/fail draw from — a chatty monitor routed to any
             combination of the three can exhaust that shared budget and suppress
             its own later notifications on that channel. Prefer a low-stakes
-            destination for them.
+            destination for them. `blocked` fires immediately when the agent
+            reports it is blocked (waiting on a human) via a `blocked` ping;
+            it shares the down/recovery/fail alert budget, not the info one.
+            It is distinct from the `blocked`-CAUSE `down` event that fires
+            separately if the block outlasts `blocked_timeout_s`. `note` is
+            an agent-reported free-text informational signal and shares the
+            every-run/success/started info budget.
         schema:
           type: string
-          enum: [down, recovery, fail, every-run, success, started]
+          enum: [down, recovery, fail, every-run, success, started, blocked, note]
         example: "down"
 
     put:
@@ -2649,7 +2676,7 @@ paths:
         "204":
           description: Route deleted.
         "400":
-          description: id is not a valid UUID, or event_type is not one of down/recovery/fail/every-run/success/started.
+          description: id is not a valid UUID, or event_type is not one of down/recovery/fail/every-run/success/started/blocked/note.
           content:
             application/problem+json:
               schema:

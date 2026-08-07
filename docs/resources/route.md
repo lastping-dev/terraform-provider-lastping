@@ -103,6 +103,25 @@ resource "lastping_route" "backup_started" {
   destination_ids = [lastping_destination.backup_owner.id]
 }
 
+# "blocked" fires immediately when an agent reports it is waiting on a human via
+# a blocked ping. Unlike the three informational events above, it draws on the
+# same alert budget as down/fail/recovery rather than the shared informational
+# one, so a blocked run cannot be starved by chatty per-run traffic — point it
+# at the same destination that pages someone for "down".
+resource "lastping_route" "backup_blocked" {
+  monitor_id      = lastping_monitor.nightly_backup.id
+  event_type      = "blocked"
+  destination_ids = [lastping_destination.oncall_slack.id]
+}
+
+# "note" is an agent-reported free-text signal with no state change. It shares
+# the every-run/success/started informational budget.
+resource "lastping_route" "backup_note" {
+  monitor_id      = lastping_monitor.nightly_backup.id
+  event_type      = "note"
+  destination_ids = [lastping_destination.backup_owner.id]
+}
+
 variable "slack_webhook_url" {
   type      = string
   sensitive = true
@@ -115,11 +134,15 @@ variable "slack_webhook_url" {
 ### Required
 
 - `destination_ids` (List of String) Destinations notified for this event, as a **list**: the API stores and returns the array in the order given, and that order is the order alerts are dispatched in. An empty list is valid and means "deliver nowhere for this event", which is not the same as removing the resource. Duplicates are rejected at plan time because the API silently de-duplicates them, which would otherwise fail the apply as an inconsistent result.
-- `event_type` (String) Which event this route covers: `down`, `recovery`, `fail`, `every-run`, `success`, `started`. Part of the resource's identity, so changing it replaces the resource.
+- `event_type` (String) Which event this route covers: `down`, `recovery`, `fail`, `every-run`, `success`, `started`, `blocked`, `note`. Part of the resource's identity, so changing it replaces the resource.
 
-The first three fire on a **state change**: `down` when a monitor misses its deadline, `recovery` when it comes back, and `fail` when a run reports failure explicitly. The other three are **informational** and fire per run: `every-run` once per completed run whether it succeeded or failed, `success` only on a successful completion, and `started` when a run begins. Use `success` rather than `every-run` where a failure is not wanted on the same channel — `every-run` conflates the two.
+The first three fire on a **state change**: `down` when a monitor misses its deadline, `recovery` when it comes back, and `fail` when a run reports failure explicitly. The next three are **informational** and fire per run: `every-run` once per completed run whether it succeeded or failed, `success` only on a successful completion, and `started` when a run begins. Use `success` rather than `every-run` where a failure is not wanted on the same channel — `every-run` conflates the two.
 
-~> **The three informational events are much chattier, and they compete with each other.** A state-change event's volume is bounded by how often the monitor changes state; theirs is bounded only by how often the monitor runs. None of them is flap-damped either — a `fail` is held for the flap window so a short blip can be cancelled before it pages, while an `every-run` is released immediately. Most importantly they share **one per-destination rate budget** (60 notifications per hour by default) that is separate from the one `down`, `fail` and `recovery` draw from: a chatty monitor routed to any combination of the three can exhaust that shared budget and suppress its own later informational notifications on that destination. Point them at a low-stakes destination, not at the one that pages someone.
+`blocked` fires immediately when an agent reports it is blocked (waiting on a human) via a `blocked` ping. It is agent-reported rather than a system-derived state change, but it draws on the `down`/`recovery`/`fail` alert budget rather than the informational one, because a blocked run needs a human and must not be starved by chatty informational traffic. It is distinct from the `blocked`-cause incident: if the block outlasts the monitor's blocked timeout, a separate `down` event fires with cause `blocked` (routable via the bare `down` route or a `down/blocked` per-cause override), not another `blocked`-event-type notification.
+
+`note` is an agent-reported, informational free-text signal — no state change — and shares the `every-run`/`success`/`started` informational budget.
+
+~> **`every-run`, `success`, `started` and `note` are much chattier than the state-change events, and they compete with each other.** A state-change event's volume is bounded by how often the monitor changes state; theirs is bounded only by how often the monitor runs or reports a note. None of them is flap-damped either — a `fail` is held for the flap window so a short blip can be cancelled before it pages, while an `every-run` is released immediately. Most importantly they share **one per-destination rate budget** (60 notifications per hour by default) that is separate from the one `down`, `fail`, `recovery` and `blocked` draw from: a chatty monitor routed to any combination of the four can exhaust that shared budget and suppress its own later informational notifications on that destination. Point them at a low-stakes destination, not at the one that pages someone.
 - `monitor_id` (String) UUID of the monitor whose alerts are being routed. The route lives at a path keyed on this id, so changing it replaces the resource.
 
 ## Import
@@ -133,7 +156,7 @@ The [`terraform import` command](https://developer.hashicorp.com/terraform/cli/c
 # and the event it covers — so the import ID carries both, separated by a colon:
 terraform import lastping_route.backup_down 550e8400-e29b-41d4-a716-446655440000:down
 
-# The event type must be one of down, recovery, fail or every-run. Anything
-# else, or a missing colon, is rejected with the expected shape rather than a
-# lookup miss.
+# The event type must be one of down, recovery, fail, every-run, success,
+# started, blocked or note. Anything else, or a missing colon, is rejected
+# with the expected shape rather than a lookup miss.
 ```

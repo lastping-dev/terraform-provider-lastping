@@ -33,9 +33,12 @@ var (
 //
 // This is NOT the same set the API auto-routes on monitor creation
 // (api/defaultdest.go: defaultAlertEvents), which is down/fail/recovery only.
-// every-run, success and started are deliberately absent there, so widening
-// this slice must not widen the adoption exemption in routeIsServerDefault.
-var routeEventTypes = []string{"down", "recovery", "fail", "every-run", "success", "started"}
+// every-run, success, started, blocked and note are deliberately absent
+// there, so widening this slice must not widen the adoption exemption in
+// routeIsServerDefault.
+var routeEventTypes = []string{
+	"down", "recovery", "fail", "every-run", "success", "started", "blocked", "note",
+}
 
 // defaultAlertEvents mirrors api/defaultdest.go: the events the API attaches to
 // the project's default email destination when a monitor is created. Kept
@@ -135,19 +138,31 @@ func (r *routeResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 					strings.Join(routeEventTypes, "`, `") + "`. Part of the resource's identity, so changing it " +
 					"replaces the resource.\n\n" +
 					"The first three fire on a **state change**: `down` when a monitor misses its deadline, " +
-					"`recovery` when it comes back, and `fail` when a run reports failure explicitly. The other " +
+					"`recovery` when it comes back, and `fail` when a run reports failure explicitly. The next " +
 					"three are **informational** and fire per run: `every-run` once per completed run whether it " +
 					"succeeded or failed, `success` only on a successful completion, and `started` when a run " +
 					"begins. Use `success` rather than `every-run` where a failure is not wanted on the same " +
 					"channel — `every-run` conflates the two.\n\n" +
-					"~> **The three informational events are much chattier, and they compete with each other.** " +
+					"`blocked` fires immediately when an agent reports it is blocked (waiting on a human) via a " +
+					"`blocked` ping. It is agent-reported rather than a system-derived state change, but it draws " +
+					"on the `down`/`recovery`/`fail` alert budget rather than the informational one, because a " +
+					"blocked run needs a human and must not be starved by chatty informational traffic. It is " +
+					"distinct from the `blocked`-cause incident: if the block outlasts the monitor's blocked " +
+					"timeout, a separate `down` event fires with cause `blocked` (routable via the bare `down` " +
+					"route or a `down/blocked` per-cause override), not another `blocked`-event-type " +
+					"notification.\n\n" +
+					"`note` is an agent-reported, informational free-text signal — no state change — and shares " +
+					"the `every-run`/`success`/`started` informational budget.\n\n" +
+					"~> **`every-run`, `success`, `started` and `note` are much chattier than the state-change " +
+					"events, and they compete with each other.** " +
 					"A state-change event's volume is bounded by how often the monitor changes state; theirs is " +
-					"bounded only by how often the monitor runs. None of them is flap-damped either — a `fail` is " +
-					"held for the flap window so a short blip can be cancelled before it pages, while an " +
-					"`every-run` is released immediately. Most importantly they share **one per-destination rate " +
-					"budget** (60 notifications per hour by default) that is separate from the one `down`, " +
-					"`fail` and `recovery` draw from: a chatty monitor routed to any combination of the three can " +
-					"exhaust that shared budget and suppress its own later informational notifications on that " +
+					"bounded only by how often the monitor runs or reports a note. None of them is flap-damped " +
+					"either — a `fail` is held for the flap window so a short blip can be cancelled before it " +
+					"pages, while an `every-run` is released immediately. Most importantly they share **one " +
+					"per-destination rate budget** (60 notifications per hour by default) that is separate from " +
+					"the one `down`, `fail`, `recovery` and `blocked` draw from: a chatty monitor routed to any " +
+					"combination of the four can exhaust that shared budget and suppress its own later " +
+					"informational notifications on that " +
 					"destination. Point them at a low-stakes destination, not at the one that pages someone.",
 				Validators:    []validator.String{stringvalidator.OneOf(routeEventTypes...)},
 				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},

@@ -29,15 +29,17 @@ func TestParseRouteImportID(t *testing.T) {
 		{name: "every-run", id: monitorID + ":every-run", wantEvent: "every-run"},
 		{name: "success", id: monitorID + ":success", wantEvent: "success"},
 		{name: "started", id: monitorID + ":started", wantEvent: "started"},
+		{name: "blocked", id: monitorID + ":blocked", wantEvent: "blocked"},
+		{name: "note", id: monitorID + ":note", wantEvent: "note"},
 		{
 			name:    "unknown event",
 			id:      monitorID + ":runaway",
-			wantErr: "not one of down, recovery, fail, every-run, success, started",
+			wantErr: "not one of down, recovery, fail, every-run, success, started, blocked, note",
 		},
 		{
 			name:    "empty event",
 			id:      monitorID + ":",
-			wantErr: "not one of down, recovery, fail, every-run, success, started",
+			wantErr: "not one of down, recovery, fail, every-run, success, started, blocked, note",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -66,17 +68,50 @@ func TestParseRouteImportID(t *testing.T) {
 // Terraform to silently take over a route a person created by hand — the exact
 // clobber the whole adoption guard exists to prevent.
 func TestRouteEventTypeSetsStayDistinct(t *testing.T) {
-	require.Equal(t,
-		[]string{"down", "recovery", "fail", "every-run", "success", "started"}, routeEventTypes,
-		"routeEventTypes must mirror the API's validEventTypes")
 	require.Equal(t, []string{"down", "fail", "recovery"}, defaultAlertEvents,
 		"defaultAlertEvents mirrors api/defaultdest.go and must not grow with routeEventTypes")
 
-	for _, e := range []string{"every-run", "success", "started"} {
+	for _, e := range routeEventTypes {
+		if e == "down" || e == "fail" || e == "recovery" {
+			continue
+		}
 		require.NotContains(t, defaultAlertEvents, e,
 			"%s is routable but is never auto-routed; listing it here would make routeIsServerDefault "+
 				"adopt a route a person wrote by hand", e)
 	}
+}
+
+// TestRouteEventTypesMatchSpec pins routeEventTypes against the vendored
+// OpenAPI spec's Route.event_type enum (testdata/openapi.yaml, refreshed by
+// `make sync-openapi`) rather than a literal restated in this file.
+//
+// A literal only catches a typo made here; it says nothing about the actual
+// failure mode this guards against — the API's canonical event-type set
+// (internal/alertevent.validEventTypes in the monorepo) growing while
+// routeEventTypes does not. Comparing against the spec catches that the next
+// time the spec is refreshed, the same way contract_test.go catches field
+// drift for every other resource.
+func TestRouteEventTypesMatchSpec(t *testing.T) {
+	doc := loadSpec(t)
+	node, err := resolveNode(doc, []string{"components", "schemas", "Route", "properties", "event_type"})
+	require.NoError(t, err, "locate components.schemas.Route.properties.event_type in %s", specPath)
+
+	rawEnum, ok := node["enum"].([]any)
+	require.True(t, ok, "components.schemas.Route.properties.event_type has no enum in %s", specPath)
+
+	specEventTypes := make([]string, len(rawEnum))
+	for i, v := range rawEnum {
+		s, ok := v.(string)
+		require.True(t, ok, "enum entry %#v is not a string", v)
+		specEventTypes[i] = s
+	}
+
+	require.Equal(t, specEventTypes, routeEventTypes,
+		"routeEventTypes has drifted from the OpenAPI spec's Route.event_type enum "+
+			"(%s). If the API genuinely changed, run `make sync-openapi` and update "+
+			"routeEventTypes to match — and re-check whether the new event type belongs "+
+			"in defaultAlertEvents (see TestRouteEventTypeSetsStayDistinct; usually it does not).",
+		specPath)
 }
 
 // TestRouteAdoptionConflict pins where the line falls between "this apply would

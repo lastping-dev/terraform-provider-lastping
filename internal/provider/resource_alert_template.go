@@ -35,7 +35,7 @@ var (
 // or `event/cause` for a per-cause override. The cause half is deliberately
 // unconstrained — the server does not validate it either, and pinning a list
 // here would reject causes added later by the backend.
-var templateKeyPattern = regexp.MustCompile(`^(down|recovery|fail|every-run|success|started)(/.+)?$`)
+var templateKeyPattern = regexp.MustCompile(`^(down|recovery|fail|every-run|success|started|blocked|note)(/.+)?$`)
 
 // trimmedValidator rejects a body that is not already in the form the server
 // would store. handleAPIPutTemplates runs strings.TrimSpace on every value, so
@@ -131,7 +131,8 @@ func (r *alertTemplateResource) Schema(_ context.Context, _ resource.SchemaReque
 				Required:    true,
 				ElementType: types.StringType,
 				MarkdownDescription: "Message bodies keyed by event. A key is either an event type on its own — " +
-					"`down`, `recovery`, `fail`, `every-run`, `success`, `started` — which covers every cause, or " +
+					"`down`, `recovery`, `fail`, `every-run`, `success`, `started`, `blocked`, `note` — which covers " +
+					"every cause, or " +
 					"`event/cause` for a narrower override such as `down/silence`, `fail/runaway` or `fail/ci`. " +
 					"The more specific key wins when both are present. Removing a key removes the message " +
 					"server-side and restores the default wording for that event; an empty map is valid and " +
@@ -144,8 +145,9 @@ func (r *alertTemplateResource) Schema(_ context.Context, _ resource.SchemaReque
 				// anything.
 				Validators: []validator.Map{
 					mapvalidator.KeysAre(stringvalidator.RegexMatches(templateKeyPattern,
-						"must be an event type (down, recovery, fail, every-run, success, started), optionally "+
-							"followed by \"/\" and a cause — for example \"down\" or \"down/silence\"")),
+						"must be an event type (down, recovery, fail, every-run, success, started, blocked, "+
+							"note), optionally followed by \"/\" and a cause — for example \"down\" or "+
+							"\"down/silence\"")),
 					mapvalidator.ValueStringsAre(trimmedValidator{}),
 				},
 			},
@@ -185,8 +187,8 @@ func templatesFromModel(ctx context.Context, m alertTemplateResourceModel) (map[
 // This is NOT redundant with the API's replace semantics, which are uniform
 // only for event-wide keys (api/api_templates.go: handleAPIPutTemplates deletes
 // every bare event type — `down`, `recovery`, `fail`, `every-run`, `success`,
-// `started` — before applying the request, but touches a per-cause row only
-// when the request names it). Sending just the
+// `started`, `blocked`, `note` — before applying the request, but touches a
+// per-cause row only when the request names it). Sending just the
 // desired map would therefore leave `down/silence` behind forever once it had
 // been set — a removed key that never actually goes away, and a permanent diff.
 func replacementPayload(desired, current map[string]string) map[string]string {
