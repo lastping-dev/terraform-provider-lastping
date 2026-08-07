@@ -107,20 +107,33 @@ components:
           example: "heartbeat"
         schedule_kind:
           type: string
-          enum: [simple, cron]
+          enum: [simple, cron, on_demand]
           description: |
-            `simple` uses a fixed period; `cron` uses a cron expression.
+            `simple` uses a fixed period; `cron` uses a cron expression;
+            `on_demand` means the check has no cadence at all — it is driven
+            entirely by run events (`start`/`success`/`fail`/…), never arms an
+            absence deadline, and silence between runs never alerts. Run-scoped
+            detection (`max_runtime_s`, `step_timeout_s`) still applies once a
+            run starts.
             Required for `heartbeat` and `ci` monitor types.
             Ignored when `monitor_type` is `http` (schedule is driven by `probe_interval_s`).
           example: "simple"
         period_s:
           type: integer
           format: int64
-          description: Expected ping interval in seconds.  Required when schedule_kind is `simple`.
+          description: |
+            Expected ping interval in seconds.  Required when schedule_kind is `simple`.
+
+            **Must be absent when schedule_kind is `on_demand`** — supplying it
+            alongside `on_demand` is rejected with 400 (`ON_DEMAND_SCHEDULE_CONFLICT`).
           example: 86400
         cron_expr:
           type: string
-          description: Cron expression (5-field).  Required when schedule_kind is `cron`.
+          description: |
+            Cron expression (5-field).  Required when schedule_kind is `cron`.
+
+            **Must be absent when schedule_kind is `on_demand`** — supplying it
+            alongside `on_demand` is rejected with 400 (`ON_DEMAND_SCHEDULE_CONFLICT`).
           example: "0 3 * * *"
         tz:
           type: string
@@ -187,6 +200,23 @@ components:
             there is nothing for a step to report progress within.  Use
             `probe_timeout_s` to bound a single probe.
           example: 300
+        blocked_timeout_s:
+          type: [integer, "null"]
+          format: int64
+          description: |
+            How long (in seconds) a check may sit `blocked` — reported via a
+            `blocked` ping, meaning the run is waiting on a human — before a
+            `blocked` incident opens.
+
+            **Null or omitted does NOT mean "wait forever".** It falls back to
+            `check.DefaultBlockedTimeout`, which is **24 hours**, after which
+            the `blocked` incident opens regardless. There is no way to
+            disable the blocked timeout entirely.
+
+            Accepted on every `monitor_type`, including `http` — unlike
+            `max_runtime_s`/`step_timeout_s` it has no run-scoped precondition
+            that would make it a provable no-op on an HTTP monitor.
+          example: 86400
         failure_threshold:
           type: integer
           format: int64
@@ -196,9 +226,9 @@ components:
           description: |
             Number of **consecutive explicit failures** required before an
             incident opens — retry-before-alert.  Applies to the `fail` cause
-            ONLY: `silence`, `overrun`, `never_started` and `runaway` are time-
-            or rate-based, so a consecutive-failure count is meaningless for
-            them and never gates them.
+            ONLY: `silence`, `overrun`, `never_started`, `runaway`, `stalled`
+            and `blocked` are time- or rate-based, so a consecutive-failure
+            count is meaningless for them and never gates them.
 
             Below the threshold nothing alerts and the status does not change,
             but the ping is still recorded, an outstanding run is still ended,
@@ -307,6 +337,19 @@ components:
             Max 20 tags; each tag max 50 characters. Duplicate tags are silently
             deduplicated. The `agent:` prefix is a convention for AI-provisioned monitors.
           example: ["agent:claude", "env:prod"]
+        agent_id:
+          type: string
+          description: |
+            Optionally attaches this monitor to an agent at creation time, by
+            either the agent's `id` or its `slug`. Omitted or empty means "no
+            attachment" — it never creates an agent implicitly.
+
+            **An unknown or foreign agent reference is rejected with 400
+            (`UNKNOWN_AGENT`)** — this is what keeps Terraform (or any IaC
+            client) authoritative over the agents it owns: naming an agent
+            that does not exist can never conjure one into being. Create the
+            agent first with `POST /api/v1/agents`.
+          example: "nightly-etl-bot"
 
     CheckPatch:
       type: object
@@ -322,9 +365,14 @@ components:
         - **No field is required** — a body may contain a single key.
         - **Omitted field** — the stored value is left unchanged.
         - **Explicit `null`** — clears the value. Accepted only by
-          `runaway_ceiling`, `max_runtime_s`, `step_timeout_s`, `monitor_from`,
-          `ci_workflow`, `ci_branch` and `tags`; those are the seven properties
-          typed to allow `null` below.
+          `runaway_ceiling`, `max_runtime_s`, `step_timeout_s`,
+          `blocked_timeout_s`, `monitor_from`, `ci_workflow`, `ci_branch`,
+          `tags` and `agent_id`; those are the nine properties typed to allow
+          `null` below. For `agent_id`, explicit `null` detaches the monitor
+          from its agent — it does not delete the agent or the monitor. For
+          `blocked_timeout_s`, explicit `null` does NOT mean "wait forever" —
+          it restores the fallback to `check.DefaultBlockedTimeout` (24h),
+          same as omitting the field entirely.
         - **Any other value** — replaces the stored value.
 
         `slug`, `monitor_type`, `ci_provider` and `ci_secret` are immutable on
@@ -336,20 +384,35 @@ components:
           example: "Daily backup job"
         schedule_kind:
           type: string
-          enum: [simple, cron]
+          enum: [simple, cron, on_demand]
           description: |
-            `simple` uses a fixed period; `cron` uses a cron expression.
+            `simple` uses a fixed period; `cron` uses a cron expression;
+            `on_demand` means the check has no cadence at all — it is driven
+            entirely by run events, never arms an absence deadline, and
+            silence between runs never alerts. Run-scoped detection
+            (`max_runtime_s`, `step_timeout_s`) still applies once a run
+            starts.
             Ignored when the monitor's type is `http` (schedule is driven by
             `probe_interval_s`).
           example: "simple"
         period_s:
           type: integer
           format: int64
-          description: Expected ping interval in seconds.  Applies when schedule_kind is `simple`.
+          description: |
+            Expected ping interval in seconds.  Applies when schedule_kind is `simple`.
+
+            **Must be absent when the resolved schedule_kind is `on_demand`**
+            — sending it in the same request that sets (or leaves) the check
+            at `on_demand` is rejected with 400 (`ON_DEMAND_SCHEDULE_CONFLICT`).
           example: 86400
         cron_expr:
           type: string
-          description: Cron expression (5-field).  Applies when schedule_kind is `cron`.
+          description: |
+            Cron expression (5-field).  Applies when schedule_kind is `cron`.
+
+            **Must be absent when the resolved schedule_kind is `on_demand`**
+            — sending it in the same request that sets (or leaves) the check
+            at `on_demand` is rejected with 400 (`ON_DEMAND_SCHEDULE_CONFLICT`).
           example: "0 3 * * *"
         tz:
           type: string
@@ -406,6 +469,20 @@ components:
             monitor** when sent with a non-null value.  An explicit `null` on an
             `http` monitor is accepted as a no-op.
           example: 300
+        blocked_timeout_s:
+          type: [integer, "null"]
+          format: int64
+          description: |
+            How long (in seconds) a check may sit `blocked` before a `blocked`
+            incident opens.
+
+            **Explicit `null` does NOT mean "wait forever"** — it clears the
+            stored value and falls back to `check.DefaultBlockedTimeout`
+            (24 hours), same as omitting the field on a check that never set
+            it. There is no way to disable the blocked timeout entirely.
+
+            Accepted on every `monitor_type`, including `http`.
+          example: 86400
         failure_threshold:
           type: integer
           format: int64
@@ -414,8 +491,8 @@ components:
           description: |
             Consecutive explicit failures required before an incident opens.
             Applies to the `fail` cause ONLY — `silence`, `overrun`,
-            `never_started` and `runaway` are time- or rate-based and are never
-            gated by it.
+            `never_started`, `runaway`, `stalled` and `blocked` are time- or
+            rate-based and are never gated by it.
 
             Not nullable: the column is `NOT NULL DEFAULT 1`, so there is no
             "unset" state to return to.  An omitted field (or an explicit
@@ -512,6 +589,21 @@ components:
             silently deduplicated.  Send `[]` or `null` to remove all tags;
             omitting the field leaves the stored tags alone.
           example: ["agent:claude", "env:prod"]
+        agent_id:
+          type: [string, "null"]
+          description: |
+            The agent that owns this monitor, by `id` or `slug`. Omitting the
+            field preserves the current attachment; an explicit `null`
+            detaches the monitor (sets its `agent_id` to null) without
+            deleting anything; any other non-empty value re-attaches it,
+            resolved fresh on every request. An explicit empty string `""`
+            is rejected with 400 — unlike `ci_workflow`/`ci_branch`, it is
+            NOT treated as "leave unchanged"; omit the field or send `null`
+            instead.
+
+            **An unknown or foreign agent reference is rejected with 400
+            (`UNKNOWN_AGENT`)** and never implicitly creates the agent.
+          example: "nightly-etl-bot"
 
     Check:
       type: object
@@ -532,7 +624,12 @@ components:
           example: "daily-backup"
         schedule_kind:
           type: string
-          enum: [simple, cron]
+          enum: [simple, cron, on_demand]
+          description: |
+            `on_demand` means the check has no cadence: it never arms an
+            absence deadline, so silence between runs never alerts. Run-scoped
+            detection (`max_runtime_s`, `step_timeout_s`) still applies once a
+            run starts.
           example: "simple"
         period_s:
           type: integer
@@ -570,6 +667,15 @@ components:
             response when unset**, in which case stall detection is disabled.
             Never set on `http` monitors.
           example: 300
+        blocked_timeout_s:
+          type: [integer, "null"]
+          format: int64
+          description: |
+            How long (in seconds) the check may sit `blocked` before a
+            `blocked` incident opens.  **Omitted from the response when
+            unset** — that does NOT mean the check waits forever, it means
+            the 24-hour `check.DefaultBlockedTimeout` fallback applies.
+          example: 86400
         failure_threshold:
           type: integer
           format: int64
@@ -707,6 +813,141 @@ components:
             Labels attached to this monitor. Always returned as an array
             (never null); empty array when no tags are set.
           example: ["agent:claude", "env:prod"]
+        agent_id:
+          type: [string, "null"]
+          format: uuid
+          description: |
+            Id of the agent that owns this monitor. Omitted/null when the
+            monitor is unattached — including right after its owning agent
+            was deleted: `DELETE /api/v1/agents/{id}` unowns the monitors it
+            owned, it does not delete them.
+          example: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+
+    AgentCreate:
+      type: object
+      description: |
+        Body for creating an agent (POST /api/v1/agents). There is no `slug`
+        field: the slug is always derived from `name` (lowercased, any run
+        of characters outside `[a-z0-9]` collapsed to a single hyphen,
+        leading/trailing hyphens trimmed), the same way for every creation
+        path — this endpoint, the dashboard onboarding wizard, and the MCP
+        `register_agent` tool — so none of them can produce a row shaped
+        differently from another.
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          description: Human-readable agent name. The slug is derived from this value.
+          example: "Nightly ETL bot"
+        description:
+          type: string
+          description: Optional free-text description.
+          example: "Runs the nightly ETL pipeline and owns its monitors."
+
+    AgentPatch:
+      type: object
+      description: |
+        Body for updating an agent (PATCH /api/v1/agents/{id}), using JSON
+        Merge Patch semantics (RFC 7396).
+
+        - **Omitted field** — the stored value is left unchanged.
+        - **Explicit `null`** — clears the value. Only `description` accepts
+          `null` (the column is `NOT NULL DEFAULT ''`, so an explicit `null`
+          maps to `""`).
+        - **Any other value** — replaces the stored value.
+
+        `name` has no meaningful "unset" state: an explicit `null` falls back
+        to the stored value, same as omitting it — it can never be blanked.
+        `slug` is immutable after creation and is not accepted here.
+      properties:
+        name:
+          type: string
+          description: Human-readable agent name.
+          example: "Nightly ETL bot"
+        description:
+          type: [string, "null"]
+          description: |
+            Free-text description. Explicit `null` clears it to `""`;
+            omitting the field leaves the stored value unchanged.
+          example: "Runs the nightly ETL pipeline and owns its monitors."
+
+    Agent:
+      type: object
+      description: |
+        An agent resource returned by the API. `status` is never stored — it
+        is rolled up live from the monitors this agent owns, the same pure
+        function the fleet dashboard and the MCP tools use, so the three
+        surfaces cannot drift apart on what "healthy" means.
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Unique agent identifier.
+          example: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+        slug:
+          type: string
+          description: |
+            Stable project-scoped identifier, derived from `name` at creation
+            and immutable thereafter.
+          example: "nightly-etl-bot"
+        name:
+          type: string
+          description: Human-readable name.
+          example: "Nightly ETL bot"
+        description:
+          type: string
+          description: Free-text description (empty string if not set).
+          example: "Runs the nightly ETL pipeline and owns its monitors."
+        status:
+          type: string
+          enum: [down, blocked, late, running, up, pending, idle]
+          description: |
+            Rolled up live from the monitors this agent owns, worst status
+            first: down > blocked > late > running > up > pending > idle.
+            Paused and in-maintenance monitors never contribute: muting a
+            monitor must neither hide a broken agent nor drag a healthy one
+            down.
+
+            - `down` — at least one owned, active monitor is down.
+            - `blocked` — no active monitor is down, but at least one owned
+              monitor has a run that is blocked on a human right now. This is
+              an alert-class state, not merely informational: it is excluded
+              from the notifier's info rate class precisely so it cannot be
+              starved by high-volume traffic.
+            - `late` — no active monitor is down or blocked, but at least one
+              is late.
+            - `running` — no active monitor is down, blocked or late, but at
+              least one owned monitor has a run currently in flight.
+            - `up` — no active monitor is down, blocked, late or running, and
+              at least one is up.
+            - `pending` — the agent owns at least one monitor, but none of its
+              active monitors has ever reported (only ever seen `new`). This
+              usually means the wiring is wrong — the agent registered but
+              never pinged.
+            - `idle` — the agent owns no monitors, or every monitor it owns is
+              paused or in maintenance. There is nothing to judge yet.
+          example: "up"
+        monitor_count:
+          type: integer
+          format: int64
+          description: Number of monitors this agent owns. `0` for an agent with no monitors.
+          example: 3
+        last_seen:
+          type: [string, "null"]
+          format: date-time
+          description: |
+            RFC 3339 timestamp: `MAX(last_ping_at)` across ALL monitors this
+            agent owns, including paused and in-maintenance ones — this
+            answers "when did I last hear from this agent at all", not "is it
+            healthy". Null or omitted for an agent that has never received a
+            ping on any of its monitors.
+          example: "2026-07-10T03:00:05Z"
+        created_at:
+          type: string
+          format: date-time
+          description: RFC 3339 UTC timestamp when the agent was created.
+          example: "2026-07-01T12:00:00Z"
 
     ChannelCreate:
       type: object
@@ -994,7 +1235,12 @@ components:
           example: "a0b1c2d3-0000-0000-0000-000000000001"
         kind:
           type: string
-          description: Ping kind (e.g. `success`, `start`, `fail`).
+          description: |
+            Ping kind. One of `success`, `start`, `fail`, `log`, `cancel`,
+            `blocked`, `note`. `blocked` marks the run as waiting on a human
+            (pauses run-clock detection until cleared); `note` is a labelled
+            informational signal that carries free text in the request body,
+            visible here via `body_excerpt`.
           example: "success"
         rid:
           type: string
@@ -1035,8 +1281,15 @@ components:
           example: "2026-07-10T04:00:00Z"
         cause:
           type: string
-          description: Machine-readable cause string (e.g. `late`, `fail`).
-          example: "late"
+          description: |
+            Machine-readable cause string. One of `silence` (no ping by the
+            expected deadline), `fail` (an explicit failure ping),
+            `overrun` (a run exceeded its budget), `never_started` (the
+            first scheduled run never started), `runaway` (pinging far
+            faster than expected), `stalled` (a run stopped reporting
+            progress), or `blocked` (a run sat blocked, waiting on a human,
+            longer than `blocked_timeout_s`).
+          example: "silence"
         detail:
           type: string
           description: |
@@ -1048,9 +1301,12 @@ components:
     CIRun:
       type: object
       description: |
-        A single CI/CD run entry with structured failure context decoded from ci_meta
-        and the nearest correlated incident. Designed for agent consumption: all
-        fields are flat (no nesting) so failure triage does not require link-following.
+        A single run entry — either a CI/CD run (structured failure context
+        decoded from `ci_meta`) or an agent/heartbeat run (only `rid` set, no
+        `ci_meta`) — plus the nearest correlated incident. Designed for agent
+        consumption: all fields are flat (no nesting) so failure triage does not
+        require link-following. Fields marked "CI-only" below are omitted
+        entirely on an agent/heartbeat run.
       properties:
         id:
           type: string
@@ -1059,7 +1315,10 @@ components:
           example: "a0b1c2d3-0000-0000-0000-000000000001"
         kind:
           type: string
-          description: Ping kind (`success`, `fail`, `start`, etc.).
+          description: |
+            Ping kind. One of `success`, `start`, `fail`, `log`, `cancel`,
+            `blocked`, `note` (see the `Ping` schema); CI/CD webhooks
+            typically post `success` or `fail`.
           example: "fail"
         received_at:
           type: string
@@ -1090,24 +1349,33 @@ components:
             $ref: "#/components/schemas/RunStep"
         run_url:
           type: string
-          description: Direct URL to the CI/CD run page (omitted when unavailable).
+          description: |
+            CI-only. Direct URL to the CI/CD run page. Omitted when unavailable,
+            and always omitted on an agent/heartbeat run.
           example: "https://github.com/acme/repo/actions/runs/9876543210"
         commit_sha:
           type: string
-          description: Full or abbreviated commit SHA that triggered the run (omitted when unavailable).
+          description: |
+            CI-only. Full or abbreviated commit SHA that triggered the run.
+            Omitted when unavailable, and always omitted on an agent/heartbeat run.
           example: "deadbeefcafe0000"
         branch:
           type: string
-          description: Branch name that triggered the run (omitted when unavailable).
+          description: |
+            CI-only. Branch name that triggered the run. Omitted when
+            unavailable, and always omitted on an agent/heartbeat run.
           example: "main"
         actor:
           type: string
-          description: Username or identity that triggered the run (omitted when unavailable).
+          description: |
+            CI-only. Username or identity that triggered the run. Omitted when
+            unavailable, and always omitted on an agent/heartbeat run.
           example: "octocat"
         failing_stage:
           type: string
           description: |
-            Name of the failing step or job (omitted when unavailable).
+            CI-only. Name of the failing step or job (omitted when unavailable,
+            and always omitted on an agent/heartbeat run).
 
             Availability differs by provider:
               * **GitLab CI** — always populated on a failed pipeline, from the
@@ -1124,17 +1392,23 @@ components:
         duration_s:
           type: integer
           format: int64
-          description: Run duration in seconds (omitted when unavailable or zero).
+          description: |
+            CI-only. Run duration in seconds. Omitted when unavailable or zero,
+            and always omitted on an agent/heartbeat run.
           example: 120
         outcome:
           type: string
-          description: Normalised run outcome string from the CI provider (e.g. `failure`, `success`).
+          description: |
+            CI-only. Normalised run outcome string from the CI provider (e.g.
+            `failure`, `success`). Always omitted on an agent/heartbeat run.
           example: "failure"
         incident_cause:
           type: string
           description: |
-            Cause from the correlated incident (e.g. `late`, `fail`) if one was
-            opened within ±10 minutes of this run. Empty when no incident correlates.
+            Cause from the correlated incident (e.g. `silence`, `fail`,
+            `overrun`, `never_started`, `runaway`, `stalled`, `blocked`) if
+            one was opened within ±10 minutes of this run. Empty when no
+            incident correlates.
           example: "fail"
         incident_detail:
           type: string
@@ -1592,8 +1866,9 @@ paths:
         - **Omitted field** — the stored value is left unchanged.
         - **Explicit `null`** — clears the value. Supported on `runaway_ceiling`,
           `max_runtime_s`, `step_timeout_s`, `monitor_from`, `ci_workflow`,
-          `ci_branch`, and `tags` only; for `tags`, explicit `null` is
-          equivalent to sending `[]`.
+          `ci_branch`, `tags`, and `agent_id` only; for `tags`, explicit `null`
+          is equivalent to sending `[]`; for `agent_id`, explicit `null`
+          detaches the monitor from its agent without deleting either of them.
           `failure_threshold` is NOT clearable (the column is `NOT NULL DEFAULT
           1`); a `null` there is treated as omission.
         - **Any other value** — replaces the stored value.
@@ -1945,8 +2220,34 @@ paths:
         `{check_name}`, `{event}`, `{status}`, `{cause}`, `{last_ping}`,
         `{schedule}`, `{incident_url}`, `{run_url}`, `{branch}`, `{commit}`,
         `{actor}`, `{failing_stage}`, `{duration}`, `{latency}`, `{status_code}`,
-        `{url}`, `{last_step}`, `{step_count}`, `{run_duration}`.  Unknown
-        placeholders are **rejected** at write time.
+        `{url}`, `{last_step}`, `{step_count}`, `{run_duration}`, `{body}`,
+        `{detail}`.
+        Unknown placeholders are **rejected** at write time. `{body}` is the
+        triggering ping's free-text body (`body_excerpt`, see the `Ping`
+        schema), truncated to 500 characters with a trailing "…" if longer
+        (every channel's message-size limit is smaller than the 10000-byte
+        stored excerpt, so the cap is applied once, centrally, rather than
+        per channel). It is populated for every event type that is emitted
+        FROM an incoming ping — `note`, `blocked`, `every-run`, `success`,
+        `started`, `fail` (the failing ping's body for cause `fail`, or
+        whichever ping tripped the rate ceiling for cause `runaway`), and
+        `recovery` (the closing success ping's body) — from that ping's own
+        `body_excerpt`, and renders empty when that ping had none. It always
+        renders empty for `down`: that event comes from the absence
+        detector's wall-clock sweep (`silence`, `overrun`, `stalled`,
+        `never_started`, or a `blocked_timeout_s` expiry), which has no
+        incoming ping to read a body from. It also always renders empty for
+        the destinations page's
+        synthetic "send test alert" action, which has no ping at all.
+
+        `{detail}` is the CI failure excerpt from the incident's `detail`
+        field (see `POST /ci/{id}/detail` and the `Incident` schema), truncated
+        with the same 500-character cap as `{body}`. It is DISTINCT from
+        `{body}`: `{body}` is what the agent's own ping said; `{detail}` is
+        what the CI job separately posted. It is populated only when the
+        incident is CI-bound and a detail was posted, and renders empty
+        otherwise — including when the detail POST arrives after the alert
+        has already been sent, since the two requests race independently.
 
         `{last_step}`, `{step_count}` and `{run_duration}` describe the run that
         was in flight when the incident opened, and are populated on `stalled`
@@ -2032,8 +2333,8 @@ paths:
 
                     Keys are a bare event type (`down`, `recovery`, `fail`,
                     `every-run`, `success`, `started`, `blocked`, `note`) or
-                    `event_type/cause` (e.g. `"down/silence"`, `"down/overrun"`,
-                    `"down/never_started"`, `"fail/runaway"`).
+                    `event_type/cause` (e.g. `"down/silence"`,
+                    `"down/overrun"`, `"down/never_started"`, `"fail/runaway"`).
 
                     Absent keys or empty-string values reset that key to the
                     built-in plain-language default.
@@ -2100,6 +2401,220 @@ paths:
           $ref: "#/components/responses/RateLimited"
 
   # ── Channels ─────────────────────────────────────────────────────────────────
+
+  /api/v1/agents:
+    post:
+      operationId: createAgent
+      summary: Create an agent
+      description: |
+        Creates a new agent for the authenticated project and returns 201.
+        There is no `slug` field in the request: the slug is always derived
+        from `name`, the same way for every creation path (this endpoint,
+        the dashboard onboarding wizard, and the MCP `register_agent` tool),
+        so the three surfaces can never produce a row shaped differently.
+
+        A brand-new agent owns no monitors: `status` is `idle`,
+        `monitor_count` is `0`, and `last_seen` is null.
+      tags: [Agents]
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AgentCreate"
+            example:
+              name: "Nightly ETL bot"
+              description: "Runs the nightly ETL pipeline and owns its monitors."
+      responses:
+        "201":
+          description: Agent created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Agent"
+        "400":
+          description: Invalid request body, or a name that cannot be slugified.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "409":
+          description: An agent with the derived slug already exists in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+    get:
+      operationId: listAgents
+      summary: List agents
+      description: |
+        Returns all agents for the authenticated project as a JSON array
+        (never null), each with its status rolled up live from the monitors
+        it owns.
+      tags: [Agents]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: Array of agents (may be empty).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Agent"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/agents/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: UUID of the agent.
+        schema:
+          type: string
+          format: uuid
+        example: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+
+    get:
+      operationId: getAgent
+      summary: Get an agent
+      description: |
+        Returns the agent for the authenticated project, with its status
+        rolled up live. 404 if not found (or belongs to another project) —
+        there is no existence oracle.
+      tags: [Agents]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: The agent.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Agent"
+        "400":
+          description: id is not a valid UUID.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: Agent not found in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+    patch:
+      operationId: updateAgent
+      summary: Update an agent
+      description: |
+        Partially updates an agent using JSON Merge Patch semantics (RFC 7396):
+
+        - **Omitted field** — the stored value is left unchanged.
+        - **Explicit `null`** — clears the value. Only `description` accepts
+          `null` (the column is `NOT NULL DEFAULT ''`, so an explicit `null`
+          maps to `""`).
+        - **Any other value** — replaces the stored value.
+
+        `name` has no meaningful "unset" state: an explicit `null` falls back
+        to the stored value, same as omitting it — it can never be blanked.
+        `slug` is immutable after creation and is ignored if present.
+      tags: [Agents]
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AgentPatch"
+            example:
+              description: "Runs the nightly ETL pipeline; now also owns the weekly reconciliation job."
+      responses:
+        "200":
+          description: Updated agent.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Agent"
+        "400":
+          description: Invalid request body, or name blanked to empty.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: Agent not found in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+    delete:
+      operationId: deleteAgent
+      summary: Delete an agent
+      description: |
+        Permanently removes the agent from the project and returns 204 No
+        Content.
+
+        **This does NOT delete the agent's monitors.** Every monitor it owned
+        has its `agent_id` set to null (`ON DELETE SET NULL`) and keeps
+        running, keeps its ping history and incidents, and keeps alerting
+        exactly as before — it simply becomes unowned. To remove the
+        monitors themselves, delete them individually via
+        `DELETE /api/v1/checks/{id}`.
+      tags: [Agents]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "204":
+          description: Agent deleted. Its former monitors are unowned, not deleted.
+        "400":
+          description: id is not a valid UUID.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: Agent not found in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
 
   /api/v1/channels:
     post:
@@ -3427,23 +3942,28 @@ paths:
 
     get:
       operationId: listCIRuns
-      summary: List CI/CD run history for a check
+      summary: List run history for a check (CI/CD runs and agent/heartbeat runs)
       description: |
-        Returns the last N CI/CD runs for the check that carry structured
-        `ci_meta` (pings received from a CI/CD provider webhook), newest first.
+        Returns the last N runs for the check, newest first — both CI/CD runs
+        (pings that carry structured `ci_meta`, received from a CI/CD provider
+        webhook) and agent/heartbeat runs (pings that carry only a `rid` set at
+        `/start`, with no `ci_meta`). A ping with neither `ci_meta` nor a `rid`
+        is not a run and is excluded.
 
-        Each entry includes the full failure context decoded from `ci_meta`:
+        CI runs include the full failure context decoded from `ci_meta`:
         `run_url`, `commit_sha`, `branch`, `actor`, `failing_stage`, `duration_s`,
-        and `outcome`. When a matching incident (opened within ±10 minutes of the
-        ping) exists, `incident_cause`, `incident_detail`, and `incident_resolved`
-        are populated — enabling unattended failure triage without following links
-        to the CI provider.
+        and `outcome`. These fields are CI-only — they are simply absent
+        (omitted, not null or empty string) on an agent/heartbeat run. When a
+        matching incident (opened within ±10 minutes of the ping) exists,
+        `incident_cause`, `incident_detail`, and `incident_resolved` are
+        populated on either kind — enabling unattended failure triage without
+        following links to the CI provider.
 
-        Each entry also carries the run id (`rid`) and, when the run reported
+        Every entry also carries the run id (`rid`) and, when the run reported
         progress markers to `/<uuid>/step?rid=…`, the `steps` it reached. A run
         that stalled therefore names the step it wedged on without a second
-        call. Steps are matched on `rid`, so they appear only when the job posts
-        `/step` with the same run id the CI webhook reports.
+        call. Steps are matched on `rid`, so they appear only when the job or
+        agent posts `/step` with the same run id it started with.
 
         Always returns a JSON array (never null).
       tags: [CI]
@@ -3453,7 +3973,7 @@ paths:
         - name: limit
           in: query
           required: false
-          description: Maximum number of CI runs to return (default 20, max 100).
+          description: Maximum number of runs to return (default 20, max 100).
           schema:
             type: integer
             default: 20
@@ -3461,7 +3981,7 @@ paths:
             example: 20
       responses:
         "200":
-          description: Array of CI runs (may be empty).
+          description: Array of runs — CI runs and agent/heartbeat runs (may be empty).
           content:
             application/json:
               schema:

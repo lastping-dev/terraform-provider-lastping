@@ -41,7 +41,7 @@ func (p *lastpingProvider) Metadata(_ context.Context, _ provider.MetadataReques
 
 func (p *lastpingProvider) Schema(_ context.Context, _ provider.SchemaRequest, resp *provider.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "Manage LastPing monitors, destinations, routing, alert messages, " +
+		MarkdownDescription: "Manage LastPing monitors, agents, destinations, routing, alert messages, " +
 			"status pages and API keys as code.",
 		Attributes: map[string]schema.Attribute{
 			"endpoint": schema.StringAttribute{
@@ -104,6 +104,7 @@ func (p *lastpingProvider) Resources(context.Context) []func() resource.Resource
 		NewAlertTemplateResource,
 		NewStatusPageResource,
 		NewAPIKeyResource,
+		NewAgentResource,
 	}
 }
 
