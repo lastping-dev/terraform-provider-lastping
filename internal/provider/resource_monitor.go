@@ -143,6 +143,12 @@ type monitorResourceModel struct {
 	// replace-the-set PUT, so they are read and written separately from every
 	// other attribute here. See monitor_assertions.go.
 	Assertions types.Set `tfsdk:"assertion"`
+
+	// Guards is the `metric_guard` nested block set, a second sub-resource on
+	// the same terms as Assertions: its own replace-the-set PUT, read and
+	// written separately from every other attribute here. See
+	// monitor_guards.go.
+	Guards types.Set `tfsdk:"metric_guard"`
 }
 
 func (r *monitorResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -396,7 +402,8 @@ func (r *monitorResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 			},
 		},
 		Blocks: map[string]schema.Block{
-			"assertion": monitorAssertionBlock(),
+			"assertion":    monitorAssertionBlock(),
+			"metric_guard": monitorGuardBlock(),
 		},
 	}
 }
@@ -442,6 +449,9 @@ func (r *monitorResource) ValidateConfig(ctx context.Context, req resource.Valid
 	// lives inside validateAssertions — so this runs before the http early
 	// return below rather than inside either branch.
 	validateAssertions(ctx, cfg, resp)
+	// Guards carry their own http rule too, for the same reason: a probe has no
+	// ping body, so a guard on one could never be evaluated.
+	validateGuards(ctx, cfg, resp)
 
 	if cfg.MonitorType.IsUnknown() || cfg.MonitorType.ValueString() != "http" {
 		// Not an http monitor, so step_timeout_s is legal — but it still has to
@@ -978,6 +988,32 @@ func (r *monitorResource) Create(ctx context.Context, req resource.CreateRequest
 	}
 	state.Assertions = assertionSet
 
+	// Metric guards are a second sub-resource, applied on exactly the same
+	// terms: a freshly created monitor has none, so the current set is known to
+	// be empty without asking.
+	desiredGuards, err := guardsFromModel(ctx, plan.Guards)
+	if err != nil {
+		resp.Diagnostics.AddError("Unable to build metric guards payload", err.Error())
+		return
+	}
+	appliedGuards, err := r.syncGuards(ctx, out.ID, desiredGuards, []client.MetricGuard{})
+	if err != nil {
+		// As above: the monitor exists, so state is saved before the error to
+		// stop the next apply from creating it a second time. state already
+		// carries the assertions that were written a few lines up.
+		resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
+		resp.Diagnostics.AddError("Unable to set monitor metric guards",
+			fmt.Sprintf("The monitor was created, but its metric guards were not written: %s\n\n"+
+				"The monitor is in state; re-running the apply will retry the guards alone.", err))
+		return
+	}
+	guardSet, gDiags := guardsToModel(ctx, appliedGuards, plan.Guards)
+	resp.Diagnostics.Append(gDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	state.Guards = guardSet
+
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
@@ -1020,6 +1056,20 @@ func (r *monitorResource) Read(ctx context.Context, req resource.ReadRequest, re
 		return
 	}
 	newState.Assertions = assertionSet
+
+	// Guards live behind their own endpoint too, so a guard added or removed
+	// outside Terraform is invisible to `terraform plan` without this call.
+	currentGuards, err := r.client.GetMetricGuards(ctx, state.ID.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddError("Unable to read monitor metric guards", err.Error())
+		return
+	}
+	guardSet, gDiags := guardsToModel(ctx, currentGuards, state.Guards)
+	resp.Diagnostics.Append(gDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	newState.Guards = guardSet
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &newState)...)
 }
@@ -1174,6 +1224,28 @@ func (r *monitorResource) Update(ctx context.Context, req resource.UpdateRequest
 		return
 	}
 	newState.Assertions = assertionSet
+
+	// Guards come from the CONFIGURATION for the same reason assertions do: the
+	// block is Optional with no server default, so an absent block has to mean
+	// "clear them" -- guardsFromModel turns it into the empty set -- and
+	// syncGuards reads the stored set first, so an apply that leaves the guards
+	// alone issues no write at all.
+	desiredGuards, err := guardsFromModel(ctx, cfg.Guards)
+	if err != nil {
+		resp.Diagnostics.AddError("Unable to build metric guards payload", err.Error())
+		return
+	}
+	appliedGuards, err := r.syncGuards(ctx, id, desiredGuards, nil)
+	if err != nil {
+		resp.Diagnostics.AddError("Unable to update monitor metric guards", err.Error())
+		return
+	}
+	guardSet, gDiags := guardsToModel(ctx, appliedGuards, plan.Guards)
+	resp.Diagnostics.Append(gDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	newState.Guards = guardSet
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &newState)...)
 }
