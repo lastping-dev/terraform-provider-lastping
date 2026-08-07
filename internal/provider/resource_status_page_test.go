@@ -370,8 +370,13 @@ resource "lastping_status_page" "mine" {
 				ResourceName:  "lastping_status_page.mine",
 				ImportState:   true,
 				ImportStateId: foreignSlug,
+				// Same message shape as the agent "not found" diagnostic,
+				// which wraps between "in this" and "project." at the widths
+				// the renderer uses in CI - \s+ tolerates that wrap instead
+				// of depending on this exact slug length staying just short
+				// enough to stay on one line.
 				ExpectError: regexp.MustCompile(
-					`No status page found with slug or ID "` + foreignSlug + `" in this project`),
+					`No\s+status\s+page\s+found\s+with\s+slug\s+or\s+ID\s+"` + foreignSlug + `"\s+in\s+this\s+project`),
 			},
 			{
 				// The same message for a slug nobody owns: the two cases must be
@@ -380,7 +385,7 @@ resource "lastping_status_page" "mine" {
 				ImportState:   true,
 				ImportStateId: "acc-nobody-owns-this",
 				ExpectError: regexp.MustCompile(
-					`No status page found with slug or ID "acc-nobody-owns-this" in this project`),
+					`No\s+status\s+page\s+found\s+with\s+slug\s+or\s+ID\s+"acc-nobody-owns-this"\s+in\s+this\s+project`),
 			},
 		},
 	})

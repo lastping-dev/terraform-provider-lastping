@@ -211,7 +211,14 @@ func (r *agentResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 			"monitor_count": schema.Int64Attribute{
 				Computed: true,
 				MarkdownDescription: "How many monitors this agent owns. Counted live, so it changes as " +
-					"monitors are attached and detached elsewhere.",
+					"monitors are attached and detached elsewhere.\n\n" +
+					"~> **This value is only as fresh as the last refresh of this resource.** If a " +
+					"`lastping_monitor` in the same configuration attaches to this agent, that attach " +
+					"happens after this agent is read, so `monitor_count` in the state produced by that " +
+					"same `terraform apply` still shows the count from before the attach. It catches up " +
+					"on the next `terraform plan` or `terraform refresh`, once this resource is read " +
+					"again - Terraform does not re-read a resource's computed attributes just because a " +
+					"different resource, later in the same apply, made them stale.",
 			},
 			"last_seen": schema.StringAttribute{
 				Computed: true,

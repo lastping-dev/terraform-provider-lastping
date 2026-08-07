@@ -151,8 +151,12 @@ func TestAccAgent_createDoesNotAdoptExisting(t *testing.T) {
 resource "lastping_agent" "adopt" {
   name = "ACC   Agent / Adopt"
 }`,
+				// A literal-space match here happens to sit right at a wrap
+				// boundary today, which makes it one word of message drift
+				// away from breaking the same way the pattern below did.
+				// \s+ makes it wrap-proof instead of merely wrap-lucky.
 				ExpectError: regexp.MustCompile(
-					`An agent with slug "acc-agent-adopt" already exists in this project`),
+					`An\s+agent\s+with\s+slug\s+"acc-agent-adopt"\s+already\s+exists\s+in\s+this\s+project`),
 			},
 		},
 	})
@@ -177,8 +181,11 @@ resource "lastping_agent" "mine" {
 				ResourceName:  "lastping_agent.mine",
 				ImportState:   true,
 				ImportStateId: "acc-agent-that-does-not-exist",
+				// This wraps between "in this" and "project." at the widths
+				// the renderer actually uses in CI, so a literal space here
+				// fails deterministically. \s+ tolerates the wrap.
 				ExpectError: regexp.MustCompile(
-					`No agent found with slug or ID "acc-agent-that-does-not-exist" in this project`),
+					`No\s+agent\s+found\s+with\s+slug\s+or\s+ID\s+"acc-agent-that-does-not-exist"\s+in\s+this\s+project`),
 			},
 		},
 	})

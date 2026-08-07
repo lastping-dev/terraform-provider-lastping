@@ -363,6 +363,20 @@ resource "lastping_monitor" "mr" {
 // lastping_agent resource in the same apply, which is the scenario the whole
 // feature exists for: a Terraform-managed fleet where monitor_count and
 // status roll up from monitors this same configuration attached.
+//
+// monitor_count assertions live in their own RefreshState steps rather than
+// in the Check of the step that attaches or detaches the monitor. Within a
+// single apply, lastping_agent.a is read (Create's response, in the attach
+// case) before lastping_monitor.ag is created against it, and nothing forces
+// a second read of the agent afterwards - Terraform does not re-read a
+// resource's computed attributes just because a different resource's apply,
+// later in the same plan, made them stale. So immediately after the apply
+// that attaches or detaches, state still holds whatever monitor_count was as
+// of the agent's own last read: the pre-attach value. A dedicated
+// RefreshState step forces the re-read `terraform refresh` would do, which is
+// the only way this ever becomes visible outside the provider - see the
+// `monitor_count` schema description for the same caveat spelled out for
+// practitioners.
 func TestAccMonitor_agentIDAttachAndDetach(t *testing.T) {
 	const attachedToFirst = `
 resource "lastping_agent" "a" {
@@ -417,6 +431,18 @@ resource "lastping_monitor" "ag" {
 				Config: attachedToFirst,
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttrPair("lastping_monitor.ag", "agent_id", "lastping_agent.a", "id"),
+				),
+			},
+			{
+				// Proves the attach actually took: force the re-read that
+				// `terraform refresh` would do, and only then check
+				// monitor_count. Checking it as part of the step above would
+				// prove nothing either way - lastping_agent.a is read before
+				// lastping_monitor.ag is created against it in that same
+				// apply, so it would read 0 whether or not the attach
+				// server-side worked.
+				RefreshState: true,
+				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr("lastping_agent.a", "monitor_count", "1"),
 					resource.TestCheckResourceAttr("lastping_agent.b", "monitor_count", "0"),
 				),
@@ -433,6 +459,13 @@ resource "lastping_monitor" "ag" {
 				},
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttrPair("lastping_monitor.ag", "agent_id", "lastping_agent.b", "id"),
+				),
+			},
+			{
+				// Same reasoning as the RefreshState step above, for the
+				// move from agent a to agent b.
+				RefreshState: true,
+				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr("lastping_agent.a", "monitor_count", "0"),
 					resource.TestCheckResourceAttr("lastping_agent.b", "monitor_count", "1"),
 				),
@@ -441,7 +474,6 @@ resource "lastping_monitor" "ag" {
 				Config: detached,
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckNoResourceAttr("lastping_monitor.ag", "agent_id"),
-					resource.TestCheckResourceAttr("lastping_agent.b", "monitor_count", "0"),
 					// Read it back from the API: state agreeing with the plan
 					// proves nothing when the plan said "removed" and the server
 					// was never told.
@@ -455,6 +487,13 @@ resource "lastping_monitor" "ag" {
 						}
 						return nil
 					}),
+				),
+			},
+			{
+				// Same reasoning again, for the detach.
+				RefreshState: true,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("lastping_agent.b", "monitor_count", "0"),
 				),
 			},
 			{

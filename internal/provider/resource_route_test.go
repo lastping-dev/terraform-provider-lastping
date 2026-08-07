@@ -537,8 +537,16 @@ resource "lastping_route" "down" {
 				ResourceName:  "lastping_route.down",
 				ImportState:   true,
 				ImportStateId: "3f7c1f5a-1a2b-4c3d-8e9f-0a1b2c3d4e5f:sideways",
+				// The diagnostic renderer hard-wraps detail text at a fixed
+				// column count, so literal spaces in a long enumeration like
+				// this one are not safe to match verbatim: a wrap can fall
+				// between any two of these tokens, turning the space into a
+				// newline. \s+ matches either. (?s) alone does not help here
+				// - it only makes "." match a newline, and there is no "."
+				// standing in for these spaces.
 				ExpectError: regexp.MustCompile(
-					`(?s)not one of down, recovery, fail, every-run, success, started, blocked, note`),
+					`(?s)not\s+one\s+of\s+down,\s+recovery,\s+fail,\s+every-run,\s+success,\s+` +
+						`started,\s+blocked,\s+note`),
 			},
 		},
 	})
@@ -581,8 +589,11 @@ resource "lastping_route" "down" {
   event_type      = "down"
   destination_ids = [lastping_destination.second.id]
 }`,
+				// The "terraform import ..." line is long enough on its own
+				// to be re-wrapped by the renderer, so the space before the
+				// UUID has to tolerate becoming a newline too.
 				ExpectError: regexp.MustCompile(
-					`(?s)Route already exists.*terraform import lastping_route\.<name> [0-9a-f-]+:down`),
+					`(?s)Route already exists.*terraform\s+import\s+lastping_route\.<name>\s+[0-9a-f-]+:down`),
 			},
 			{
 				// Assert against the server, not state: a refusal that had
@@ -848,8 +859,11 @@ resource "lastping_route" "down" {
   event_type      = "down"
   destination_ids = [lastping_destination.second.id]
 }`,
+				// The "terraform import ..." line is long enough on its own
+				// to be re-wrapped by the renderer, so the space before the
+				// UUID has to tolerate becoming a newline too.
 				ExpectError: regexp.MustCompile(
-					`(?s)Route already exists.*terraform import lastping_route\.<name> [0-9a-f-]+:down`),
+					`(?s)Route already exists.*terraform\s+import\s+lastping_route\.<name>\s+[0-9a-f-]+:down`),
 			},
 			{
 				Config: routeFixtures,

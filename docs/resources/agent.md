@@ -97,6 +97,8 @@ resource "lastping_agent" "deploy" {
 - `id` (String) Agent UUID, assigned by the server.
 - `last_seen` (String) RFC 3339 UTC timestamp of the most recent ping across **all** monitors this agent owns, including paused and in-maintenance ones — it answers "when did I last hear from this agent at all", not "is it healthy". Null until one of its monitors is first pinged.
 - `monitor_count` (Number) How many monitors this agent owns. Counted live, so it changes as monitors are attached and detached elsewhere.
+
+~> **This value is only as fresh as the last refresh of this resource.** If a `lastping_monitor` in the same configuration attaches to this agent, that attach happens after this agent is read, so `monitor_count` in the state produced by that same `terraform apply` still shows the count from before the attach. It catches up on the next `terraform plan` or `terraform refresh`, once this resource is read again - Terraform does not re-read a resource's computed attributes just because a different resource, later in the same apply, made them stale.
 - `slug` (String) Stable, project-scoped identifier derived from `name` at creation and immutable thereafter. Use it to import the agent, and to attach monitors to it — the API accepts either the slug or the UUID wherever an agent is referenced.
 - `status` (String) Health rolled up live from the monitors this agent owns, worst first: `down`, `blocked` (a run is waiting on a human), `late`, `running` (a run is in flight), `up`, `pending` (a monitor exists but has never reported — usually broken wiring) or `idle` (no monitors, or all of them paused or in maintenance). Paused and in-maintenance monitors never contribute. Never stored, so it changes without any configuration change.
 
