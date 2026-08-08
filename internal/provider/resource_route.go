@@ -32,19 +32,27 @@ var (
 // routeEventTypes is the set the API accepts (api/routes.go: validEventTypes).
 //
 // This is NOT the same set the API auto-routes on monitor creation
-// (api/defaultdest.go: defaultAlertEvents), which is down/fail/recovery only.
-// every-run, success, started, blocked and note are deliberately absent
-// there, so widening this slice must not widen the adoption exemption in
-// routeIsServerDefault.
+// (api/defaultdest.go: defaultAlertEvents), which is down/fail/recovery/blocked.
+// every-run, success, started and note are deliberately absent there -- they are
+// RateClassInfo, one or more per run, and auto-routing them would mail a user on
+// every task transition. Widening this slice must not widen the adoption
+// exemption in routeIsServerDefault.
 var routeEventTypes = []string{
 	"down", "recovery", "fail", "every-run", "success", "started", "blocked", "note",
 }
 
 // defaultAlertEvents mirrors api/defaultdest.go: the events the API attaches to
 // the project's default email destination when a monitor is created. Kept
-// separate from routeEventTypes on purpose — every-run, success and started are
-// routable but are never auto-routed.
-var defaultAlertEvents = []string{"down", "fail", "recovery"}
+// separate from routeEventTypes on purpose — every-run, success, started and
+// note are routable but are never auto-routed.
+//
+// blocked joined this set on 2026-08-08. It means an agent has stopped and is
+// waiting on a human, and it was silent by default, which is the whole point of
+// the signal. It MUST stay in lockstep with the API: if the provider still
+// thought the default set were three events, a blocked route declared in the
+// same apply as its monitor would collide with the one the server just created
+// and fail as an adoption conflict.
+var defaultAlertEvents = []string{"down", "fail", "recovery", "blocked"}
 
 // uuidValidator rejects a value the API could only answer with an opaque
 // "invalid JSON body" 400, because it decodes ids straight into uuid.UUID.

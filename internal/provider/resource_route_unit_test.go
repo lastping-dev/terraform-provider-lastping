@@ -68,16 +68,27 @@ func TestParseRouteImportID(t *testing.T) {
 // Terraform to silently take over a route a person created by hand — the exact
 // clobber the whole adoption guard exists to prevent.
 func TestRouteEventTypeSetsStayDistinct(t *testing.T) {
-	require.Equal(t, []string{"down", "fail", "recovery"}, defaultAlertEvents,
-		"defaultAlertEvents mirrors api/defaultdest.go and must not grow with routeEventTypes")
+	require.Equal(t, []string{"down", "fail", "recovery", "blocked"}, defaultAlertEvents,
+		"defaultAlertEvents mirrors api/defaultdest.go and must not drift from it")
 
-	for _, e := range routeEventTypes {
-		if e == "down" || e == "fail" || e == "recovery" {
-			continue
-		}
+	// The invariant is not the literal list, it is the CLASS. The API auto-routes
+	// its RateClassAlert events and never its RateClassInfo ones: every-run,
+	// success, started and note fire one or more times per run, so auto-routing
+	// them would mail a user on every task transition. Listing any of them here
+	// would also make routeIsServerDefault adopt a route a person wrote by hand.
+	//
+	// blocked is RateClassAlert and joined the set on 2026-08-08; it means an
+	// agent is waiting on a human, and it was silent by default until then.
+	neverAutoRouted := []string{"every-run", "success", "started", "note"}
+	for _, e := range neverAutoRouted {
+		require.Contains(t, routeEventTypes, e, "%s must still be routable by hand", e)
 		require.NotContains(t, defaultAlertEvents, e,
-			"%s is routable but is never auto-routed; listing it here would make routeIsServerDefault "+
-				"adopt a route a person wrote by hand", e)
+			"%s is RateClassInfo: routable, but must never be auto-routed", e)
+	}
+
+	for _, e := range defaultAlertEvents {
+		require.Contains(t, routeEventTypes, e,
+			"%s is auto-routed but is not in the routable set, which cannot be right", e)
 	}
 }
 
