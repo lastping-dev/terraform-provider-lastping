@@ -801,15 +801,27 @@ resource "lastping_route" "recovery" {
 							if err != nil {
 								return err
 							}
+							// Only the events this config DECLARES should have been
+							// adopted onto oncall. The API also auto-routes blocked to
+							// the project default (api/defaultdest.go), and Terraform
+							// never declared it, so it legitimately still points there.
+							// Asserting over every route on the monitor conflated
+							// "the routes I declared were adopted" with "this monitor
+							// has no other routes", and broke the moment the API
+							// widened its auto-route set.
+							declared := map[string]bool{"down": true, "fail": true, "recovery": true}
 							seen := map[string]bool{}
 							for _, rt := range routes {
+								if !declared[rt.EventType] {
+									continue
+								}
 								seen[rt.EventType] = true
 								if len(rt.ChannelIDs) != 1 || rt.ChannelIDs[0] != oncallID {
 									return fmt.Errorf("%s route holds %v, want [%s]",
 										rt.EventType, rt.ChannelIDs, oncallID)
 								}
 							}
-							for _, ev := range []string{"down", "fail", "recovery"} {
+							for ev := range declared {
 								if !seen[ev] {
 									return fmt.Errorf("no %s route on the monitor", ev)
 								}
