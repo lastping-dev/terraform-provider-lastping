@@ -35,6 +35,7 @@ type monitorDataModel struct {
 	GraceS               types.Int64  `tfsdk:"grace_s"`
 	MaxRuntimeS          types.Int64  `tfsdk:"max_runtime_s"`
 	StepTimeoutS         types.Int64  `tfsdk:"step_timeout_s"`
+	ExpectEveryS         types.Int64  `tfsdk:"expect_every_s"`
 	FailureThreshold     types.Int64  `tfsdk:"failure_threshold"`
 	Tags                 types.Set    `tfsdk:"tags"`
 	RunawayCeiling       types.Int64  `tfsdk:"runaway_ceiling"`
@@ -112,6 +113,13 @@ func monitorDataAttributes() map[string]schema.Attribute {
 				"`stalled` incident opens, in seconds. Null when unset, in which case stall detection " +
 				"is off. Always strictly below the effective run budget (`max_runtime_s`, or `grace_s` " +
 				"when that is unset), and never set on an `http` monitor.",
+		},
+		"expect_every_s": schema.Int64Attribute{
+			Computed: true,
+			MarkdownDescription: "Silence floor in seconds: the longest this monitor may go with no ping of " +
+				"any kind before a `silence` incident opens, regardless of its schedule. Null when unset, " +
+				"in which case absence is detected only by the schedule — and, on a " +
+				"`schedule_kind = \"on_demand\"` monitor, not at all between runs.",
 		},
 		"failure_threshold": schema.Int64Attribute{
 			Computed: true,
@@ -276,6 +284,11 @@ func monitorDataFromAPI(ctx context.Context, m *client.Monitor) (monitorDataMode
 		out.StepTimeoutS = types.Int64Value(*m.StepTimeoutS)
 	} else {
 		out.StepTimeoutS = types.Int64Null()
+	}
+	if m.ExpectEveryS != nil {
+		out.ExpectEveryS = types.Int64Value(*m.ExpectEveryS)
+	} else {
+		out.ExpectEveryS = types.Int64Null()
 	}
 	return out, diags
 }

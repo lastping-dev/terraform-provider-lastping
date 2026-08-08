@@ -216,3 +216,29 @@ resource "lastping_monitor" "research_agent" {
     aggregation = "avg"
   }
 }
+
+# An on-demand agent. This is the shape `expect_every_s` exists for.
+#
+# `schedule_kind = "on_demand"` arms NO absence deadlines between runs: that is
+# the whole point of the kind — an agent nobody happens to invoke for a week
+# must not page for simply not having been asked to run. The cost is that a
+# genuinely dead agent is indistinguishable from an idle one, and the monitor
+# reads healthy either way.
+#
+# `expect_every_s` buys the detection back without buying the false pages back.
+# It is a floor on SILENCE measured from the monitor's last activity, not a
+# cadence: if this agent says nothing at all for 30 minutes, something is
+# wrong. It stands down entirely while a run is in flight, so the four-hour run
+# `max_runtime_s` allows below is still not an incident, and a `blocked` ping
+# pauses it while the agent waits on a human.
+resource "lastping_monitor" "research_agent" {
+  name          = "Research agent"
+  slug          = "research-agent"
+  schedule_kind = "on_demand"
+  grace_s       = 300
+
+  # A run may take four hours. Silence between runs may last thirty minutes.
+  # The two clocks are independent, which is why both attributes exist.
+  max_runtime_s  = 14400
+  expect_every_s = 1800
+}

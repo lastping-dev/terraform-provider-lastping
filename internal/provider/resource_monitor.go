@@ -117,6 +117,7 @@ type monitorResourceModel struct {
 	GraceS               types.Int64  `tfsdk:"grace_s"`
 	MaxRuntimeS          types.Int64  `tfsdk:"max_runtime_s"`
 	StepTimeoutS         types.Int64  `tfsdk:"step_timeout_s"`
+	ExpectEveryS         types.Int64  `tfsdk:"expect_every_s"`
 	FailureThreshold     types.Int64  `tfsdk:"failure_threshold"`
 	Tags                 types.Set    `tfsdk:"tags"`
 	RunawayCeiling       types.Int64  `tfsdk:"runaway_ceiling"`
@@ -270,6 +271,29 @@ func (r *monitorResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 					"with 400 `STEP_TIMEOUT_NOT_SUPPORTED`, and this provider rejects it at plan time. Use " +
 					"`probe_timeout_s` to bound a single probe.",
 				Validators: []validator.Int64{int64validator.Between(10, 86400)},
+			},
+			"expect_every_s": schema.Int64Attribute{
+				Optional: true,
+				MarkdownDescription: "**Silence floor**: open a `silence` incident if no ping of any kind has " +
+					"arrived within this many seconds, regardless of the schedule. Between 60 and 31536000. " +
+					"Opt-in: omit it and there is no floor, which is how every monitor behaved before this " +
+					"attribute existed; removing it from the configuration turns it back off.\n\n" +
+					"It is anchored on the monitor's last activity, not on its schedule — a floor on silence, " +
+					"not a cadence. That is what makes it **the only absence rule a " +
+					"`schedule_kind = \"on_demand\"` monitor can have**: that kind arms no deadlines between " +
+					"runs by design, so without this attribute an on-demand monitor reads healthy " +
+					"indefinitely however long its agent stays dark.\n\n" +
+					"It never fires mid-run. While a run is in flight (a `/start` is outstanding) the floor " +
+					"stands down entirely and the run clock owns detection — `max_runtime_s` for the overrun " +
+					"rule, `step_timeout_s` for the stall rule — so a legitimate four-hour run that reports " +
+					"nothing is still not an incident. A `blocked` ping also pauses it, bounded by the " +
+					"monitor's blocked timeout.\n\n" +
+					"On `simple` and `cron` monitors it is a backstop rather than the main rule: it joins the " +
+					"schedule's own deadline as whichever is **sooner**, so it can tighten detection under a " +
+					"long cadence (a daily cron has a ~25-hour blind window) but can never loosen it.\n\n" +
+					"Accepted on every `monitor_type`, `http` included — unlike `max_runtime_s` and " +
+					"`step_timeout_s` it has no run-scoped precondition that would make it a no-op there.",
+				Validators: []validator.Int64{int64validator.Between(60, 31536000)},
 			},
 			"failure_threshold": schema.Int64Attribute{
 				Optional: true,
@@ -595,6 +619,10 @@ func monitorFromModel(ctx context.Context, m monitorResourceModel) (client.Monit
 		v := m.StepTimeoutS.ValueInt64()
 		out.StepTimeoutS = &v
 	}
+	if !m.ExpectEveryS.IsNull() && !m.ExpectEveryS.IsUnknown() {
+		v := m.ExpectEveryS.ValueInt64()
+		out.ExpectEveryS = &v
+	}
 	if !m.MonitorFrom.IsNull() && !m.MonitorFrom.IsUnknown() && m.MonitorFrom.ValueString() != "" {
 		v := m.MonitorFrom.ValueString()
 		out.MonitorFrom = &v
@@ -734,6 +762,21 @@ func monitorPatchFromModel(ctx context.Context, desired, cfg monitorResourceMode
 		patch["step_timeout_s"] = nil
 	} else {
 		patch["step_timeout_s"] = desired.StepTimeoutS.ValueInt64()
+	}
+
+	// expect_every_s is clearable in the same way and for the same reason, with
+	// the sharpest consequence of the group: an absent key would leave the
+	// stored floor in place, so removing the attribute from a configuration
+	// would silently keep paging — and, in the other direction, a value that
+	// never reached the API would leave an on_demand monitor detecting nothing
+	// at all while the configuration said otherwise. Its range starts at 60, so
+	// omit-when-zero would have looked harmless and pinned the attribute
+	// forever. Safe to send on an http monitor: the API accepts the floor on
+	// every monitor_type, so there is no rejection to anticipate.
+	if cfg.ExpectEveryS.IsNull() || desired.ExpectEveryS.IsNull() {
+		patch["expect_every_s"] = nil
+	} else {
+		patch["expect_every_s"] = desired.ExpectEveryS.ValueInt64()
 	}
 
 	if cfg.MonitorFrom.IsNull() || desired.MonitorFrom.ValueString() == "" {
@@ -902,6 +945,14 @@ func modelFromMonitor(ctx context.Context, mon *client.Monitor, prior monitorRes
 		m.StepTimeoutS = types.Int64Value(*mon.StepTimeoutS)
 	} else {
 		m.StepTimeoutS = types.Int64Null()
+	}
+	// And for expect_every_s: absent means there is no silence floor, which has
+	// to read as null rather than as a 0 no practitioner could have written
+	// (the valid range starts at 60).
+	if mon.ExpectEveryS != nil {
+		m.ExpectEveryS = types.Int64Value(*mon.ExpectEveryS)
+	} else {
+		m.ExpectEveryS = types.Int64Null()
 	}
 	m.MonitorFrom = monitorFromValue(mon.MonitorFrom, prior.MonitorFrom)
 

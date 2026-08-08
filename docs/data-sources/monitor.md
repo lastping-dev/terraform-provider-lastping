@@ -74,6 +74,7 @@ variable "slack_webhook_url" {
 - `created_at` (String) RFC 3339 UTC timestamp when the monitor was created.
 - `cron_expr` (String) 5-field cron expression, for `schedule_kind = "cron"`.
 - `due_at` (String) RFC 3339 UTC timestamp of the next expected ping.
+- `expect_every_s` (Number) Silence floor in seconds: the longest this monitor may go with no ping of any kind before a `silence` incident opens, regardless of its schedule. Null when unset, in which case absence is detected only by the schedule — and, on a `schedule_kind = "on_demand"` monitor, not at all between runs.
 - `failure_threshold` (Number) Consecutive explicit failures required before an incident opens (the `fail` cause only). Always present; `1` is the default, "open on the first failure".
 - `grace_s` (Number) Grace period in seconds after a deadline is missed before alerting.
 - `last_ping_at` (String) RFC 3339 UTC timestamp of the most recent ping. Null until the first ping.

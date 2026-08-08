@@ -117,6 +117,10 @@ func TestMonitorNewInt64Validators(t *testing.T) {
 		{"step_timeout_s", 86400, true},
 		{"step_timeout_s", 9, false},
 		{"step_timeout_s", 86401, false},
+		{"expect_every_s", 60, true},
+		{"expect_every_s", 31536000, true},
+		{"expect_every_s", 59, false},
+		{"expect_every_s", 31536001, false},
 	} {
 		t.Run(fmt.Sprintf("%s=%d", tc.attr, tc.value), func(t *testing.T) {
 			resp := validateInt64(t, tc.attr, tc.value)
@@ -313,7 +317,7 @@ func TestMonitorOptionalOnlyAttributesAreNotComputed(t *testing.T) {
 	for _, name := range []string{
 		"slug", "cron_expr", "tags", "runaway_ceiling", "monitor_from",
 		"probe_url", "probe_interval_s", "probe_expected_body", "max_runtime_s",
-		"step_timeout_s", "agent_id",
+		"step_timeout_s", "expect_every_s", "agent_id",
 	} {
 		attr, ok := s.Attributes[name]
 		require.True(t, ok, "missing attribute %s", name)
@@ -417,6 +421,7 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		GraceS:               types.Int64Value(1800),
 		MaxRuntimeS:          types.Int64Value(14400),
 		StepTimeoutS:         types.Int64Value(900),
+		ExpectEveryS:         types.Int64Value(1800),
 		FailureThreshold:     types.Int64Value(3),
 		Tags:                 tags,
 		RunawayCeiling:       types.Int64Value(40),
@@ -447,6 +452,7 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		"grace_s":                int64(1800),
 		"max_runtime_s":          int64(14400),
 		"step_timeout_s":         int64(900),
+		"expect_every_s":         int64(1800),
 		"failure_threshold":      int64(3),
 		"cron_expr":              "",
 		"probe_method":           "GET",
@@ -476,6 +482,7 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		cfg.MonitorFrom = types.StringNull()
 		cfg.MaxRuntimeS = types.Int64Null()
 		cfg.StepTimeoutS = types.Int64Null()
+		cfg.ExpectEveryS = types.Int64Null()
 		cfg.AgentID = types.StringNull()
 
 		want := client.MonitorPatch{}
@@ -487,6 +494,7 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		want["monitor_from"] = nil
 		want["max_runtime_s"] = nil
 		want["step_timeout_s"] = nil
+		want["expect_every_s"] = nil
 		want["agent_id"] = nil
 
 		got, err := monitorPatchFromModel(ctx, cfg, cfg)
@@ -579,6 +587,7 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		cfg.MonitorFrom = types.StringNull()
 		cfg.MaxRuntimeS = types.Int64Null()
 		cfg.StepTimeoutS = types.Int64Null()
+		cfg.ExpectEveryS = types.Int64Null()
 		cfg.AgentID = types.StringNull()
 
 		got, err := monitorPatchFromModel(ctx, stored, cfg)
@@ -594,6 +603,8 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		require.Nil(t, got["max_runtime_s"])
 		require.Contains(t, got, "step_timeout_s")
 		require.Nil(t, got["step_timeout_s"])
+		require.Contains(t, got, "expect_every_s")
+		require.Nil(t, got["expect_every_s"])
 		require.Contains(t, got, "agent_id")
 		require.Nil(t, got["agent_id"])
 	})
@@ -675,6 +686,7 @@ func TestResolveUnknownsFromState_CoversEveryAttribute(t *testing.T) {
 		GraceS:               types.Int64Value(1800),
 		MaxRuntimeS:          types.Int64Value(14400),
 		StepTimeoutS:         types.Int64Value(900),
+		ExpectEveryS:         types.Int64Value(1800),
 		FailureThreshold:     types.Int64Value(3),
 		Tags:                 types.SetValueMust(types.StringType, []attr.Value{types.StringValue("prod")}),
 		RunawayCeiling:       types.Int64Value(40),
