@@ -38,6 +38,28 @@ func TestAPIKeyModelPreservesPlaintext(t *testing.T) {
 	})
 }
 
+// TestAPIKeyLastUsedAtValue covers both states the API can report: a key
+// that has authenticated at least one request, and one that never has, which
+// the API represents as an absent field (nil, not a zero time) rather than a
+// zero/epoch timestamp.
+func TestAPIKeyLastUsedAtValue(t *testing.T) {
+	t.Run("populated from a response that carries it", func(t *testing.T) {
+		used := time.Date(2026, 8, 1, 9, 30, 0, 0, time.UTC)
+		got := modelFromAPIKey(&client.APIKey{
+			ID: "id", Name: "n", Prefix: "lp_abcdefg", CreatedAt: used, LastUsedAt: &used,
+		}, apiKeyResourceModel{Key: types.StringUnknown()})
+		require.Equal(t, "2026-08-01T09:30:00Z", got.LastUsedAt.ValueString())
+	})
+
+	t.Run("null when the API returns none, for a never-used key", func(t *testing.T) {
+		created := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+		got := modelFromAPIKey(&client.APIKey{
+			ID: "id", Name: "n", Prefix: "lp_abcdefg", CreatedAt: created, LastUsedAt: nil,
+		}, apiKeyResourceModel{Key: types.StringUnknown()})
+		require.True(t, got.LastUsedAt.IsNull())
+	})
+}
+
 // TestAPIKeyExpiresAtValue covers the UTC-normalisation round trip. The API
 // stores timestamptz and always answers in UTC, so a configured offset comes
 // back spelled differently; without this the apply fails as an inconsistent

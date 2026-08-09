@@ -77,9 +77,10 @@ type apiKeyResourceModel struct {
 	Name      types.String `tfsdk:"name"`
 	ExpiresAt types.String `tfsdk:"expires_at"`
 
-	Prefix    types.String `tfsdk:"prefix"`
-	CreatedAt types.String `tfsdk:"created_at"`
-	Key       types.String `tfsdk:"key"`
+	Prefix     types.String `tfsdk:"prefix"`
+	CreatedAt  types.String `tfsdk:"created_at"`
+	LastUsedAt types.String `tfsdk:"last_used_at"`
+	Key        types.String `tfsdk:"key"`
 }
 
 func (r *apiKeyResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -130,6 +131,16 @@ func (r *apiKeyResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				Computed:            true,
 				MarkdownDescription: "RFC 3339 UTC timestamp when the key was created.",
 				PlanModifiers:       []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
+			},
+			"last_used_at": schema.StringAttribute{
+				Computed: true,
+				MarkdownDescription: "RFC 3339 UTC timestamp of the most recent request this key " +
+					"authenticated. Null until the key is used for the first time. The API records this " +
+					"on every authenticated request, so it can change between one `terraform apply` and " +
+					"the next with nothing in configuration to compare it against — Terraform's refresh " +
+					"absorbs that silently, the same way it already does for a monitor's `due_at` and " +
+					"`next_probe_at`; it surfaces only under the opt-in `terraform plan -refresh-only`.",
+				PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
 			},
 			"key": schema.StringAttribute{
 				Computed:  true,
@@ -185,17 +196,30 @@ func expiresAtValue(apiVal *time.Time, prior types.String) types.String {
 // refresh would destroy the one copy that exists.
 func modelFromAPIKey(k *client.APIKey, prior apiKeyResourceModel) apiKeyResourceModel {
 	m := apiKeyResourceModel{
-		ID:        types.StringValue(k.ID),
-		Name:      types.StringValue(k.Name),
-		ExpiresAt: expiresAtValue(k.ExpiresAt, prior.ExpiresAt),
-		Prefix:    types.StringValue(k.Prefix),
-		CreatedAt: types.StringValue(k.CreatedAt.UTC().Format(time.RFC3339)),
-		Key:       prior.Key,
+		ID:         types.StringValue(k.ID),
+		Name:       types.StringValue(k.Name),
+		ExpiresAt:  expiresAtValue(k.ExpiresAt, prior.ExpiresAt),
+		Prefix:     types.StringValue(k.Prefix),
+		CreatedAt:  types.StringValue(k.CreatedAt.UTC().Format(time.RFC3339)),
+		LastUsedAt: lastUsedAtValue(k.LastUsedAt),
+		Key:        prior.Key,
 	}
 	if k.Key != "" {
 		m.Key = types.StringValue(k.Key)
 	}
 	return m
+}
+
+// lastUsedAtValue maps the API's optional last_used_at to state: null for a
+// key that has never authenticated a request, otherwise its UTC RFC 3339
+// spelling. Unlike expiresAtValue there is no configured value to reconcile
+// against — last_used_at is Computed-only — so there is nothing to preserve
+// and every read simply reports what the server has now.
+func lastUsedAtValue(v *time.Time) types.String {
+	if v == nil {
+		return types.StringNull()
+	}
+	return types.StringValue(v.UTC().Format(time.RFC3339))
 }
 
 func (r *apiKeyResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {

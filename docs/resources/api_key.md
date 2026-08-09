@@ -78,4 +78,5 @@ output "ci_api_key_prefix" {
 - `created_at` (String) RFC 3339 UTC timestamp when the key was created.
 - `id` (String) API key UUID, assigned by the server. Not a credential.
 - `key` (String, Sensitive) The plaintext API key (`lp_…`). **Stored in Terraform state** — see the warning above. The API returns it exactly once, on creation, so it is held in state rather than refreshed; a key whose state entry is lost cannot be recovered and must be replaced.
+- `last_used_at` (String) RFC 3339 UTC timestamp of the most recent request this key authenticated. Null until the key is used for the first time. The API records this on every authenticated request, so it can change between one `terraform apply` and the next with nothing in configuration to compare it against — Terraform's refresh absorbs that silently, the same way it already does for a monitor's `due_at` and `next_probe_at`; it surfaces only under the opt-in `terraform plan -refresh-only`.
 - `prefix` (String) First 10 characters of the key (`lp_…`). Deliberately non-secret: it is how a key is identified in the dashboard and in audit output.

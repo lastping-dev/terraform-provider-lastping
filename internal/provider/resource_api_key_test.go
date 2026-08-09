@@ -82,6 +82,9 @@ resource "lastping_api_key" "k" {
 					// expires_at was not configured, so it must read back absent
 					// rather than as an empty string.
 					resource.TestCheckNoResourceAttr("lastping_api_key.k", "expires_at"),
+					// Nothing has authenticated with this key yet — Create mints it
+					// but never uses it — so last_used_at must read back absent too.
+					resource.TestCheckNoResourceAttr("lastping_api_key.k", "last_used_at"),
 					resource.TestMatchResourceAttr("lastping_api_key.k", "prefix",
 						regexp.MustCompile(`^lp_.{7}$`)),
 					resource.TestCheckResourceAttrWith("lastping_api_key.k", "key", func(key string) error {
@@ -105,12 +108,18 @@ resource "lastping_api_key" "k" {
 				// A refresh must not clobber the plaintext: it is unreadable, so
 				// state is the only copy and Read has to leave it alone.
 				RefreshState: true,
-				Check: resource.TestCheckResourceAttrWith("lastping_api_key.k", "key", func(key string) error {
-					if key != first {
-						return errors.New("refresh changed the stored key")
-					}
-					return testAccKeyAuthenticates(key)
-				}),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrWith("lastping_api_key.k", "key", func(key string) error {
+						if key != first {
+							return errors.New("refresh changed the stored key")
+						}
+						return testAccKeyAuthenticates(key)
+					}),
+					// The previous step's own "key" check already authenticated with
+					// this key once, so by this refresh the server has recorded a use
+					// and last_used_at must have flipped from absent to set.
+					resource.TestCheckResourceAttrSet("lastping_api_key.k", "last_used_at"),
+				),
 			},
 			{
 				// Renaming replaces: the API cannot rename a key.

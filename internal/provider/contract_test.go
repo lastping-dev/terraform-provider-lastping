@@ -105,18 +105,32 @@ var knownSpecGaps = map[string]string{}
 // Keys are "<case name>[.<nested attribute>].<spec property name>", matching
 // knownSpecGaps' key shape — see splitGapKey.
 var deliberatelyUnmodelled = map[string]string{
-	// last_used_at and last_used_surface (ApiKey, inherited by ApiKeyCreated)
-	// are REST/MCP/UI-only by design — see the monorepo's api/apikeys_api.go,
-	// the comment on apiKeyResponse: last_used_at changes on every
-	// authenticated request, so a computed Terraform attribute tracking it
-	// would produce a permanent, meaningless diff on every `terraform plan`.
-	// last_used_surface is derived from the caller-controlled, spoofable
-	// User-Agent header — best-effort client self-identification, never
-	// authorization, and not state a config-as-code tool should converge on.
-	"resource.lastping_api_key.last_used_at":       apiKeyTelemetryExempt,
-	"resource.lastping_api_key.last_used_surface":  apiKeyTelemetryExempt,
-	"ephemeral.lastping_api_key.last_used_at":      apiKeyTelemetryExempt,
-	"ephemeral.lastping_api_key.last_used_surface": apiKeyTelemetryExempt,
+	// last_used_at is now modelled on the managed resource (see created_at's
+	// neighbour in resource_api_key.go) — a Computed-only attribute whose
+	// server value changes between applies is absorbed silently by
+	// Terraform's refresh, with nothing in configuration to diff it against;
+	// it surfaces only under the opt-in `terraform plan -refresh-only`, the
+	// same as the monitor resource's due_at and next_probe_at already do. The
+	// ephemeral resource is different in kind, not degree: it mints a
+	// brand-new key on every Open, which by definition has never
+	// authenticated anything, so last_used_at would read null on every
+	// single run — an attribute that can never carry information is not
+	// worth exposing.
+	"ephemeral.lastping_api_key.last_used_at": "ephemeral.lastping_api_key mints a fresh key on every " +
+		"Open, which has never authenticated a request yet, so last_used_at would be null on every " +
+		"single run — there is no value it could ever report.",
+
+	// last_used_surface stays unmodelled on both surfaces: it is derived from
+	// the caller-controlled, spoofable User-Agent header on the
+	// authenticating request (the monorepo's api.detectSurface), not from
+	// any cryptographic or protocol-level signal. It answers "did my client
+	// ever successfully authenticate?", not "what is true" — a caller can
+	// claim to be any surface it likes — so it is useful as an honest,
+	// best-effort hint in the dashboard but wrong as Terraform state: a
+	// config-as-code tool converges configuration toward a value, and this
+	// is not a value anything should be converged toward.
+	"resource.lastping_api_key.last_used_surface":  apiKeyLastUsedSurfaceExempt,
+	"ephemeral.lastping_api_key.last_used_surface": apiKeyLastUsedSurfaceExempt,
 
 	// The ephemeral resource never surfaces created_at or expires_at (only the
 	// managed lastping_api_key resource does). This mirrors the same map's
@@ -166,13 +180,14 @@ var deliberatelyUnmodelled = map[string]string{
 		"this case's sendExempt/readExempt)",
 }
 
-// apiKeyTelemetryExempt is shared by the managed and ephemeral api_key cases:
-// both omit last_used_at/last_used_surface for the same reason.
-const apiKeyTelemetryExempt = "REST/MCP/UI-only by design (monorepo api/apikeys_api.go, comment on " +
-	"apiKeyResponse): last_used_at changes on every authenticated request, so a computed Terraform " +
-	"attribute tracking it would produce a permanent, meaningless diff on every `terraform plan`. " +
-	"last_used_surface is derived from the spoofable User-Agent header — best-effort client " +
-	"self-identification, never authorization, not state to converge on."
+// apiKeyLastUsedSurfaceExempt is shared by the managed and ephemeral
+// api_key cases: both omit last_used_surface for the same reason — it is
+// derived from the spoofable User-Agent header, so it is a best-effort
+// client hint, never something a config-as-code tool should converge on.
+const apiKeyLastUsedSurfaceExempt = "derived from the caller-controlled, spoofable User-Agent header " +
+	"(monorepo api.detectSurface), not from any cryptographic or protocol-level signal — a caller can " +
+	"claim to be any surface it likes. Useful as a best-effort dashboard hint for \"did my client ever " +
+	"authenticate?\", but never state Terraform should try to converge configuration toward."
 
 // ciConfiguredExempt is shared by all three monitor-reading cases.
 const ciConfiguredExempt = "always exactly (ci_provider != null) — a derived boolean mirror of " +

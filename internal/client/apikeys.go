@@ -20,6 +20,11 @@ type APIKey struct {
 	CreatedAt time.Time  `json:"created_at"`
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 
+	// LastUsedAt is when this key last authenticated a request, updated on
+	// every authenticated call (api/auth.go's TouchAPIKey). Omitted — nil
+	// here — for a key that has never been used.
+	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
+
 	// Key is the plaintext key. Non-empty only on the CreateAPIKey response.
 	Key string `json:"key,omitempty"`
 }
