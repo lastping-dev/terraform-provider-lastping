@@ -117,11 +117,16 @@ type monitorResourceModel struct {
 	GraceS               types.Int64  `tfsdk:"grace_s"`
 	MaxRuntimeS          types.Int64  `tfsdk:"max_runtime_s"`
 	StepTimeoutS         types.Int64  `tfsdk:"step_timeout_s"`
+	ExpectEveryS         types.Int64  `tfsdk:"expect_every_s"`
+	BlockedTimeoutS      types.Int64  `tfsdk:"blocked_timeout_s"`
 	FailureThreshold     types.Int64  `tfsdk:"failure_threshold"`
 	Tags                 types.Set    `tfsdk:"tags"`
 	RunawayCeiling       types.Int64  `tfsdk:"runaway_ceiling"`
 	MonitorFrom          types.String `tfsdk:"monitor_from"`
 	AgentID              types.String `tfsdk:"agent_id"`
+	CiProvider           types.String `tfsdk:"ci_provider"`
+	CiWorkflow           types.String `tfsdk:"ci_workflow"`
+	CiBranch             types.String `tfsdk:"ci_branch"`
 	ProbeURL             types.String `tfsdk:"probe_url"`
 	ProbeMethod          types.String `tfsdk:"probe_method"`
 	ProbeIntervalS       types.Int64  `tfsdk:"probe_interval_s"`
@@ -203,7 +208,7 @@ func (r *monitorResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 				MarkdownDescription: "`simple` (fixed `period_s` interval) or `cron` (`cron_expr` + `tz`). " +
 					"Computed for `monitor_type = \"http\"`, which the server always schedules as `simple` " +
 					"from `probe_interval_s`.",
-				Validators: []validator.String{stringvalidator.OneOf("simple", "cron")},
+				Validators: []validator.String{stringvalidator.OneOf("simple", "cron", "on_demand")},
 			},
 			"period_s": schema.Int64Attribute{
 				Optional: true,
@@ -271,6 +276,54 @@ func (r *monitorResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 					"`probe_timeout_s` to bound a single probe.",
 				Validators: []validator.Int64{int64validator.Between(10, 86400)},
 			},
+			"expect_every_s": schema.Int64Attribute{
+				Optional: true,
+				MarkdownDescription: "**Silence floor**: open a `silence` incident if no ping of any kind has " +
+					"arrived within this many seconds, regardless of the schedule. Between 60 and 31536000. " +
+					"Opt-in: omit it and there is no floor, which is how every monitor behaved before this " +
+					"attribute existed; removing it from the configuration turns it back off.\n\n" +
+					"It is anchored on the monitor's last activity, not on its schedule — a floor on silence, " +
+					"not a cadence. That is what makes it **the only absence rule a " +
+					"`schedule_kind = \"on_demand\"` monitor can have**: that kind arms no deadlines between " +
+					"runs by design, so without this attribute an on-demand monitor reads healthy " +
+					"indefinitely however long its agent stays dark.\n\n" +
+					"It never fires mid-run. While a run is in flight (a `/start` is outstanding) the floor " +
+					"stands down entirely and the run clock owns detection — `max_runtime_s` for the overrun " +
+					"rule, `step_timeout_s` for the stall rule — so a legitimate four-hour run that reports " +
+					"nothing is still not an incident. A `blocked` ping also pauses it, bounded by the " +
+					"monitor's blocked timeout.\n\n" +
+					"On `simple` and `cron` monitors it is a backstop rather than the main rule: it joins the " +
+					"schedule's own deadline as whichever is **sooner**, so it can tighten detection under a " +
+					"long cadence (a daily cron has a ~25-hour blind window) but can never loosen it.\n\n" +
+					"Accepted on every `monitor_type`, `http` included — unlike `max_runtime_s` and " +
+					"`step_timeout_s` it has no run-scoped precondition that would make it a no-op there.",
+				Validators: []validator.Int64{int64validator.Between(60, 31536000)},
+			},
+			"blocked_timeout_s": schema.Int64Attribute{
+				Optional: true,
+				MarkdownDescription: "How long a run may sit **blocked** — waiting on a human — before a " +
+					"`blocked` incident opens, in seconds.\n\n" +
+					"A `blocked` ping (`POST /ping/{id}/blocked?rid=…`) is how an agent says \"I am alive but " +
+					"I cannot proceed until someone answers me\". While a monitor is blocked the ordinary " +
+					"absence rules stand down: the silence deadline, `expect_every_s` and the run clock all " +
+					"stop counting against it, because a job correctly waiting for approval is not a job that " +
+					"has failed. This attribute is what stops that suppression from being unbounded — an " +
+					"approval nobody ever gives is itself an outage, and it should page.\n\n" +
+					"~> **Omitting it does NOT mean \"wait forever\".** The server falls back to a 24-hour " +
+					"default (`check.DefaultBlockedTimeout`), and removing the attribute from the " +
+					"configuration restores that fallback rather than disabling the rule. There is no way to " +
+					"turn the blocked timeout off; the only choice is how long it is.\n\n" +
+					"Accepted on every `monitor_type`, `http` included — unlike `max_runtime_s` and " +
+					"`step_timeout_s` it has no run-scoped precondition that would make it a no-op there.",
+				// The API declares no bounds for this attribute and enforces none, so
+				// this validator is deliberately the loosest one that still refuses a
+				// value that could not mean what it says: core/check reads any
+				// blocked_timeout_s <= 0 as "unset" and applies the 24-hour default
+				// (core/check/detect.go), so a configured 0 would be stored, read
+				// back as 0, and behave as 86400 — state that agrees with the
+				// configuration and lies about the monitor.
+				Validators: []validator.Int64{int64validator.AtLeast(1)},
+			},
 			"failure_threshold": schema.Int64Attribute{
 				Optional: true,
 				Computed: true,
@@ -326,6 +379,53 @@ func (r *monitorResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 					"not the string the configuration wrote. This provider enforces the UUID form at plan " +
 					"time for that reason, not because the API itself is that strict.",
 				Validators: []validator.String{uuidValidator{}},
+			},
+			"ci_provider": schema.StringAttribute{
+				Optional: true,
+				MarkdownDescription: "Bind this monitor to a CI provider's webhooks: `github`, `gitlab`, or " +
+					"`jenkins`. Setting it makes the server mint a webhook signing secret and expose an " +
+					"ingest URL, so the monitor is driven by your pipeline's own events rather than by a " +
+					"ping you have to add to the job.\n\n" +
+					"~> **Changing or removing this replaces the monitor.** The API treats the CI binding as " +
+					"create-only: `POST /api/v1/checks` is the only place a provider can be set, and " +
+					"`PATCH /api/v1/checks/{id}` does not decode the field at all — it is listed alongside " +
+					"`slug`, `monitor_type` and `ci_secret` as immutable and ignored if present. Modelling " +
+					"that as an in-place update would produce a plan that reads as a clean one-attribute " +
+					"change and an apply that silently did nothing, leaving the same diff on every " +
+					"subsequent plan forever. `RequiresReplace` is the only honest rendering: it shows the " +
+					"true cost of the change (a new monitor id, a new webhook URL and a new secret) at plan " +
+					"time, before anything is applied.\n\n" +
+					"~> **The webhook secret is returned exactly once, in the create response, and this " +
+					"provider does not surface it.** Read it from the dashboard, or rotate it with " +
+					"`POST /api/v1/checks/{id}/ci/regenerate`, and store it in your CI provider's secret " +
+					"manager.",
+				Validators:    []validator.String{stringvalidator.OneOf("github", "gitlab", "jenkins")},
+				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
+			},
+			"ci_workflow": schema.StringAttribute{
+				Optional: true,
+				MarkdownDescription: "Only accept inbound CI webhooks whose workflow name matches this " +
+					"(provider-specific — a GitHub Actions workflow file name such as `ci.yml`, for " +
+					"example). Omit it to accept every workflow. Unlike `ci_provider` this is an in-place " +
+					"update, and removing it from the configuration clears the filter.\n\n" +
+					"~> **Ignored unless `ci_provider` is set**, which this provider refuses at plan time " +
+					"rather than letting the API accept and discard it.\n\n" +
+					"~> **This attribute cannot be refreshed.** No API response carries it — `GET` and list " +
+					"report `ci_provider` but never the two filters — so Terraform can only report the " +
+					"value it last wrote. A filter changed in the dashboard is therefore invisible to " +
+					"`terraform plan`, and a monitor brought in with `terraform import` starts with this " +
+					"attribute null however it is really configured; the first apply after the import " +
+					"writes the configured value and the two agree from then on.",
+				Validators: []validator.String{stringvalidator.LengthAtLeast(1)},
+			},
+			"ci_branch": schema.StringAttribute{
+				Optional: true,
+				MarkdownDescription: "Only accept inbound CI webhooks for this branch. Omit it to accept " +
+					"every branch. In-place updatable, and removing it from the configuration clears the " +
+					"filter.\n\n" +
+					"~> **Ignored unless `ci_provider` is set**, and **cannot be refreshed** — see " +
+					"`ci_workflow`, which carries both caveats on identical terms.",
+				Validators: []validator.String{stringvalidator.LengthAtLeast(1)},
 			},
 			"probe_url": schema.StringAttribute{
 				Optional:            true,
@@ -453,6 +553,16 @@ func (r *monitorResource) ValidateConfig(ctx context.Context, req resource.Valid
 	// ping body, so a guard on one could never be evaluated.
 	validateGuards(ctx, cfg, resp)
 
+	// The CI filters are meaningless without a binding to filter, on every
+	// monitor type, so this runs before the http early return as well.
+	validateCIFilters(cfg, resp)
+
+	// on_demand has no cadence -- it is driven entirely by run events -- so the
+	// API rejects period_s/cron_expr alongside it with 400
+	// ON_DEMAND_SCHEDULE_CONFLICT. Catching it at plan time turns an apply-time
+	// failure into a plan-time one.
+	validateOnDemandSchedule(cfg, resp)
+
 	if cfg.MonitorType.IsUnknown() || cfg.MonitorType.ValueString() != "http" {
 		// Not an http monitor, so step_timeout_s is legal — but it still has to
 		// fit inside the run budget. The check is skipped for http monitors
@@ -492,6 +602,78 @@ func (r *monitorResource) ValidateConfig(ctx context.Context, req resource.Valid
 				"(here: at least %d), so %d would never be applied as written.\n\nSet grace_s to at least %d, "+
 				"or omit it to take the server floor.",
 				floor, cfg.GraceS.ValueInt64(), floor))
+	}
+}
+
+// validateCIFilters refuses ci_workflow or ci_branch on a monitor that has no
+// ci_provider.
+//
+// The API does not refuse it — it silently discards both. api/checks.go only
+// calls SetCheckCIBinding when a provider was supplied on create, and
+// api/checks.go's PATCH path guards the same call with
+// `existing.CiProvider.Valid && existing.CiProvider.String != ""`, so the
+// filters are accepted with a 200 and dropped on the floor. The spec says as
+// much in prose ("Has no effect when `ci_provider` is not set").
+//
+// That is the worst possible outcome for Terraform specifically. Because no
+// response carries the filters back, the provider writes the configured value
+// into state unchallenged; the apply succeeds, every later plan is clean, and
+// the practitioner has a configuration that says the monitor only reacts to
+// `main` while the monitor reacts to everything. A plan-time error is the only
+// point at which that is still visible.
+//
+// Unknown is not an error: a ci_provider interpolated from another resource is
+// unknown at plan time and known at apply time, and the API is the backstop.
+// validateOnDemandSchedule refuses a cadence on an on_demand monitor, matching
+// the API's ON_DEMAND_SCHEDULE_CONFLICT rejection (api/checks.go). on_demand
+// arms no absence deadlines between runs, so period_s and cron_expr would be
+// persisted on a monitor that never reads either -- silently accepted, silently
+// meaningless. The API refuses it outright; refusing at plan time surfaces the
+// same rule before an apply spends a round trip on it.
+func validateOnDemandSchedule(cfg monitorResourceModel, resp *resource.ValidateConfigResponse) {
+	if cfg.ScheduleKind.IsNull() || cfg.ScheduleKind.IsUnknown() {
+		return
+	}
+	if cfg.ScheduleKind.ValueString() != "on_demand" {
+		return
+	}
+	if !cfg.PeriodS.IsNull() && !cfg.PeriodS.IsUnknown() {
+		resp.Diagnostics.AddAttributeError(path.Root("period_s"),
+			"period_s is not supported on an on_demand monitor",
+			"on_demand has no cadence: it is driven entirely by run events, so the API rejects "+
+				"period_s with 400 ON_DEMAND_SCHEDULE_CONFLICT. Remove period_s, or use "+
+				"schedule_kind \"simple\" if this monitor needs a cadence.")
+	}
+	if !cfg.CronExpr.IsNull() && !cfg.CronExpr.IsUnknown() {
+		resp.Diagnostics.AddAttributeError(path.Root("cron_expr"),
+			"cron_expr is not supported on an on_demand monitor",
+			"on_demand has no cadence: it is driven entirely by run events, so the API rejects "+
+				"cron_expr with 400 ON_DEMAND_SCHEDULE_CONFLICT. Remove cron_expr, or use "+
+				"schedule_kind \"cron\" if this monitor needs a cadence.")
+	}
+}
+
+func validateCIFilters(cfg monitorResourceModel, resp *resource.ValidateConfigResponse) {
+	if !cfg.CiProvider.IsNull() || cfg.CiProvider.IsUnknown() {
+		return
+	}
+	for _, f := range []struct {
+		name string
+		val  types.String
+	}{
+		{"ci_workflow", cfg.CiWorkflow},
+		{"ci_branch", cfg.CiBranch},
+	} {
+		if f.val.IsNull() || f.val.IsUnknown() {
+			continue
+		}
+		resp.Diagnostics.AddAttributeError(path.Root(f.name),
+			fmt.Sprintf("%s has no effect without ci_provider", f.name),
+			fmt.Sprintf("%s filters the CI webhooks a monitor accepts, and a monitor with no ci_provider "+
+				"accepts none — the API stores neither filter unless a CI binding exists, and answers 200 "+
+				"either way.\n\nBecause the API never reports the filters back, this would apply cleanly, "+
+				"read back as configured on every later plan, and quietly not be in force.\n\nSet "+
+				"ci_provider, or remove %s.", f.name, f.name))
 	}
 }
 
@@ -582,6 +764,17 @@ func monitorFromModel(ctx context.Context, m monitorResourceModel) (client.Monit
 		ProbeExpectedStatus:  m.ProbeExpectedStatus.ValueInt64(),
 		ProbeTimeoutS:        m.ProbeTimeoutS.ValueInt64(),
 		ProbeFollowRedirects: m.ProbeFollowRedirects.ValueBool(),
+
+		// The CI binding is create-only on the API, which is why ci_provider
+		// carries RequiresReplace: this is the only request that can establish
+		// it. The two filters are settable here and on PATCH both.
+		CiProvider: m.CiProvider.ValueString(),
+		CiWorkflow: m.CiWorkflow.ValueString(),
+		CiBranch:   m.CiBranch.ValueString(),
+	}
+	if !m.BlockedTimeoutS.IsNull() && !m.BlockedTimeoutS.IsUnknown() {
+		v := m.BlockedTimeoutS.ValueInt64()
+		out.BlockedTimeoutS = &v
 	}
 	if !m.RunawayCeiling.IsNull() && !m.RunawayCeiling.IsUnknown() {
 		v := m.RunawayCeiling.ValueInt64()
@@ -594,6 +787,10 @@ func monitorFromModel(ctx context.Context, m monitorResourceModel) (client.Monit
 	if !m.StepTimeoutS.IsNull() && !m.StepTimeoutS.IsUnknown() {
 		v := m.StepTimeoutS.ValueInt64()
 		out.StepTimeoutS = &v
+	}
+	if !m.ExpectEveryS.IsNull() && !m.ExpectEveryS.IsUnknown() {
+		v := m.ExpectEveryS.ValueInt64()
+		out.ExpectEveryS = &v
 	}
 	if !m.MonitorFrom.IsNull() && !m.MonitorFrom.IsUnknown() && m.MonitorFrom.ValueString() != "" {
 		v := m.MonitorFrom.ValueString()
@@ -638,15 +835,20 @@ func monitorFromModel(ctx context.Context, m monitorResourceModel) (client.Monit
 // desired against state and the two would agree.
 //
 // TestMonitorOptionalOnlyAttributesAreNotComputed is the guardrail that keeps
-// tags, runaway_ceiling, monitor_from, max_runtime_s, step_timeout_s and
-// agent_id Optional-only. Read it before making any of them Computed to
-// suppress drift.
+// tags, runaway_ceiling, monitor_from, max_runtime_s, step_timeout_s,
+// expect_every_s, blocked_timeout_s, agent_id, ci_workflow and ci_branch
+// Optional-only. Read it before making any of them Computed to suppress drift —
+// and note that for ci_workflow and ci_branch the temptation is stronger than
+// for the rest, because the API never reports them back and Computed looks like
+// the way to stop the resulting diff. It is not: it would pin whatever was last
+// written and make the filters impossible to clear.
 //
 // The document is sparse (see client.MonitorPatch) and its keys fall into three
 // groups:
 //
 //  1. Clearable — tags, runaway_ceiling, monitor_from, max_runtime_s,
-//     step_timeout_s, agent_id. Absent
+//     step_timeout_s, expect_every_s, blocked_timeout_s, agent_id, ci_workflow,
+//     ci_branch. Absent
 //     from the configuration, they are sent as an explicit JSON null. Under
 //     merge-patch that is the only way to clear them; under the older
 //     full-replace server a null decodes to a nil slice / nil pointer and clears
@@ -688,6 +890,14 @@ func monitorPatchFromModel(ctx context.Context, desired, cfg monitorResourceMode
 	}
 	putString("slug", desired.Slug)
 	putString("monitor_type", desired.MonitorType)
+	// ci_provider sits here with monitor_type and slug because it is the third
+	// attribute the API documents as immutable-and-ignored-on-update, and it is
+	// sent for the same reason they are: this provider still has to be correct
+	// against a server that replaces rather than merges. Against the real API it
+	// is a guaranteed no-op — checkPatchRequest has no ci_provider member, so
+	// the key is not even decoded — and RequiresReplace means a changed value
+	// never reaches Update in the first place.
+	putString("ci_provider", desired.CiProvider)
 	putString("schedule_kind", desired.ScheduleKind)
 	putInt64("period_s", desired.PeriodS)
 	putString("tz", desired.TZ)
@@ -734,6 +944,60 @@ func monitorPatchFromModel(ctx context.Context, desired, cfg monitorResourceMode
 		patch["step_timeout_s"] = nil
 	} else {
 		patch["step_timeout_s"] = desired.StepTimeoutS.ValueInt64()
+	}
+
+	// expect_every_s is clearable in the same way and for the same reason, with
+	// the sharpest consequence of the group: an absent key would leave the
+	// stored floor in place, so removing the attribute from a configuration
+	// would silently keep paging — and, in the other direction, a value that
+	// never reached the API would leave an on_demand monitor detecting nothing
+	// at all while the configuration said otherwise. Its range starts at 60, so
+	// omit-when-zero would have looked harmless and pinned the attribute
+	// forever. Safe to send on an http monitor: the API accepts the floor on
+	// every monitor_type, so there is no rejection to anticipate.
+	if cfg.ExpectEveryS.IsNull() || desired.ExpectEveryS.IsNull() {
+		patch["expect_every_s"] = nil
+	} else {
+		patch["expect_every_s"] = desired.ExpectEveryS.ValueInt64()
+	}
+
+	// blocked_timeout_s is clearable, with a twist worth stating plainly: the
+	// null does not disable the rule, it restores the server's 24-hour
+	// check.DefaultBlockedTimeout. That still makes the explicit-null form the
+	// right one — omitting the key would leave a bespoke timeout in place after
+	// the attribute was deleted from the configuration, so "go back to the
+	// default" would be unreachable through Terraform, which is exactly the bug
+	// tags, runaway_ceiling and monitor_from all had. Safe on an http monitor:
+	// the API accepts blocked_timeout_s on every monitor_type.
+	if cfg.BlockedTimeoutS.IsNull() || desired.BlockedTimeoutS.IsNull() {
+		patch["blocked_timeout_s"] = nil
+	} else {
+		patch["blocked_timeout_s"] = desired.BlockedTimeoutS.ValueInt64()
+	}
+
+	// ci_workflow and ci_branch are clearable, and they are the one place in
+	// this function where the omit-when-empty shape would not merely be wrong
+	// but actively inverted. The API deliberately deviates from RFC 7396 for
+	// these two: an explicit "" PRESERVES the stored filter — a guard against
+	// full-body clients unbinding a live filter by sending their unset default —
+	// and ONLY an explicit null clears it. So a "" on the wire is the exact
+	// opposite of what deleting the attribute means, and this branch is written
+	// to make "" unreachable: null in the configuration sends null, and the
+	// schema's LengthAtLeast(1) refuses a configured "" at plan time.
+	//
+	// Sending the pair on a monitor with no CI binding is a no-op the API
+	// accepts: it guards SetCheckCIBinding on the STORED ci_provider, so the
+	// merged filters are simply never written. ValidateConfig has already
+	// refused a configured filter in that case anyway.
+	if cfg.CiWorkflow.IsNull() || desired.CiWorkflow.IsNull() {
+		patch["ci_workflow"] = nil
+	} else {
+		patch["ci_workflow"] = desired.CiWorkflow.ValueString()
+	}
+	if cfg.CiBranch.IsNull() || desired.CiBranch.IsNull() {
+		patch["ci_branch"] = nil
+	} else {
+		patch["ci_branch"] = desired.CiBranch.ValueString()
 	}
 
 	if cfg.MonitorFrom.IsNull() || desired.MonitorFrom.ValueString() == "" {
@@ -795,6 +1059,42 @@ func int64OrNull(v int64) types.Int64 {
 		return types.Int64Null()
 	}
 	return types.Int64Value(v)
+}
+
+// writeOnlyString maps an attribute the API accepts but never reports back —
+// ci_workflow and ci_branch, and nothing else today.
+//
+// Neither has a field on api/checks.go's checkResponse, so no GET, list or
+// PATCH response can carry one; the decoded value is always "", whatever the
+// server actually holds. Passing that "" through stringOrNull would null the
+// attribute on the first refresh after every apply, producing a permanent diff
+// against any configuration that sets it. Carrying the prior value forward
+// instead is the only self-consistent option available: state reports what
+// Terraform last wrote.
+//
+// The cost is stated in the schema description rather than hidden: a filter
+// changed outside Terraform cannot be detected, and an imported monitor starts
+// with both attributes null regardless of how it is really configured. The
+// first apply after an import writes the configured values and the two agree
+// from then on.
+//
+// The apiVal argument is not dead code standing in for that: it is the seam
+// that makes this correct the day the API starts returning the filters. A real
+// value always wins over the prior one, so the function turns into an ordinary
+// refresh with no call-site change.
+//
+// An unknown prior resolves to null. Terraform resolves config-derived unknowns
+// before apply, so a plan should never reach here holding one — but writing an
+// unknown into state is a hard "invalid result object after apply" error, and
+// null is both a legal value and the truthful one for "not known here".
+func writeOnlyString(apiVal string, prior types.String) types.String {
+	if apiVal != "" {
+		return types.StringValue(apiVal)
+	}
+	if prior.IsUnknown() {
+		return types.StringNull()
+	}
+	return prior
 }
 
 // timestampOrNull maps an optional API timestamp to state.
@@ -864,6 +1164,13 @@ func modelFromMonitor(ctx context.Context, mon *client.Monitor, prior monitorRes
 		// canonical UUID — never the slug a caller may have attached it with.
 		AgentID: stringOrNull(mon.AgentID),
 
+		// ci_provider IS reported by GET and list (checkResponse.CiProvider,
+		// omitempty), so it refreshes normally and an import picks it up. Its
+		// two filters do not — see writeOnlyString.
+		CiProvider: stringOrNull(mon.CiProvider),
+		CiWorkflow: writeOnlyString(mon.CiWorkflow, prior.CiWorkflow),
+		CiBranch:   writeOnlyString(mon.CiBranch, prior.CiBranch),
+
 		// failure_threshold is NOT NULL DEFAULT 1 server-side and always comes
 		// back, so it is a concrete number rather than an int64OrNull.
 		FailureThreshold: types.Int64Value(mon.FailureThreshold),
@@ -902,6 +1209,24 @@ func modelFromMonitor(ctx context.Context, mon *client.Monitor, prior monitorRes
 		m.StepTimeoutS = types.Int64Value(*mon.StepTimeoutS)
 	} else {
 		m.StepTimeoutS = types.Int64Null()
+	}
+	// And for expect_every_s: absent means there is no silence floor, which has
+	// to read as null rather than as a 0 no practitioner could have written
+	// (the valid range starts at 60).
+	if mon.ExpectEveryS != nil {
+		m.ExpectEveryS = types.Int64Value(*mon.ExpectEveryS)
+	} else {
+		m.ExpectEveryS = types.Int64Null()
+	}
+	// And for blocked_timeout_s: absent means the 24-hour default applies, NOT
+	// that the monitor waits forever. Null is still the right reading — it is
+	// "no value of my own", the state an omitted attribute has to round-trip to
+	// — and 0 would be doubly wrong, since the server reads a stored 0 as unset
+	// too.
+	if mon.BlockedTimeoutS != nil {
+		m.BlockedTimeoutS = types.Int64Value(*mon.BlockedTimeoutS)
+	} else {
+		m.BlockedTimeoutS = types.Int64Null()
 	}
 	m.MonitorFrom = monitorFromValue(mon.MonitorFrom, prior.MonitorFrom)
 

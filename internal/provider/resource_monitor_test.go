@@ -1388,3 +1388,366 @@ resource "lastping_monitor" "probe" {
 		},
 	})
 }
+
+// TestAccMonitor_blockedTimeoutCanBeRemoved is the clearable proof for
+// blocked_timeout_s, and it differs from every other member of that group in
+// what "cleared" means.
+//
+// A `blocked` ping suspends the ordinary absence rules — the silence deadline,
+// expect_every_s and the run clock all stand down while a job waits on a human
+// — and blocked_timeout_s is the bound on that suspension. Removing it does NOT
+// mean "wait forever": the server falls back to check.DefaultBlockedTimeout,
+// 24 hours. So the attribute has no "off" state at all, only a length, and the
+// property under test is that Terraform can hand it back to the default.
+//
+// It still has to travel as an explicit null. Under merge-patch an absent key
+// leaves the stored bound in place, so a bespoke 2-hour timeout set once
+// through Terraform could never be returned to the default — and the second
+// step reads the monitor back through the API rather than trusting state,
+// because state agreeing with the plan proves nothing when the plan said
+// "removed" and the server was never told.
+func TestAccMonitor_blockedTimeoutCanBeRemoved(t *testing.T) {
+	const withBlocked = `
+resource "lastping_monitor" "bt" {
+  name              = "acc-blocked-timeout"
+  slug              = "acc-blocked-timeout"
+  schedule_kind     = "simple"
+  period_s          = 3600
+  grace_s           = 600
+  max_runtime_s     = 14400
+  blocked_timeout_s = 7200
+}`
+	const withoutBlocked = `
+resource "lastping_monitor" "bt" {
+  name          = "acc-blocked-timeout"
+  slug          = "acc-blocked-timeout"
+  schedule_kind = "simple"
+  period_s      = 3600
+  grace_s       = 600
+  max_runtime_s = 14400
+}`
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: withBlocked,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("lastping_monitor.bt", "blocked_timeout_s", "7200"),
+					// The blocked clock is independent of the run clock: setting
+					// one must not disturb the other.
+					resource.TestCheckResourceAttr("lastping_monitor.bt", "max_runtime_s", "14400"),
+					resource.TestCheckResourceAttrWith("lastping_monitor.bt", "id", func(id string) error {
+						mon, err := testAccDirectClient(t).GetMonitor(t.Context(), id)
+						if err != nil {
+							return err
+						}
+						if mon.BlockedTimeoutS == nil || *mon.BlockedTimeoutS != 7200 {
+							return fmt.Errorf("server holds blocked_timeout_s=%v, want 7200", mon.BlockedTimeoutS)
+						}
+						return nil
+					}),
+				),
+			},
+			{
+				Config: withoutBlocked,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr("lastping_monitor.bt", "blocked_timeout_s"),
+					resource.TestCheckResourceAttrWith("lastping_monitor.bt", "id", func(id string) error {
+						mon, err := testAccDirectClient(t).GetMonitor(t.Context(), id)
+						if err != nil {
+							return err
+						}
+						// Cleared server-side means "the 24-hour default now
+						// applies", not "unbounded" — the column is NULL and the
+						// rule still fires.
+						if mon.BlockedTimeoutS != nil {
+							return fmt.Errorf("server still holds blocked_timeout_s=%d, want it back at the default",
+								*mon.BlockedTimeoutS)
+						}
+						if mon.MaxRuntimeS == nil || *mon.MaxRuntimeS != 14400 {
+							return fmt.Errorf("clearing blocked_timeout_s disturbed max_runtime_s=%v",
+								mon.MaxRuntimeS)
+						}
+						return nil
+					}),
+				),
+			},
+			{
+				// And it stays cleared: no perpetual diff on re-plan.
+				Config:   withoutBlocked,
+				PlanOnly: true,
+			},
+			{
+				ResourceName:      "lastping_monitor.bt",
+				ImportState:       true,
+				ImportStateId:     "acc-blocked-timeout",
+				ImportStateVerify: true,
+			},
+		},
+	})
+}
+
+// TestAccMonitor_blockedTimeoutOnHTTPMonitor guards against the obvious wrong
+// generalisation.
+//
+// max_runtime_s and step_timeout_s are both refused on monitor_type = "http",
+// so it is natural to assume every detection attribute is. blocked_timeout_s is
+// not: it has no run-scoped precondition — a `blocked` ping is a statement
+// about the monitor, not about an armed run — and the API accepts it on every
+// monitor type. A ValidateConfig rule copied from its two neighbours would
+// refuse a configuration the server is perfectly happy with, which is the kind
+// of error a practitioner can do nothing about.
+func TestAccMonitor_blockedTimeoutOnHTTPMonitor(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{{
+			Config: `
+resource "lastping_monitor" "probe" {
+  name              = "acc-http-blocked"
+  slug              = "acc-http-blocked"
+  monitor_type      = "http"
+  probe_url         = "https://example.com/"
+  probe_interval_s  = 300
+  blocked_timeout_s = 3600
+}`,
+			Check: resource.ComposeAggregateTestCheckFunc(
+				resource.TestCheckResourceAttr("lastping_monitor.probe", "blocked_timeout_s", "3600"),
+			),
+		}},
+	})
+}
+
+// TestAccMonitor_ciBinding is the end-to-end proof that a CI monitor can be
+// declared in HCL at all, which before these attributes it could not.
+//
+// The import step deliberately ignores ci_workflow and ci_branch, and that is
+// the finding rather than a workaround: no API response carries either filter,
+// so an imported monitor cannot recover them however it is really configured.
+// ci_provider IS returned, so it is verified normally — an import that silently
+// dropped it was the original bug.
+func TestAccMonitor_ciBinding(t *testing.T) {
+	const config = `
+resource "lastping_monitor" "ci" {
+  name          = "acc-ci-binding"
+  slug          = "acc-ci-binding"
+  monitor_type  = "ci"
+  schedule_kind = "simple"
+  period_s      = 86400
+  grace_s       = 3600
+  ci_provider   = "github"
+  ci_workflow   = "ci.yml"
+  ci_branch     = "main"
+}`
+	const filtersChanged = `
+resource "lastping_monitor" "ci" {
+  name          = "acc-ci-binding"
+  slug          = "acc-ci-binding"
+  monitor_type  = "ci"
+  schedule_kind = "simple"
+  period_s      = 86400
+  grace_s       = 3600
+  ci_provider   = "github"
+  ci_workflow   = "release.yml"
+  ci_branch     = "release"
+}`
+	const filtersRemoved = `
+resource "lastping_monitor" "ci" {
+  name          = "acc-ci-binding"
+  slug          = "acc-ci-binding"
+  monitor_type  = "ci"
+  schedule_kind = "simple"
+  period_s      = 86400
+  grace_s       = 3600
+  ci_provider   = "github"
+}`
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("lastping_monitor.ci", "ci_provider", "github"),
+					resource.TestCheckResourceAttr("lastping_monitor.ci", "ci_workflow", "ci.yml"),
+					resource.TestCheckResourceAttr("lastping_monitor.ci", "ci_branch", "main"),
+					resource.TestCheckResourceAttrWith("lastping_monitor.ci", "id", func(id string) error {
+						mon, err := testAccDirectClient(t).GetMonitor(t.Context(), id)
+						if err != nil {
+							return err
+						}
+						if mon.CiProvider != "github" {
+							return fmt.Errorf("server holds ci_provider=%q, want github", mon.CiProvider)
+						}
+						return nil
+					}),
+				),
+			},
+			{
+				// The filters update in place: only ci_provider is immutable.
+				Config: filtersChanged,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("lastping_monitor.ci", plancheck.ResourceActionUpdate),
+					},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("lastping_monitor.ci", "ci_workflow", "release.yml"),
+					resource.TestCheckResourceAttr("lastping_monitor.ci", "ci_branch", "release"),
+				),
+			},
+			{
+				// Removing them clears them. The API reads an explicit "" on
+				// these two as "preserve", so this only works because
+				// monitorPatchFromModel sends null and never "".
+				Config: filtersRemoved,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr("lastping_monitor.ci", "ci_workflow"),
+					resource.TestCheckNoResourceAttr("lastping_monitor.ci", "ci_branch"),
+					resource.TestCheckResourceAttr("lastping_monitor.ci", "ci_provider", "github"),
+				),
+			},
+			{
+				Config:   filtersRemoved,
+				PlanOnly: true,
+			},
+			{
+				ResourceName:      "lastping_monitor.ci",
+				ImportState:       true,
+				ImportStateId:     "acc-ci-binding",
+				ImportStateVerify: true,
+			},
+		},
+	})
+}
+
+// TestAccMonitor_ciFiltersAreNotRefreshable pins the documented cost of
+// ci_workflow and ci_branch being write-only.
+//
+// An import cannot recover them — no response carries them — so
+// ImportStateVerify has to be told to ignore both, and that ignore list IS the
+// assertion. If the API ever starts returning the filters, this step begins
+// passing without the ignore and the exemption should be deleted along with
+// modelFromMonitor's writeOnlyString fallback.
+func TestAccMonitor_ciFiltersAreNotRefreshable(t *testing.T) {
+	const config = `
+resource "lastping_monitor" "ciimp" {
+  name          = "acc-ci-import"
+  slug          = "acc-ci-import"
+  monitor_type  = "ci"
+  schedule_kind = "simple"
+  period_s      = 86400
+  grace_s       = 3600
+  ci_provider   = "gitlab"
+  ci_workflow   = "nightly"
+  ci_branch     = "main"
+}`
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("lastping_monitor.ciimp", "ci_workflow", "nightly"),
+				),
+			},
+			{
+				// A refresh must not drop what Terraform last wrote, even
+				// though the response says nothing about it.
+				Config:   config,
+				PlanOnly: true,
+			},
+			{
+				ResourceName:            "lastping_monitor.ciimp",
+				ImportState:             true,
+				ImportStateId:           "acc-ci-import",
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"ci_workflow", "ci_branch"},
+			},
+		},
+	})
+}
+
+// TestAccMonitor_ciProviderChangeForcesReplacement: the API treats the CI
+// binding as create-only and ignores ci_provider on PATCH entirely, so an
+// in-place update would apply cleanly, change nothing, and leave the same diff
+// on every subsequent plan. RequiresReplace makes the real cost — a new monitor
+// id, a new webhook URL and a new signing secret — visible at plan time.
+func TestAccMonitor_ciProviderChangeForcesReplacement(t *testing.T) {
+	const onGitHub = `
+resource "lastping_monitor" "swap" {
+  name          = "acc-ci-swap"
+  slug          = "acc-ci-swap"
+  monitor_type  = "ci"
+  schedule_kind = "simple"
+  period_s      = 86400
+  grace_s       = 3600
+  ci_provider   = "github"
+}`
+	const onGitLab = `
+resource "lastping_monitor" "swap" {
+  name          = "acc-ci-swap"
+  slug          = "acc-ci-swap"
+  monitor_type  = "ci"
+  schedule_kind = "simple"
+  period_s      = 86400
+  grace_s       = 3600
+  ci_provider   = "gitlab"
+}`
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: onGitHub,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("lastping_monitor.swap", "ci_provider", "github"),
+				),
+			},
+			{
+				Config: onGitLab,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("lastping_monitor.swap",
+							plancheck.ResourceActionDestroyBeforeCreate),
+					},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("lastping_monitor.swap", "ci_provider", "gitlab"),
+				),
+			},
+		},
+	})
+}
+
+// TestAccMonitor_ciFilterWithoutProviderRejected: the API accepts ci_workflow
+// on a monitor with no CI binding and silently discards it, and because no
+// response reports the filter back, the provider would write the configured
+// value into state unchallenged — an apply that succeeds, plans clean forever,
+// and does not do what the configuration says. Plan time is the only place that
+// is still visible.
+func TestAccMonitor_ciFilterWithoutProviderRejected(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{{
+			Config: `
+resource "lastping_monitor" "orphan" {
+  name          = "acc-ci-orphan"
+  slug          = "acc-ci-orphan"
+  schedule_kind = "simple"
+  period_s      = 3600
+  grace_s       = 600
+  ci_workflow   = "ci.yml"
+}`,
+			PlanOnly:    true,
+			ExpectError: regexp.MustCompile(`ci_workflow\s+has\s+no\s+effect\s+without\s+ci_provider`),
+		}},
+	})
+}

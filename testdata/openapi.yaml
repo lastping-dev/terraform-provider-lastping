@@ -114,7 +114,8 @@ components:
             entirely by run events (`start`/`success`/`fail`/…), never arms an
             absence deadline, and silence between runs never alerts. Run-scoped
             detection (`max_runtime_s`, `step_timeout_s`) still applies once a
-            run starts.
+            run starts, and `expect_every_s` — the silence floor — is the only
+            way to detect absence between runs.
             Required for `heartbeat` and `ci` monitor types.
             Ignored when `monitor_type` is `http` (schedule is driven by `probe_interval_s`).
           example: "simple"
@@ -200,6 +201,39 @@ components:
             there is nothing for a step to report progress within.  Use
             `probe_timeout_s` to bound a single probe.
           example: 300
+        expect_every_s:
+          type: [integer, "null"]
+          format: int64
+          minimum: 60
+          maximum: 31536000
+          description: |
+            **Silence floor**: open a `silence` incident if **no ping of any
+            kind** — `success`, `start`, `fail`, `step` — has arrived within
+            this many seconds, regardless of the schedule.  It is anchored on
+            the monitor's last activity (`last_ping_at`), never on the
+            schedule: it is a floor on silence, not a cadence.
+
+            Null or omitted turns it off, which is exactly how every monitor
+            behaved before this field existed.
+
+            **This is the only absence rule an `on_demand` monitor can have.**
+            That schedule kind arms no deadlines between runs by design, so
+            without `expect_every_s` an `on_demand` monitor reads `up`
+            indefinitely however long its agent stays dark.
+
+            It never fires mid-run: while a `/start` is outstanding the floor
+            stands down entirely and the run clock owns detection
+            (`max_runtime_s`, `step_timeout_s`).  A `blocked` ping also
+            suppresses it, bounded by `blocked_timeout_s`.
+
+            On `simple`/`cron` monitors it is a **backstop**: it joins the
+            schedule's own deadline as whichever is *sooner*, so it can tighten
+            detection under a long cadence but can never loosen it.
+
+            Accepted on every `monitor_type` and every `schedule_kind` — unlike
+            `max_runtime_s`/`step_timeout_s` it has no run-scoped precondition
+            that would make it a provable no-op on an HTTP monitor.
+          example: 900
         blocked_timeout_s:
           type: [integer, "null"]
           format: int64
@@ -366,8 +400,9 @@ components:
         - **Omitted field** — the stored value is left unchanged.
         - **Explicit `null`** — clears the value. Accepted only by
           `runaway_ceiling`, `max_runtime_s`, `step_timeout_s`,
-          `blocked_timeout_s`, `monitor_from`, `ci_workflow`, `ci_branch`,
-          `tags` and `agent_id`; those are the nine properties typed to allow
+          `blocked_timeout_s`, `expect_every_s`, `monitor_from`,
+          `ci_workflow`, `ci_branch`,
+          `tags` and `agent_id`; those are the ten properties typed to allow
           `null` below. For `agent_id`, explicit `null` detaches the monitor
           from its agent — it does not delete the agent or the monitor. For
           `blocked_timeout_s`, explicit `null` does NOT mean "wait forever" —
@@ -391,7 +426,8 @@ components:
             entirely by run events, never arms an absence deadline, and
             silence between runs never alerts. Run-scoped detection
             (`max_runtime_s`, `step_timeout_s`) still applies once a run
-            starts.
+            starts, and `expect_every_s` — the silence floor — is the only way
+            to detect absence between runs.
             Ignored when the monitor's type is `http` (schedule is driven by
             `probe_interval_s`).
           example: "simple"
@@ -469,6 +505,21 @@ components:
             monitor** when sent with a non-null value.  An explicit `null` on an
             `http` monitor is accepted as a no-op.
           example: 300
+        expect_every_s:
+          type: [integer, "null"]
+          format: int64
+          minimum: 60
+          maximum: 31536000
+          description: |
+            **Silence floor** in seconds: alert if no ping of any kind arrives
+            within this window, regardless of the schedule.
+
+            Explicit `null` turns the floor off; omitting the field leaves it
+            as stored.  On an `on_demand` monitor, clearing it returns the
+            monitor to arming **no absence deadlines at all** between runs.
+
+            Accepted on every `monitor_type`, including `http`.
+          example: 900
         blocked_timeout_s:
           type: [integer, "null"]
           format: int64
@@ -629,7 +680,8 @@ components:
             `on_demand` means the check has no cadence: it never arms an
             absence deadline, so silence between runs never alerts. Run-scoped
             detection (`max_runtime_s`, `step_timeout_s`) still applies once a
-            run starts.
+            run starts, and `expect_every_s` — the silence floor — is the only
+            way to detect absence between runs.
           example: "simple"
         period_s:
           type: integer
@@ -667,6 +719,14 @@ components:
             response when unset**, in which case stall detection is disabled.
             Never set on `http` monitors.
           example: 300
+        expect_every_s:
+          type: [integer, "null"]
+          format: int64
+          description: |
+            Silence floor in seconds.  **Omitted from the response when
+            unset**, in which case absence is detected only by the schedule —
+            and, for an `on_demand` monitor, not at all between runs.
+          example: 900
         blocked_timeout_s:
           type: [integer, "null"]
           format: int64
@@ -1396,6 +1456,20 @@ components:
             CI-only. Run duration in seconds. Omitted when unavailable or zero,
             and always omitted on an agent/heartbeat run.
           example: 120
+        duration_ms:
+          type: integer
+          format: int64
+          description: |
+            Wall-clock duration in milliseconds, measured by LastPing from the
+            run's `/start` -> success timing (`pings.duration_ms`). Present on
+            ANY completed run — CI or agent/heartbeat — whose success ping
+            paired with a preceding start on the same `rid`; omitted otherwise.
+
+            Distinct from `duration_s`: that field is CI-only and self-reported
+            by the provider from `ci_meta`, this one is computed by LastPing
+            for every run kind. The two can each be present without the other
+            and must not be treated as confirming each other.
+          example: 128734
         outcome:
           type: string
           description: |
@@ -1644,6 +1718,162 @@ components:
             "down/silence": "[LastPing] {check_name} hasn't checked in — last seen {last_ping}."
             fail: "{failing_stage} failed on {branch} — {run_url}."
 
+    Assertion:
+      type: object
+      description: >-
+        One condition a monitor's ping body must satisfy on a successful run.
+        A ping body that fails any assertion turns that success into a `fail`
+        with cause `assertion` — the existing incident, routing, flap-hold
+        and notification path handles it exactly like any other failure. This
+        is deliberately not a query language: `contains`/`not_contains` is a
+        substring test, `matches` is a Go RE2 regexp (bounded to 1000 bytes;
+        RE2 does not backtrack so pattern length, not pattern complexity, is
+        the risk being bounded), and `json_path` is a dotted-path lookup
+        (`a.b.c`) over the body decoded as JSON — not a JSONPath library, so
+        `[`, `*` and `$` are rejected rather than silently doing something
+        unexpected. All four kinds are validated at write time (this PUT), so
+        a malformed assertion is a 400 here, never a runtime surprise the
+        next time the check reports success.
+      required:
+        - name
+        - kind
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+          description: Server-assigned. Present on GET/PUT responses; ignored if sent in a PUT request body.
+        name:
+          type: string
+          description: Human label for the assertion. Appears in the alert's failure reason.
+          example: "rows processed"
+        kind:
+          type: string
+          enum: [contains, not_contains, matches, json_path]
+          description: >-
+            How the body is inspected. `contains`/`not_contains` and `matches`
+            read `value` against the raw body text. `json_path` decodes the
+            body as JSON and compares the value at `path` to `value` using `op`.
+        value:
+          type: string
+          description: >-
+            Required for `contains`, `not_contains` and `matches` (substring or
+            RE2 pattern, max 1000 bytes). For `json_path`, the expected value
+            to compare against — compared numerically if both the extracted
+            value and `value` parse as a number (so `"12.5" > "3"` is true),
+            otherwise compared as strings.
+          example: "0"
+        path:
+          type: string
+          description: >-
+            Required for `json_path` only. A dotted path into the body decoded
+            as JSON, e.g. `"result.rows_processed"`. Must not contain `[`, `*`
+            or `$` — this is a fixed lookup, not a query.
+          example: "result.rows_processed"
+        op:
+          type: string
+          enum: [eq, ne, gt, gte, lt, lte]
+          description: Required for `json_path` only. Comparison operator between the extracted value and `value`.
+
+    AssertionsResponse:
+      type: object
+      description: The complete set of output assertions configured for a check.
+      required:
+        - assertions
+      properties:
+        assertions:
+          type: array
+          description: Always a JSON array, empty when the check has no assertions configured.
+          items:
+            $ref: "#/components/schemas/Assertion"
+
+    MetricGuard:
+      type: object
+      description: >-
+        A ceiling on a number the job reports about itself. An assertion
+        catches a run that did nothing; a guard catches the opposite — an
+        agent that loops, retries and burns money is not pinging fast, so a
+        ping-rate ceiling never sees it. Each guard reads one number out of
+        the ping body at `path`, rolls it up across the trailing `window_s`
+        seconds with `aggregation`, and opens an incident with cause
+        `runaway` when the result EXCEEDS `ceiling` (equal does not trip — a
+        ceiling is the most you are allowed to spend, not the first amount
+        that is too much). There is no new incident cause: a tripped guard
+        reuses `runaway`, exactly as the fixed pings-per-hour
+        `runaway_ceiling` does, and the guard's `name` is written to the
+        incident's detail so the two are distinguishable in the alert.
+        Pings whose body is absent, is not JSON, or holds nothing numeric at
+        `path` are SKIPPED rather than counted as zero, so a `start` ping
+        never drags an average down.
+      required:
+        - name
+        - path
+        - window_s
+        - ceiling
+        - aggregation
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+          description: Server-assigned. Present on GET/PUT responses; ignored if sent in a PUT request body.
+        name:
+          type: string
+          description: >-
+            Human label for the guard. It is written to the incident's detail
+            when the guard trips, and is the only thing that distinguishes a
+            tripped guard from a ping-rate runaway in the alert.
+          example: "daily spend"
+        path:
+          type: string
+          description: >-
+            A dotted path into the ping body decoded as JSON, e.g.
+            `"cost.usd"`. Identical in meaning to an `Assertion`'s `path` and
+            read by the same code: it must not contain `[`, `*` or `$`, since
+            this is a fixed lookup rather than a query. A value that is a
+            numeric string counts as a number, on the same rule assertions use.
+          example: "cost.usd"
+        window_s:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 604800
+          description: >-
+            Trailing window in seconds. Capped at 604800 (7 days), and the cap
+            is cost rather than policy: a guard re-aggregates every ping body
+            in its window on every ping, so the work is linear in the window
+            (measured: 4.2 ms per ping at a 1-hour window against 390 ms at 30
+            days). A window longer than the 90-day ping retention would also
+            aggregate over rows the pruner has already deleted and quietly
+            report a number lower than the truth.
+          example: 86400
+        ceiling:
+          type: number
+          format: double
+          description: >-
+            The value the aggregate must not exceed. Zero and negative values
+            are both legitimate.
+          example: 50
+        aggregation:
+          type: string
+          enum: [sum, max, avg]
+          description: >-
+            How the numbers found in the window are rolled up: `sum` totals
+            them, `max` takes the largest, `avg` averages them over the pings
+            that actually reported a number at `path`.
+
+    MetricGuardsResponse:
+      type: object
+      description: The complete set of metric guards configured for a check.
+      required:
+        - guards
+      properties:
+        guards:
+          type: array
+          description: Always a JSON array, empty when the check has no guards configured.
+          items:
+            $ref: "#/components/schemas/MetricGuard"
+
 security: []
 
 paths:
@@ -1865,8 +2095,8 @@ paths:
 
         - **Omitted field** — the stored value is left unchanged.
         - **Explicit `null`** — clears the value. Supported on `runaway_ceiling`,
-          `max_runtime_s`, `step_timeout_s`, `monitor_from`, `ci_workflow`,
-          `ci_branch`, `tags`, and `agent_id` only; for `tags`, explicit `null`
+          `max_runtime_s`, `step_timeout_s`, `expect_every_s`, `monitor_from`,
+          `ci_workflow`, `ci_branch`, `tags`, and `agent_id` only; for `tags`, explicit `null`
           is equivalent to sending `[]`; for `agent_id`, explicit `null`
           detaches the monitor from its agent without deleting either of them.
           `failure_threshold` is NOT clearable (the column is `NOT NULL DEFAULT
@@ -2379,6 +2609,338 @@ paths:
               `every-run`, `success`, `started`, `blocked`, or `note`
               (e.g. `"down"` or `"down/silence"`).
             - Template body references an unknown `{variable}`.
+            - Malformed JSON body.
+            Nothing is written when any entry fails validation.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: Check not found in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /api/v1/checks/{id}/assertions:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: UUID of the check.
+        schema:
+          type: string
+          format: uuid
+        example: "550e8400-e29b-41d4-a716-446655440000"
+
+    get:
+      operationId: getAssertions
+      summary: Get output assertions for a check
+      description: |
+        Returns the output assertions configured for the check. Returns an
+        empty `assertions` array when none are set (the overwhelmingly common
+        case, and the case that must cost at most one indexed lookup on the
+        ping-processing path).
+
+        A ping body that fails any assertion on a `success` signal turns that
+        signal into a `fail` with cause `assertion` — see the `Assertion`
+        schema for how each `kind` is evaluated.
+      tags: [Checks]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: Current output assertions for this check (may be an empty array).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssertionsResponse"
+              example:
+                assertions:
+                  - id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                    name: "rows processed"
+                    kind: "json_path"
+                    path: "result.rows_processed"
+                    op: "gt"
+                    value: "0"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: Check not found in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+    put:
+      operationId: putAssertions
+      summary: Replace output assertions for a check
+      description: |
+        Replaces the complete set of output assertions for the check
+        (**replace-the-set** semantics) — the request body is the new set in
+        its entirety; assertions absent from the body are deleted.
+
+        Every assertion is validated before any write, using the exact
+        evaluator the processor calls on every successful ping
+        (`core/assertion.Validate`): an uncompilable regexp, a `matches`
+        pattern over 1000 bytes, a missing required field for the given
+        `kind`, or a `json_path` containing `[`, `*` or `$` all fail the
+        request with `400` and **nothing is written**. The `400` message
+        names the offending assertion by its `name`.
+
+        At most **20 assertions** are allowed per check — the same cap
+        applied to tags — because assertions are evaluated on every
+        successful ping and an unbounded set is an unbounded per-ping cost.
+        A request over the cap is rejected with `400` before any per-assertion
+        validation runs.
+
+        Returns the resulting set (same shape as `GET`) on success.
+      tags: [Checks]
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - assertions
+              properties:
+                assertions:
+                  type: array
+                  description: The complete new set of assertions (at most 20). An empty array clears all assertions.
+                  items:
+                    $ref: "#/components/schemas/Assertion"
+            examples:
+              rows_processed:
+                summary: Assert a JSON field is greater than zero
+                value:
+                  assertions:
+                    - name: "rows processed"
+                      kind: "json_path"
+                      path: "result.rows_processed"
+                      op: "gt"
+                      value: "0"
+              body_contains:
+                summary: Assert the body reports success text
+                value:
+                  assertions:
+                    - name: "no error text"
+                      kind: "not_contains"
+                      value: "ERROR"
+              clear_all:
+                summary: Clear all assertions
+                value:
+                  assertions: []
+      responses:
+        "200":
+          description: Resulting output assertions after applying the replace-the-set operation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssertionsResponse"
+              example:
+                assertions:
+                  - id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                    name: "rows processed"
+                    kind: "json_path"
+                    path: "result.rows_processed"
+                    op: "gt"
+                    value: "0"
+        "400":
+          description: |
+            Invalid request — one of:
+            - More than 20 assertions in the request.
+            - An assertion fails `core/assertion.Validate`: missing `name`,
+              missing `value`/`path`/`op` for the given `kind`, an uncompilable
+              `matches` regexp, a `matches` pattern over 1000 bytes, an invalid
+              `op`, or a `json_path` containing `[`, `*` or `$`.
+            - Malformed JSON body.
+            Nothing is written when any entry fails validation.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: Check not found in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /api/v1/checks/{id}/guards:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: UUID of the check.
+        schema:
+          type: string
+          format: uuid
+        example: "550e8400-e29b-41d4-a716-446655440000"
+
+    get:
+      operationId: getMetricGuards
+      summary: Get metric guards for a check
+      description: |
+        Returns the metric guards configured for the check. Returns an empty
+        `guards` array when none are set — the overwhelmingly common case, and
+        the case that costs zero extra queries on the ping-processing path
+        (the "has any guard" test rides on the row the processor already
+        fetched).
+
+        See the `MetricGuard` schema for how a guard is evaluated and why a
+        tripped guard opens a `runaway` incident rather than introducing a new
+        cause.
+      tags: [Checks]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: Current metric guards for this check (may be an empty array).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MetricGuardsResponse"
+              example:
+                guards:
+                  - id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                    name: "daily spend"
+                    path: "cost.usd"
+                    window_s: 86400
+                    ceiling: 50
+                    aggregation: "sum"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: Check not found in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+    put:
+      operationId: putMetricGuards
+      summary: Replace metric guards for a check
+      description: |
+        Replaces the complete set of metric guards for the check
+        (**replace-the-set** semantics) — the request body is the new set in
+        its entirety; guards absent from the body are deleted.
+
+        Every guard is validated before any write
+        (`core/metricguard.Validate`): a missing `name`, a `path` containing
+        `[`, `*` or `$`, an `aggregation` outside `sum`/`max`/`avg`, a
+        `window_s` of zero or below, a `window_s` above 604800, or a
+        non-finite `ceiling` all fail the request with `400` and **nothing is
+        written**. The `400` message names the offending guard.
+
+        Two caps apply, and both are measured cost rather than taste:
+
+        - **`window_s` at most 604800 seconds (7 days).** A guard re-reads
+          every ping body in its window on every ping, so the work is linear
+          in the window: 4.2 ms per ping at one hour, 390 ms at 30 days. Seven
+          days is also comfortably inside the 90-day ping retention, past
+          which a guard would aggregate over already-pruned rows and quietly
+          under-report.
+        - **At most 5 guards per check**, against 20 for assertions. An
+          assertion is a string match over a set already in hand; a guard is
+          its own query, because each carries its own window — so N guards
+          multiply the per-ping cost by N.
+
+        Returns the resulting set (same shape as `GET`) on success.
+      tags: [Checks]
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - guards
+              properties:
+                guards:
+                  type: array
+                  maxItems: 5
+                  description: The complete new set of guards (at most 5). An empty array clears all guards.
+                  items:
+                    $ref: "#/components/schemas/MetricGuard"
+            examples:
+              daily_spend:
+                summary: Cap what an agent may spend in a day
+                value:
+                  guards:
+                    - name: "daily spend"
+                      path: "cost.usd"
+                      window_s: 86400
+                      ceiling: 50
+                      aggregation: "sum"
+              worst_single_run:
+                summary: Cap the worst single run in an hour
+                value:
+                  guards:
+                    - name: "single-run tokens"
+                      path: "usage.total_tokens"
+                      window_s: 3600
+                      ceiling: 200000
+                      aggregation: "max"
+              clear_all:
+                summary: Clear all guards
+                value:
+                  guards: []
+      responses:
+        "200":
+          description: Resulting metric guards after applying the replace-the-set operation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MetricGuardsResponse"
+              example:
+                guards:
+                  - id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                    name: "daily spend"
+                    path: "cost.usd"
+                    window_s: 86400
+                    ceiling: 50
+                    aggregation: "sum"
+        "400":
+          description: |
+            Invalid request — one of:
+            - More than 5 guards in the request.
+            - A guard fails `core/metricguard.Validate`: missing `name`,
+              missing `path`, a `path` containing `[`, `*` or `$`, an
+              `aggregation` outside `sum`/`max`/`avg`, `window_s` at or below
+              zero, `window_s` above 604800, or a non-finite `ceiling`.
             - Malformed JSON body.
             Nothing is written when any entry fails validation.
           content:
@@ -3958,6 +4520,13 @@ paths:
         `incident_cause`, `incident_detail`, and `incident_resolved` are
         populated on either kind — enabling unattended failure triage without
         following links to the CI provider.
+
+        `duration_ms` is separate from `duration_s` and is NOT CI-only: it is
+        the wall-clock duration LastPing itself measured from the run's
+        `/start` -> success timing, present on any run (CI or agent/heartbeat)
+        whose success ping paired with its start. Use it to answer "how long
+        does this job normally take?" for a non-CI monitor, where `duration_s`
+        is never populated.
 
         Every entry also carries the run id (`rid`) and, when the run reported
         progress markers to `/<uuid>/step?rid=…`, the `steps` it reached. A run

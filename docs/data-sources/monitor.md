@@ -71,9 +71,14 @@ variable "slack_webhook_url" {
 
 - `agent_id` (String) UUID of the `lastping_agent` that owns this monitor. Null when the monitor is unattached — including right after its owning agent was deleted.
 - `alert_after` (String) RFC 3339 UTC timestamp after which a missing ping raises an incident.
+- `blocked_timeout_s` (Number) How long a run may sit `blocked` — waiting on a human — before a `blocked` incident opens, in seconds. Null when unset, which does **not** mean the monitor waits forever: the server falls back to a 24-hour default. There is no state in which the blocked timeout is off.
+- `ci_provider` (String) CI provider bound to this monitor (`github`, `gitlab` or `jenkins`), or null when it has no CI binding.
+
+The binding's `ci_workflow` and `ci_branch` filters have no attribute here, and cannot: no API response carries them, so a data source could only ever report null. The `lastping_monitor` resource exposes them as write-only attributes for that reason.
 - `created_at` (String) RFC 3339 UTC timestamp when the monitor was created.
 - `cron_expr` (String) 5-field cron expression, for `schedule_kind = "cron"`.
 - `due_at` (String) RFC 3339 UTC timestamp of the next expected ping.
+- `expect_every_s` (Number) Silence floor in seconds: the longest this monitor may go with no ping of any kind before a `silence` incident opens, regardless of its schedule. Null when unset, in which case absence is detected only by the schedule — and, on a `schedule_kind = "on_demand"` monitor, not at all between runs.
 - `failure_threshold` (Number) Consecutive explicit failures required before an incident opens (the `fail` cause only). Always present; `1` is the default, "open on the first failure".
 - `grace_s` (Number) Grace period in seconds after a deadline is missed before alerting.
 - `last_ping_at` (String) RFC 3339 UTC timestamp of the most recent ping. Null until the first ping.
