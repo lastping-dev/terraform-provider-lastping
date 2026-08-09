@@ -1533,7 +1533,6 @@ func TestAccMonitor_ciBinding(t *testing.T) {
 resource "lastping_monitor" "ci" {
   name          = "acc-ci-binding"
   slug          = "acc-ci-binding"
-  monitor_type  = "ci"
   schedule_kind = "simple"
   period_s      = 86400
   grace_s       = 3600
@@ -1545,7 +1544,6 @@ resource "lastping_monitor" "ci" {
 resource "lastping_monitor" "ci" {
   name          = "acc-ci-binding"
   slug          = "acc-ci-binding"
-  monitor_type  = "ci"
   schedule_kind = "simple"
   period_s      = 86400
   grace_s       = 3600
@@ -1557,7 +1555,6 @@ resource "lastping_monitor" "ci" {
 resource "lastping_monitor" "ci" {
   name          = "acc-ci-binding"
   slug          = "acc-ci-binding"
-  monitor_type  = "ci"
   schedule_kind = "simple"
   period_s      = 86400
   grace_s       = 3600
@@ -1637,7 +1634,6 @@ func TestAccMonitor_ciFiltersAreNotRefreshable(t *testing.T) {
 resource "lastping_monitor" "ciimp" {
   name          = "acc-ci-import"
   slug          = "acc-ci-import"
-  monitor_type  = "ci"
   schedule_kind = "simple"
   period_s      = 86400
   grace_s       = 3600
@@ -1683,7 +1679,6 @@ func TestAccMonitor_ciProviderChangeForcesReplacement(t *testing.T) {
 resource "lastping_monitor" "swap" {
   name          = "acc-ci-swap"
   slug          = "acc-ci-swap"
-  monitor_type  = "ci"
   schedule_kind = "simple"
   period_s      = 86400
   grace_s       = 3600
@@ -1693,7 +1688,6 @@ resource "lastping_monitor" "swap" {
 resource "lastping_monitor" "swap" {
   name          = "acc-ci-swap"
   slug          = "acc-ci-swap"
-  monitor_type  = "ci"
   schedule_kind = "simple"
   period_s      = 86400
   grace_s       = 3600

@@ -195,11 +195,12 @@ func (r *monitorResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 				Optional: true,
 				Computed: true,
 				Default:  stringdefault.StaticString("heartbeat"),
-				MarkdownDescription: "Kind of monitor: `heartbeat` (default, expects periodic pings), `ci` " +
-					"(bound to a CI provider webhook), or `http` (active probe). The API treats this as " +
-					"create-only — PATCH silently ignores it — so changing it here replaces the resource " +
-					"rather than leaving a permanent, un-appliable diff.",
-				Validators:    []validator.String{stringvalidator.OneOf("heartbeat", "ci", "http")},
+				MarkdownDescription: "Kind of monitor: `heartbeat` (default, expects periodic pings) or " +
+					"`http` (active probe). A CI-bound monitor is not a separate kind — it is a `heartbeat` " +
+					"monitor with `ci_provider` set, so bind CI through that attribute rather than through " +
+					"this one. The API treats this as create-only — PATCH silently ignores it — so " +
+					"changing it here replaces the resource rather than leaving a permanent, un-appliable diff.",
+				Validators:    []validator.String{stringvalidator.OneOf("heartbeat", "http")},
 				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
 			},
 			"schedule_kind": schema.StringAttribute{

@@ -264,7 +264,6 @@ resource "lastping_monitor" "research_agent" {
 resource "lastping_monitor" "nightly_release" {
   name          = "Nightly release pipeline"
   slug          = "nightly-release"
-  monitor_type  = "ci"
   schedule_kind = "simple"
   period_s      = 86400
   grace_s       = 3600

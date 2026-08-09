@@ -397,7 +397,7 @@ func TestMonitorCIProviderRequiresReplace(t *testing.T) {
 	require.True(t, monitorStringRequiresReplace(t, "ci_provider", "github", "gitlab"),
 		"ci_provider is create-only on the API, so changing it must replace the monitor")
 
-	require.True(t, monitorStringRequiresReplace(t, "monitor_type", "heartbeat", "ci"),
+	require.True(t, monitorStringRequiresReplace(t, "monitor_type", "heartbeat", "http"),
 		"monitor_type is the existing precedent this follows")
 
 	require.False(t, monitorStringRequiresReplace(t, "agent_id",
@@ -470,11 +470,12 @@ func TestMonitorCIFiltersRequireProvider(t *testing.T) {
 func TestMonitorCIFiltersSurviveRefresh(t *testing.T) {
 	ctx := context.Background()
 
-	// What the API actually returns for a CI monitor: the provider, never the
-	// filters.
+	// What the API actually returns for a CI monitor: a heartbeat monitor with
+	// ci_provider set, never the filters. "ci" is not a value the API ever
+	// writes to monitor_type.
 	fromAPI := &client.Monitor{
 		ID: "3f7c1f5a-1a2b-4c3d-8e9f-0a1b2c3d4e5f", Name: "acc",
-		MonitorType: "ci", ScheduleKind: "simple", PeriodS: 3600, TZ: "UTC", GraceS: 1800,
+		MonitorType: "heartbeat", ScheduleKind: "simple", PeriodS: 3600, TZ: "UTC", GraceS: 1800,
 		CiProvider: "github",
 	}
 
