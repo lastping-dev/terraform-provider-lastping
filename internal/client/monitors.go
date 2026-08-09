@@ -30,6 +30,7 @@ type Monitor struct {
 	StepTimeoutS         *int64   `json:"step_timeout_s,omitempty"`
 	ExpectEveryS         *int64   `json:"expect_every_s,omitempty"`
 	BlockedTimeoutS      *int64   `json:"blocked_timeout_s,omitempty"`
+	NotifyMinRunS        *int64   `json:"notify_min_run_s,omitempty"`
 	FailureThreshold     int64    `json:"failure_threshold,omitempty"`
 	Tags                 []string `json:"tags,omitempty"`
 	RunawayCeiling       *int64   `json:"runaway_ceiling,omitempty"`
@@ -145,7 +146,8 @@ func (c *Client) GetMonitorBySlug(ctx context.Context, slug string) (*Monitor, e
 //   - a key that is absent leaves the stored value alone;
 //   - a key whose value is nil serialises as JSON `null`, which clears the
 //     field — the API honours that for runaway_ceiling, max_runtime_s,
-//     step_timeout_s, expect_every_s, blocked_timeout_s, monitor_from, tags,
+//     step_timeout_s, expect_every_s, blocked_timeout_s, notify_min_run_s,
+//     monitor_from, tags,
 //     ci_workflow and ci_branch, and treats
 //     it as "absent" everywhere else. A null blocked_timeout_s is the odd one
 //     out in that list: it does not mean "wait forever", it restores the

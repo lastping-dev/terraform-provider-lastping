@@ -134,6 +134,10 @@ func TestMonitorNewInt64Validators(t *testing.T) {
 		{"expect_every_s", 31536000, true},
 		{"expect_every_s", 59, false},
 		{"expect_every_s", 31536001, false},
+		{"notify_min_run_s", 60, true},
+		{"notify_min_run_s", 31536000, true},
+		{"notify_min_run_s", 59, false},
+		{"notify_min_run_s", 31536001, false},
 		// blocked_timeout_s has no server-side bounds at all, so the only
 		// values refused here are the ones core/check would read as "unset"
 		// and silently replace with the 24-hour default. There is no upper
@@ -179,6 +183,39 @@ func TestMonitorMaxRuntimeRejectedOnHTTP(t *testing.T) {
 
 	// And it is only http that is refused.
 	heartbeat := withRuntime
+	heartbeat.MonitorType = types.StringValue("heartbeat")
+	heartbeat.ProbeURL = types.StringNull()
+	require.False(t, monitorValidateConfig(t, heartbeat).HasError())
+}
+
+// TestMonitorNotifyMinRunRejectedOnHTTP: the API answers 400
+// NOTIFY_MIN_RUN_NOT_SUPPORTED for notify_min_run_s on an http monitor, for the
+// same precondition as max_runtime_s: the floor only evaluates once a run's
+// duration is known, and that duration comes exclusively from a matched
+// /start + success pair, which a probe never sends.
+func TestMonitorNotifyMinRunRejectedOnHTTP(t *testing.T) {
+	base := monitorResourceModel{
+		Name:        types.StringValue("acc"),
+		MonitorType: types.StringValue("http"),
+		ProbeURL:    types.StringValue("https://example.com/"),
+		// The zero types.Set has no element type, which ObjectValueFrom
+		// rejects; every other zero value is a well-formed null.
+		Tags:       types.SetNull(types.StringType),
+		Assertions: monitorAssertionSetNull(),
+	}
+
+	withFloor := base
+	withFloor.NotifyMinRunS = types.Int64Value(300)
+	diags := monitorValidateConfig(t, withFloor)
+	require.True(t, diags.HasError(), "notify_min_run_s on an http monitor must be refused at plan time")
+	require.Contains(t, diags.Errors()[0].Summary(), "notify_min_run_s")
+
+	// Omitted on an http monitor: fine. The PATCH still carries an explicit
+	// null, which the API accepts there as a no-op.
+	require.False(t, monitorValidateConfig(t, base).HasError())
+
+	// And it is only http that is refused.
+	heartbeat := withFloor
 	heartbeat.MonitorType = types.StringValue("heartbeat")
 	heartbeat.ProbeURL = types.StringNull()
 	require.False(t, monitorValidateConfig(t, heartbeat).HasError())
@@ -552,7 +589,7 @@ func TestMonitorOptionalOnlyAttributesAreNotComputed(t *testing.T) {
 	for _, name := range []string{
 		"slug", "cron_expr", "tags", "runaway_ceiling", "monitor_from",
 		"probe_url", "probe_interval_s", "probe_expected_body", "max_runtime_s",
-		"step_timeout_s", "expect_every_s", "blocked_timeout_s", "agent_id",
+		"step_timeout_s", "expect_every_s", "blocked_timeout_s", "notify_min_run_s", "agent_id",
 		// ci_workflow and ci_branch are the ones most likely to be "fixed" into
 		// Computed one day: no API response carries them, so the provider
 		// carries prior state forward, and Computed looks like the tidy way to
@@ -664,6 +701,7 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		StepTimeoutS:         types.Int64Value(900),
 		ExpectEveryS:         types.Int64Value(1800),
 		BlockedTimeoutS:      types.Int64Value(7200),
+		NotifyMinRunS:        types.Int64Value(120),
 		FailureThreshold:     types.Int64Value(3),
 		Tags:                 tags,
 		RunawayCeiling:       types.Int64Value(40),
@@ -699,6 +737,7 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		"step_timeout_s":         int64(900),
 		"expect_every_s":         int64(1800),
 		"blocked_timeout_s":      int64(7200),
+		"notify_min_run_s":       int64(120),
 		"failure_threshold":      int64(3),
 		"ci_provider":            "github",
 		"ci_workflow":            "ci.yml",
@@ -733,6 +772,7 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		cfg.StepTimeoutS = types.Int64Null()
 		cfg.ExpectEveryS = types.Int64Null()
 		cfg.BlockedTimeoutS = types.Int64Null()
+		cfg.NotifyMinRunS = types.Int64Null()
 		cfg.AgentID = types.StringNull()
 		cfg.CiWorkflow = types.StringNull()
 		cfg.CiBranch = types.StringNull()
@@ -748,6 +788,7 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		want["step_timeout_s"] = nil
 		want["expect_every_s"] = nil
 		want["blocked_timeout_s"] = nil
+		want["notify_min_run_s"] = nil
 		want["agent_id"] = nil
 		// ci_workflow and ci_branch clear to null and NEVER to "": the API
 		// reads "" on these two as "leave the stored filter alone", so the
@@ -775,6 +816,7 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		require.Contains(t, string(body), `"max_runtime_s":null`)
 		require.Contains(t, string(body), `"step_timeout_s":null`)
 		require.Contains(t, string(body), `"blocked_timeout_s":null`)
+		require.Contains(t, string(body), `"notify_min_run_s":null`)
 		require.Contains(t, string(body), `"agent_id":null`)
 		require.Contains(t, string(body), `"ci_workflow":null`)
 		require.Contains(t, string(body), `"ci_branch":null`)
@@ -856,6 +898,7 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		cfg.StepTimeoutS = types.Int64Null()
 		cfg.ExpectEveryS = types.Int64Null()
 		cfg.BlockedTimeoutS = types.Int64Null()
+		cfg.NotifyMinRunS = types.Int64Null()
 		cfg.AgentID = types.StringNull()
 		cfg.CiWorkflow = types.StringNull()
 		cfg.CiBranch = types.StringNull()
@@ -877,6 +920,8 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		require.Nil(t, got["expect_every_s"])
 		require.Contains(t, got, "blocked_timeout_s")
 		require.Nil(t, got["blocked_timeout_s"])
+		require.Contains(t, got, "notify_min_run_s")
+		require.Nil(t, got["notify_min_run_s"])
 		require.Contains(t, got, "agent_id")
 		require.Nil(t, got["agent_id"])
 		require.Contains(t, got, "ci_workflow")
@@ -964,6 +1009,7 @@ func TestResolveUnknownsFromState_CoversEveryAttribute(t *testing.T) {
 		StepTimeoutS:         types.Int64Value(900),
 		ExpectEveryS:         types.Int64Value(1800),
 		BlockedTimeoutS:      types.Int64Value(7200),
+		NotifyMinRunS:        types.Int64Value(120),
 		FailureThreshold:     types.Int64Value(3),
 		Tags:                 types.SetValueMust(types.StringType, []attr.Value{types.StringValue("prod")}),
 		RunawayCeiling:       types.Int64Value(40),

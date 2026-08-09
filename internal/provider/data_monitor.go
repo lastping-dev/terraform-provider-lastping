@@ -36,6 +36,7 @@ type monitorDataModel struct {
 	MaxRuntimeS          types.Int64  `tfsdk:"max_runtime_s"`
 	StepTimeoutS         types.Int64  `tfsdk:"step_timeout_s"`
 	ExpectEveryS         types.Int64  `tfsdk:"expect_every_s"`
+	NotifyMinRunS        types.Int64  `tfsdk:"notify_min_run_s"`
 	BlockedTimeoutS      types.Int64  `tfsdk:"blocked_timeout_s"`
 	CiProvider           types.String `tfsdk:"ci_provider"`
 	FailureThreshold     types.Int64  `tfsdk:"failure_threshold"`
@@ -122,6 +123,13 @@ func monitorDataAttributes() map[string]schema.Attribute {
 				"any kind before a `silence` incident opens, regardless of its schedule. Null when unset, " +
 				"in which case absence is detected only by the schedule — and, on a " +
 				"`schedule_kind = \"on_demand\"` monitor, not at all between runs.",
+		},
+		"notify_min_run_s": schema.Int64Attribute{
+			Computed: true,
+			MarkdownDescription: "Notification duration floor in seconds: a run shorter than this produces " +
+				"no info-class notification (`success`, `every-run`, `note`). Null when unset, in which " +
+				"case every info-class event notifies regardless of how short the run was. Never suppresses " +
+				"`down`, `fail`, `recovery` or `blocked`, and never set on an `http` monitor.",
 		},
 		"blocked_timeout_s": schema.Int64Attribute{
 			Computed: true,
@@ -307,6 +315,11 @@ func monitorDataFromAPI(ctx context.Context, m *client.Monitor) (monitorDataMode
 		out.ExpectEveryS = types.Int64Value(*m.ExpectEveryS)
 	} else {
 		out.ExpectEveryS = types.Int64Null()
+	}
+	if m.NotifyMinRunS != nil {
+		out.NotifyMinRunS = types.Int64Value(*m.NotifyMinRunS)
+	} else {
+		out.NotifyMinRunS = types.Int64Null()
 	}
 	if m.BlockedTimeoutS != nil {
 		out.BlockedTimeoutS = types.Int64Value(*m.BlockedTimeoutS)

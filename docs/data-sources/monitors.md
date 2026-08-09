@@ -83,6 +83,7 @@ The binding's `ci_workflow` and `ci_branch` filters have no attribute here, and 
 - `monitor_from` (String) RFC 3339 UTC timestamp before which deadlines are not computed.
 - `monitor_type` (String) `heartbeat`, `ci`, or `http`.
 - `name` (String) Human-readable name.
+- `notify_min_run_s` (Number) Notification duration floor in seconds: a run shorter than this produces no info-class notification (`success`, `every-run`, `note`). Null when unset, in which case every info-class event notifies regardless of how short the run was. Never suppresses `down`, `fail`, `recovery` or `blocked`, and never set on an `http` monitor.
 - `paused` (Boolean) Whether alerting is suspended for this monitor.
 - `period_s` (Number) Expected ping interval in seconds, for `schedule_kind = "simple"`.
 - `ping_url` (String) URL a service HTTP GETs to record a successful ping.

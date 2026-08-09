@@ -256,6 +256,15 @@ resource "lastping_monitor" "research_agent" {
   # The two clocks are independent, which is why both attributes exist.
   max_runtime_s  = 14400
   expect_every_s = 1800
+
+  # On an agent monitor, one run is one task: routing `success` without a
+  # floor pages on every trivial question this agent answers. A run under two
+  # minutes produces no info-class notification (success, every-run, note) —
+  # but a run that FAILS still notifies however short it was, because
+  # notify_min_run_s never suppresses down/fail/recovery/blocked. It is not
+  # supported on monitor_type = "http": the floor needs a matched /start +
+  # success pair to know a duration, and a probe never sends one.
+  notify_min_run_s = 120
 }
 
 # A CI job, monitored from your pipeline's own webhooks rather than from a ping
@@ -370,6 +379,15 @@ The block is repeatable and **replaces the whole set**: the guards in the config
 ~> **Guards read the ping body, so the job has to send one** — for example `curl -d '{"cost":{"usd":0.42}}' "$PING_URL"`. A monitor with `monitor_type = "http"` has no ping body at all (the prober makes the request), so guards configured on one are never evaluated; the provider rejects them at plan time rather than storing a setting that cannot fire. (see [below for nested schema](#nestedblock--metric_guard))
 - `monitor_from` (String) RFC 3339 timestamp from which deadlines are computed for a new monitor. The API stores and returns UTC; a value written with a different offset is kept as configured as long as it denotes the same instant.
 - `monitor_type` (String) Kind of monitor: `heartbeat` (default, expects periodic pings) or `http` (active probe). A CI-bound monitor is not a separate kind — it is a `heartbeat` monitor with `ci_provider` set, so bind CI through that attribute rather than through this one. The API treats this as create-only — PATCH silently ignores it — so changing it here replaces the resource rather than leaving a permanent, un-appliable diff.
+- `notify_min_run_s` (Number) **Notification duration floor**: a run shorter than this many seconds produces no info-class notification. Between 60 and 31536000. Opt-in: omit it and every info-class event notifies regardless of how short the run was, which is how every monitor behaved before this attribute existed; removing it from the configuration turns it back off.
+
+Info-class means `success`, `every-run` and `note` — the events a monitor emits about a run that behaved. `started` is out of scope by construction: a run's duration does not exist yet when it begins, so the floor can never apply to it.
+
+~> **It never suppresses a failure.** `down`, `fail`, `recovery` and `blocked` are always delivered, however short the run — a short run that failed is exactly what a user needs to hear about. An unknown run duration fails open too: if the floor cannot be evaluated, the notification is sent.
+
+The case this exists for is an AI-agent monitor where one run is one task: routing `success` without this floor pages on every trivial question the agent answers. The floor quiets those without ever silencing a failure.
+
+~> **Not supported on `monitor_type = "http"`.** The floor only ever applies once a run's duration is known, and that duration is populated only by a matched `/start` + success pair — the same precondition `max_runtime_s` and `step_timeout_s` already require and an HTTP probe never provides, since the prober mints a fresh run id for every probe and never sends `/start`. The API rejects it with 400 `NOTIFY_MIN_RUN_NOT_SUPPORTED`, and this provider rejects it at plan time.
 - `paused` (Boolean) When true, the monitor does not alert regardless of ping status. Maps onto the `pause`/`resume` endpoints on update, not a PATCH field.
 - `period_s` (Number) Period in seconds, for `schedule_kind = "simple"`. Server-derived (equal to `probe_interval_s`) for `monitor_type = "http"`.
 - `probe_expected_body` (String) Substring the probe response body must contain to count as healthy.

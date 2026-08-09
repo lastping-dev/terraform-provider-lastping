@@ -241,6 +241,15 @@ resource "lastping_monitor" "research_agent" {
   # The two clocks are independent, which is why both attributes exist.
   max_runtime_s  = 14400
   expect_every_s = 1800
+
+  # On an agent monitor, one run is one task: routing `success` without a
+  # floor pages on every trivial question this agent answers. A run under two
+  # minutes produces no info-class notification (success, every-run, note) —
+  # but a run that FAILS still notifies however short it was, because
+  # notify_min_run_s never suppresses down/fail/recovery/blocked. It is not
+  # supported on monitor_type = "http": the floor needs a matched /start +
+  # success pair to know a duration, and a probe never sends one.
+  notify_min_run_s = 120
 }
 
 # A CI job, monitored from your pipeline's own webhooks rather than from a ping

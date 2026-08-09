@@ -1520,6 +1520,132 @@ resource "lastping_monitor" "probe" {
 	})
 }
 
+// TestAccMonitor_notifyMinRunSetUpdateAndClear covers the notification
+// duration floor end to end: set at create, changed in place, then cleared —
+// and the clear must actually reach the server, not merely stop showing up in
+// the plan, because that is the whole failure mode the clearable group exists
+// to rule out (see monitorPatchFromModel).
+func TestAccMonitor_notifyMinRunSetUpdateAndClear(t *testing.T) {
+	const withFloor = `
+resource "lastping_monitor" "nmr" {
+  name             = "acc-notify-min-run"
+  slug             = "acc-notify-min-run"
+  schedule_kind    = "on_demand"
+  grace_s          = 600
+  notify_min_run_s = 120
+}`
+	const floorUpdated = `
+resource "lastping_monitor" "nmr" {
+  name             = "acc-notify-min-run"
+  slug             = "acc-notify-min-run"
+  schedule_kind    = "on_demand"
+  grace_s          = 600
+  notify_min_run_s = 300
+}`
+	const withoutFloor = `
+resource "lastping_monitor" "nmr" {
+  name          = "acc-notify-min-run"
+  slug          = "acc-notify-min-run"
+  schedule_kind = "on_demand"
+  grace_s       = 600
+}`
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: withFloor,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("lastping_monitor.nmr", "notify_min_run_s", "120"),
+					resource.TestCheckResourceAttrWith("lastping_monitor.nmr", "id", func(id string) error {
+						mon, err := testAccDirectClient(t).GetMonitor(t.Context(), id)
+						if err != nil {
+							return err
+						}
+						if mon.NotifyMinRunS == nil || *mon.NotifyMinRunS != 120 {
+							return fmt.Errorf("server holds notify_min_run_s=%v, want 120", mon.NotifyMinRunS)
+						}
+						return nil
+					}),
+				),
+			},
+			{
+				// Update in place — must not force replacement.
+				Config: floorUpdated,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("lastping_monitor.nmr", "notify_min_run_s", "300"),
+					resource.TestCheckResourceAttrWith("lastping_monitor.nmr", "id", func(id string) error {
+						mon, err := testAccDirectClient(t).GetMonitor(t.Context(), id)
+						if err != nil {
+							return err
+						}
+						if mon.NotifyMinRunS == nil || *mon.NotifyMinRunS != 300 {
+							return fmt.Errorf("server holds notify_min_run_s=%v, want 300", mon.NotifyMinRunS)
+						}
+						return nil
+					}),
+				),
+			},
+			{
+				Config: withoutFloor,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr("lastping_monitor.nmr", "notify_min_run_s"),
+					// Read it back from the API: state agreeing with the plan
+					// proves nothing when the plan said "removed" and the server
+					// was never told.
+					resource.TestCheckResourceAttrWith("lastping_monitor.nmr", "id", func(id string) error {
+						mon, err := testAccDirectClient(t).GetMonitor(t.Context(), id)
+						if err != nil {
+							return err
+						}
+						if mon.NotifyMinRunS != nil {
+							return fmt.Errorf("server still holds notify_min_run_s=%d, want it cleared",
+								*mon.NotifyMinRunS)
+						}
+						return nil
+					}),
+				),
+			},
+			{
+				// And it stays cleared: no perpetual diff on re-plan.
+				Config:   withoutFloor,
+				PlanOnly: true,
+			},
+			{
+				ResourceName:      "lastping_monitor.nmr",
+				ImportState:       true,
+				ImportStateId:     "acc-notify-min-run",
+				ImportStateVerify: true,
+			},
+		},
+	})
+}
+
+// TestAccMonitor_notifyMinRunRejectedOnHTTP asserts the API's 400
+// NOTIFY_MIN_RUN_NOT_SUPPORTED is anticipated at plan time. Like max_runtime_s
+// and step_timeout_s, the floor only evaluates once a run's duration is known,
+// and an http probe never sends the /start that duration is measured from.
+func TestAccMonitor_notifyMinRunRejectedOnHTTP(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{{
+			Config: `
+resource "lastping_monitor" "probe" {
+  name              = "acc-http-notifyminrun"
+  slug              = "acc-http-notifyminrun"
+  monitor_type      = "http"
+  probe_url         = "https://example.com/"
+  probe_interval_s  = 300
+  notify_min_run_s  = 120
+}`,
+			PlanOnly:    true,
+			ExpectError: regexp.MustCompile(`notify_min_run_s.*not supported`),
+		}},
+	})
+}
+
 // TestAccMonitor_ciBinding is the end-to-end proof that a CI monitor can be
 // declared in HCL at all, which before these attributes it could not.
 //

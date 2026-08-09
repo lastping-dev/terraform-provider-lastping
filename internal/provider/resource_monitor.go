@@ -118,6 +118,7 @@ type monitorResourceModel struct {
 	MaxRuntimeS          types.Int64  `tfsdk:"max_runtime_s"`
 	StepTimeoutS         types.Int64  `tfsdk:"step_timeout_s"`
 	ExpectEveryS         types.Int64  `tfsdk:"expect_every_s"`
+	NotifyMinRunS        types.Int64  `tfsdk:"notify_min_run_s"`
 	BlockedTimeoutS      types.Int64  `tfsdk:"blocked_timeout_s"`
 	FailureThreshold     types.Int64  `tfsdk:"failure_threshold"`
 	Tags                 types.Set    `tfsdk:"tags"`
@@ -298,6 +299,31 @@ func (r *monitorResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 					"long cadence (a daily cron has a ~25-hour blind window) but can never loosen it.\n\n" +
 					"Accepted on every `monitor_type`, `http` included — unlike `max_runtime_s` and " +
 					"`step_timeout_s` it has no run-scoped precondition that would make it a no-op there.",
+				Validators: []validator.Int64{int64validator.Between(60, 31536000)},
+			},
+			"notify_min_run_s": schema.Int64Attribute{
+				Optional: true,
+				MarkdownDescription: "**Notification duration floor**: a run shorter than this many seconds " +
+					"produces no info-class notification. Between 60 and 31536000. Opt-in: omit it and every " +
+					"info-class event notifies regardless of how short the run was, which is how every " +
+					"monitor behaved before this attribute existed; removing it from the configuration turns " +
+					"it back off.\n\n" +
+					"Info-class means `success`, `every-run` and `note` — the events a monitor emits about a " +
+					"run that behaved. `started` is out of scope by construction: a run's duration does not " +
+					"exist yet when it begins, so the floor can never apply to it.\n\n" +
+					"~> **It never suppresses a failure.** `down`, `fail`, `recovery` and `blocked` are always " +
+					"delivered, however short the run — a short run that failed is exactly what a user needs " +
+					"to hear about. An unknown run duration fails open too: if the floor cannot be evaluated, " +
+					"the notification is sent.\n\n" +
+					"The case this exists for is an AI-agent monitor where one run is one task: routing " +
+					"`success` without this floor pages on every trivial question the agent answers. The " +
+					"floor quiets those without ever silencing a failure.\n\n" +
+					"~> **Not supported on `monitor_type = \"http\"`.** The floor only ever applies once a " +
+					"run's duration is known, and that duration is populated only by a matched `/start` + " +
+					"success pair — the same precondition `max_runtime_s` and `step_timeout_s` already " +
+					"require and an HTTP probe never provides, since the prober mints a fresh run id for " +
+					"every probe and never sends `/start`. The API rejects it with 400 " +
+					"`NOTIFY_MIN_RUN_NOT_SUPPORTED`, and this provider rejects it at plan time.",
 				Validators: []validator.Int64{int64validator.Between(60, 31536000)},
 			},
 			"blocked_timeout_s": schema.Int64Attribute{
@@ -534,6 +560,16 @@ func (r *monitorResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 //     max_runtime_s — the explicit null the update path always sends is a no-op
 //     the API accepts.
 //
+//   - notify_min_run_s set at all, same precondition as max_runtime_s: the
+//     floor only ever evaluates once a run's duration is known, and that
+//     duration comes exclusively from a matched /start + success pair — which
+//     an http probe never sends. 400 NOTIFY_MIN_RUN_NOT_SUPPORTED, and the
+//     explicit null the update path always sends is a no-op the API accepts,
+//     same as the other two. Unlike expect_every_s and blocked_timeout_s,
+//     which key off ordinary pings and stay live on every monitor_type,
+//     notify_min_run_s shares max_runtime_s's run-scoped precondition and so
+//     shares its rejection.
+//
 // And two rules that are not about http at all: step_timeout_s must be strictly
 // below the effective run budget (see validateStepTimeoutBudget), and every
 // `assertion` block must be one core/assertion.Validate would accept (see
@@ -591,6 +627,17 @@ func (r *monitorResource) ValidateConfig(ctx context.Context, req resource.Valid
 				"MAX_RUNTIME_NOT_SUPPORTED. An HTTP probe has no start/success pair — the prober mints a "+
 				"fresh run id for every probe — so no start is ever outstanding and the overrun rule can "+
 				"never fire.\n\nRemove max_runtime_s. To bound a single probe, use probe_timeout_s.")
+	}
+
+	if !cfg.NotifyMinRunS.IsNull() && !cfg.NotifyMinRunS.IsUnknown() {
+		resp.Diagnostics.AddAttributeError(path.Root("notify_min_run_s"),
+			"notify_min_run_s is not supported on an http monitor",
+			"The API rejects notify_min_run_s on monitor_type = \"http\" with 400 "+
+				"NOTIFY_MIN_RUN_NOT_SUPPORTED. The floor only evaluates once a run's duration is known, "+
+				"and that duration comes exclusively from a matched /start + success pair — an HTTP probe "+
+				"never sends /start, since the prober mints a fresh run id for every probe.\n\nRemove "+
+				"notify_min_run_s. It has no equivalent on an http monitor: there is no run for it to "+
+				"measure.")
 	}
 
 	if cfg.GraceS.IsNull() || cfg.GraceS.IsUnknown() ||
@@ -793,6 +840,10 @@ func monitorFromModel(ctx context.Context, m monitorResourceModel) (client.Monit
 		v := m.ExpectEveryS.ValueInt64()
 		out.ExpectEveryS = &v
 	}
+	if !m.NotifyMinRunS.IsNull() && !m.NotifyMinRunS.IsUnknown() {
+		v := m.NotifyMinRunS.ValueInt64()
+		out.NotifyMinRunS = &v
+	}
 	if !m.MonitorFrom.IsNull() && !m.MonitorFrom.IsUnknown() && m.MonitorFrom.ValueString() != "" {
 		v := m.MonitorFrom.ValueString()
 		out.MonitorFrom = &v
@@ -837,8 +888,8 @@ func monitorFromModel(ctx context.Context, m monitorResourceModel) (client.Monit
 //
 // TestMonitorOptionalOnlyAttributesAreNotComputed is the guardrail that keeps
 // tags, runaway_ceiling, monitor_from, max_runtime_s, step_timeout_s,
-// expect_every_s, blocked_timeout_s, agent_id, ci_workflow and ci_branch
-// Optional-only. Read it before making any of them Computed to suppress drift —
+// expect_every_s, blocked_timeout_s, notify_min_run_s, agent_id, ci_workflow
+// and ci_branch Optional-only. Read it before making any of them Computed to suppress drift —
 // and note that for ci_workflow and ci_branch the temptation is stronger than
 // for the rest, because the API never reports them back and Computed looks like
 // the way to stop the resulting diff. It is not: it would pin whatever was last
@@ -848,8 +899,8 @@ func monitorFromModel(ctx context.Context, m monitorResourceModel) (client.Monit
 // groups:
 //
 //  1. Clearable — tags, runaway_ceiling, monitor_from, max_runtime_s,
-//     step_timeout_s, expect_every_s, blocked_timeout_s, agent_id, ci_workflow,
-//     ci_branch. Absent
+//     step_timeout_s, expect_every_s, blocked_timeout_s, notify_min_run_s,
+//     agent_id, ci_workflow, ci_branch. Absent
 //     from the configuration, they are sent as an explicit JSON null. Under
 //     merge-patch that is the only way to clear them; under the older
 //     full-replace server a null decodes to a nil slice / nil pointer and clears
@@ -960,6 +1011,20 @@ func monitorPatchFromModel(ctx context.Context, desired, cfg monitorResourceMode
 		patch["expect_every_s"] = nil
 	} else {
 		patch["expect_every_s"] = desired.ExpectEveryS.ValueInt64()
+	}
+
+	// notify_min_run_s is clearable in the same explicit-null shape as
+	// max_runtime_s and step_timeout_s: an absent key would leave the stored
+	// floor in place, so removing the attribute from a configuration would
+	// silently keep swallowing info-class notifications. Its range starts at
+	// 60, so omit-when-zero would have looked harmless while pinning the
+	// attribute forever. The null is safe to send even on an http monitor,
+	// where any non-null value is a 400 — the API accepts a null there as a
+	// no-op, and ValidateConfig has already refused a configured value.
+	if cfg.NotifyMinRunS.IsNull() || desired.NotifyMinRunS.IsNull() {
+		patch["notify_min_run_s"] = nil
+	} else {
+		patch["notify_min_run_s"] = desired.NotifyMinRunS.ValueInt64()
 	}
 
 	// blocked_timeout_s is clearable, with a twist worth stating plainly: the
@@ -1218,6 +1283,14 @@ func modelFromMonitor(ctx context.Context, mon *client.Monitor, prior monitorRes
 		m.ExpectEveryS = types.Int64Value(*mon.ExpectEveryS)
 	} else {
 		m.ExpectEveryS = types.Int64Null()
+	}
+	// And for notify_min_run_s: absent means there is no notification duration
+	// floor, which has to read as null rather than as a 0 no practitioner could
+	// have written (the valid range starts at 60).
+	if mon.NotifyMinRunS != nil {
+		m.NotifyMinRunS = types.Int64Value(*mon.NotifyMinRunS)
+	} else {
+		m.NotifyMinRunS = types.Int64Null()
 	}
 	// And for blocked_timeout_s: absent means the 24-hour default applies, NOT
 	// that the monitor waits forever. Null is still the right reading — it is
