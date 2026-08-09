@@ -208,7 +208,7 @@ func (r *monitorResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 				MarkdownDescription: "`simple` (fixed `period_s` interval) or `cron` (`cron_expr` + `tz`). " +
 					"Computed for `monitor_type = \"http\"`, which the server always schedules as `simple` " +
 					"from `probe_interval_s`.",
-				Validators: []validator.String{stringvalidator.OneOf("simple", "cron")},
+				Validators: []validator.String{stringvalidator.OneOf("simple", "cron", "on_demand")},
 			},
 			"period_s": schema.Int64Attribute{
 				Optional: true,
@@ -557,6 +557,12 @@ func (r *monitorResource) ValidateConfig(ctx context.Context, req resource.Valid
 	// monitor type, so this runs before the http early return as well.
 	validateCIFilters(cfg, resp)
 
+	// on_demand has no cadence -- it is driven entirely by run events -- so the
+	// API rejects period_s/cron_expr alongside it with 400
+	// ON_DEMAND_SCHEDULE_CONFLICT. Catching it at plan time turns an apply-time
+	// failure into a plan-time one.
+	validateOnDemandSchedule(cfg, resp)
+
 	if cfg.MonitorType.IsUnknown() || cfg.MonitorType.ValueString() != "http" {
 		// Not an http monitor, so step_timeout_s is legal — but it still has to
 		// fit inside the run budget. The check is skipped for http monitors
@@ -618,6 +624,35 @@ func (r *monitorResource) ValidateConfig(ctx context.Context, req resource.Valid
 //
 // Unknown is not an error: a ci_provider interpolated from another resource is
 // unknown at plan time and known at apply time, and the API is the backstop.
+// validateOnDemandSchedule refuses a cadence on an on_demand monitor, matching
+// the API's ON_DEMAND_SCHEDULE_CONFLICT rejection (api/checks.go). on_demand
+// arms no absence deadlines between runs, so period_s and cron_expr would be
+// persisted on a monitor that never reads either -- silently accepted, silently
+// meaningless. The API refuses it outright; refusing at plan time surfaces the
+// same rule before an apply spends a round trip on it.
+func validateOnDemandSchedule(cfg monitorResourceModel, resp *resource.ValidateConfigResponse) {
+	if cfg.ScheduleKind.IsNull() || cfg.ScheduleKind.IsUnknown() {
+		return
+	}
+	if cfg.ScheduleKind.ValueString() != "on_demand" {
+		return
+	}
+	if !cfg.PeriodS.IsNull() && !cfg.PeriodS.IsUnknown() {
+		resp.Diagnostics.AddAttributeError(path.Root("period_s"),
+			"period_s is not supported on an on_demand monitor",
+			"on_demand has no cadence: it is driven entirely by run events, so the API rejects "+
+				"period_s with 400 ON_DEMAND_SCHEDULE_CONFLICT. Remove period_s, or use "+
+				"schedule_kind \"simple\" if this monitor needs a cadence.")
+	}
+	if !cfg.CronExpr.IsNull() && !cfg.CronExpr.IsUnknown() {
+		resp.Diagnostics.AddAttributeError(path.Root("cron_expr"),
+			"cron_expr is not supported on an on_demand monitor",
+			"on_demand has no cadence: it is driven entirely by run events, so the API rejects "+
+				"cron_expr with 400 ON_DEMAND_SCHEDULE_CONFLICT. Remove cron_expr, or use "+
+				"schedule_kind \"cron\" if this monitor needs a cadence.")
+	}
+}
+
 func validateCIFilters(cfg monitorResourceModel, resp *resource.ValidateConfigResponse) {
 	if !cfg.CiProvider.IsNull() || cfg.CiProvider.IsUnknown() {
 		return

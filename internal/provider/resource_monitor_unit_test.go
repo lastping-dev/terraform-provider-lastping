@@ -1064,3 +1064,73 @@ func TestResolveUnknownsFromState_LeavesKnownAndNullAlone(t *testing.T) {
 	require.Equal(t, types.Int64Value(1800), got.GraceS)
 	require.Equal(t, types.Int64Value(7200), got.PeriodS)
 }
+
+// TestMonitorOnDemandSchedule pins the two halves of on_demand support that
+// were missing together: the schedule_kind validator refused the value while
+// the shipped docs already showed it, so anyone copying the documented
+// expect_every_s example was rejected at plan time by their own provider.
+//
+// The cadence half mirrors the API's ON_DEMAND_SCHEDULE_CONFLICT (400): an
+// on_demand monitor is driven entirely by run events, so a period or cron
+// expression would be persisted on a monitor that never reads either.
+func TestMonitorOnDemandSchedule(t *testing.T) {
+	t.Run("on_demand is an accepted schedule_kind", func(t *testing.T) {
+		// Drive the schema's own validators, the path a plan takes, rather than
+		// asserting on the OneOf list, which would restate the fix instead of
+		// exercising it.
+		sch := monitorSchema(t)
+		attr, ok := sch.Attributes["schedule_kind"]
+		require.True(t, ok, "schedule_kind attribute missing")
+		strAttr, ok := attr.(schema.StringAttribute)
+		require.True(t, ok, "schedule_kind is not a string attribute")
+
+		for _, kind := range []string{"simple", "cron", "on_demand"} {
+			var diags diag.Diagnostics
+			for _, v := range strAttr.Validators {
+				resp := &validator.StringResponse{}
+				v.ValidateString(context.Background(), validator.StringRequest{
+					Path:        path.Root("schedule_kind"),
+					ConfigValue: types.StringValue(kind),
+				}, resp)
+				diags.Append(resp.Diagnostics...)
+			}
+			require.False(t, diags.HasError(), "schedule_kind %q must be accepted: %v", kind, diags)
+		}
+	})
+
+	t.Run("a cadence on on_demand is refused at plan time", func(t *testing.T) {
+		diags := monitorValidateConfig(t, monitorResourceModel{
+			Name:         types.StringValue("acc"),
+			ScheduleKind: types.StringValue("on_demand"),
+			PeriodS:      types.Int64Value(3600),
+		})
+		require.True(t, diags.HasError(), "period_s on on_demand must be a plan-time error")
+		require.Contains(t, diags.Errors()[0].Summary(), "period_s")
+
+		diags = monitorValidateConfig(t, monitorResourceModel{
+			Name:         types.StringValue("acc"),
+			ScheduleKind: types.StringValue("on_demand"),
+			CronExpr:     types.StringValue("0 3 * * *"),
+		})
+		require.True(t, diags.HasError(), "cron_expr on on_demand must be a plan-time error")
+		require.Contains(t, diags.Errors()[0].Summary(), "cron_expr")
+	})
+
+	t.Run("on_demand without a cadence is fine", func(t *testing.T) {
+		diags := monitorValidateConfig(t, monitorResourceModel{
+			Name:         types.StringValue("acc"),
+			ScheduleKind: types.StringValue("on_demand"),
+			ExpectEveryS: types.Int64Value(900),
+		})
+		require.False(t, diags.HasError(), "%v", diags)
+	})
+
+	t.Run("a cadence on simple stays legal", func(t *testing.T) {
+		diags := monitorValidateConfig(t, monitorResourceModel{
+			Name:         types.StringValue("acc"),
+			ScheduleKind: types.StringValue("simple"),
+			PeriodS:      types.Int64Value(3600),
+		})
+		require.False(t, diags.HasError(), "%v", diags)
+	})
+}
