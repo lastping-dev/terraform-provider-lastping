@@ -279,7 +279,6 @@ resource "lastping_monitor" "research_agent" {
 resource "lastping_monitor" "nightly_release" {
   name          = "Nightly release pipeline"
   slug          = "nightly-release"
-  monitor_type  = "ci"
   schedule_kind = "simple"
   period_s      = 86400
   grace_s       = 3600
@@ -370,7 +369,7 @@ The block is repeatable and **replaces the whole set**: the guards in the config
 
 ~> **Guards read the ping body, so the job has to send one** — for example `curl -d '{"cost":{"usd":0.42}}' "$PING_URL"`. A monitor with `monitor_type = "http"` has no ping body at all (the prober makes the request), so guards configured on one are never evaluated; the provider rejects them at plan time rather than storing a setting that cannot fire. (see [below for nested schema](#nestedblock--metric_guard))
 - `monitor_from` (String) RFC 3339 timestamp from which deadlines are computed for a new monitor. The API stores and returns UTC; a value written with a different offset is kept as configured as long as it denotes the same instant.
-- `monitor_type` (String) Kind of monitor: `heartbeat` (default, expects periodic pings), `ci` (bound to a CI provider webhook), or `http` (active probe). The API treats this as create-only — PATCH silently ignores it — so changing it here replaces the resource rather than leaving a permanent, un-appliable diff.
+- `monitor_type` (String) Kind of monitor: `heartbeat` (default, expects periodic pings) or `http` (active probe). A CI-bound monitor is not a separate kind — it is a `heartbeat` monitor with `ci_provider` set, so bind CI through that attribute rather than through this one. The API treats this as create-only — PATCH silently ignores it — so changing it here replaces the resource rather than leaving a permanent, un-appliable diff.
 - `paused` (Boolean) When true, the monitor does not alert regardless of ping status. Maps onto the `pause`/`resume` endpoints on update, not a PATCH field.
 - `period_s` (Number) Period in seconds, for `schedule_kind = "simple"`. Server-derived (equal to `probe_interval_s`) for `monitor_type = "http"`.
 - `probe_expected_body` (String) Substring the probe response body must contain to count as healthy.
