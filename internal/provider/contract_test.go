@@ -70,16 +70,11 @@ const specPath = "../../testdata/openapi.yaml"
 // here, so confirm against the monorepo's file, not the served document, before
 // adding an entry.
 //
-// notify_min_run_s IS the same deployment-lag shape, confirmed against the
-// monorepo: api/swagger/openapi.yaml declares it on CheckCreate, Check and
-// CheckPatch, but the served document `make sync-openapi` fetches does not yet
-// carry it. These three entries go once a resync picks up a deployment that
-// does.
-var knownSpecGaps = map[string]string{
-	"resource.lastping_monitor.notify_min_run_s":       "api/checks.go declares it on CheckCreate, Check and CheckPatch; the deployed spec has not caught up",
-	"data.lastping_monitor.notify_min_run_s":           "api/checks.go declares it on Check; the deployed spec has not caught up",
-	"data.lastping_monitors.monitors.notify_min_run_s": "api/checks.go declares it on Check; the deployed spec has not caught up",
-}
+// notify_min_run_s was the same deployment-lag shape: three entries covering
+// resource.lastping_monitor, data.lastping_monitor and
+// data.lastping_monitors.monitors went once a resync picked up a deployment
+// that carried the property on CheckCreate, Check and CheckPatch.
+var knownSpecGaps = map[string]string{}
 
 // destinationConfigExempt is the reason every per-kind credential attribute on
 // lastping_destination has no spec property of its own. They are flattened by

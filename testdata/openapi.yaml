@@ -234,6 +234,38 @@ components:
             `max_runtime_s`/`step_timeout_s` it has no run-scoped precondition
             that would make it a provable no-op on an HTTP monitor.
           example: 900
+        notify_min_run_s:
+          type: [integer, "null"]
+          format: int64
+          minimum: 60
+          maximum: 31536000
+          description: |
+            **Notification duration floor**: a run **shorter** than this many
+            seconds does not produce an INFO-CLASS notification (`success`,
+            `started`, `every-run`, `note`). This is what stops a trivial,
+            fast agent run — "what's 2+2" — from paging a destination routed
+            to `success` exactly like a real, hours-long job would.
+
+            **It never suppresses `down`, `fail`, `recovery` or `blocked`** —
+            those are alert-class and are never affected by this field,
+            however short the run.  A run that failed in two seconds is
+            exactly what a user needs to hear about.
+
+            It never suppresses `started` (a run's duration does not exist
+            yet the moment it begins), and it never suppresses an event whose
+            duration could not be measured at all — an unknown duration
+            always means "notify", never "suppress".
+
+            Null or omitted turns it off, which is exactly how every monitor
+            behaved before this field existed.
+
+            **Rejected with 400 (`NOTIFY_MIN_RUN_NOT_SUPPORTED`) when
+            `monitor_type` is `http`.**  The floor only ever suppresses a
+            notification once a run's duration is measured, and that
+            measurement comes exclusively from a matched `/start` +
+            `/success` pair — which an HTTP probe never produces (the prober
+            mints a fresh run id per probe).
+          example: 300
         blocked_timeout_s:
           type: [integer, "null"]
           format: int64
@@ -400,10 +432,10 @@ components:
         - **Omitted field** — the stored value is left unchanged.
         - **Explicit `null`** — clears the value. Accepted only by
           `runaway_ceiling`, `max_runtime_s`, `step_timeout_s`,
-          `blocked_timeout_s`, `expect_every_s`, `monitor_from`,
-          `ci_workflow`, `ci_branch`,
-          `tags` and `agent_id`; those are the ten properties typed to allow
-          `null` below. For `agent_id`, explicit `null` detaches the monitor
+          `blocked_timeout_s`, `expect_every_s`, `notify_min_run_s`,
+          `monitor_from`, `ci_workflow`, `ci_branch`,
+          `tags` and `agent_id`; those are the eleven properties typed to
+          allow `null` below. For `agent_id`, explicit `null` detaches the monitor
           from its agent — it does not delete the agent or the monitor. For
           `blocked_timeout_s`, explicit `null` does NOT mean "wait forever" —
           it restores the fallback to `check.DefaultBlockedTimeout` (24h),
@@ -520,6 +552,26 @@ components:
 
             Accepted on every `monitor_type`, including `http`.
           example: 900
+        notify_min_run_s:
+          type: [integer, "null"]
+          format: int64
+          minimum: 60
+          maximum: 31536000
+          description: |
+            **Notification duration floor**: a run shorter than this many
+            seconds does not produce an INFO-CLASS notification (`success`,
+            `started`, `every-run`, `note`). Never suppresses `down`, `fail`,
+            `recovery` or `blocked`, and never suppresses `started` or an
+            event whose duration is unknown.
+
+            Explicit `null` turns the floor off; omitting the field leaves it
+            as stored.
+
+            **Rejected with 400 (`NOTIFY_MIN_RUN_NOT_SUPPORTED`) on an `http`
+            monitor** when sent with a non-null value — an HTTP probe has no
+            start/success pair, so its run duration is never measured. An
+            explicit `null` on an `http` monitor is accepted as a no-op.
+          example: 300
         blocked_timeout_s:
           type: [integer, "null"]
           format: int64
@@ -727,6 +779,17 @@ components:
             unset**, in which case absence is detected only by the schedule —
             and, for an `on_demand` monitor, not at all between runs.
           example: 900
+        notify_min_run_s:
+          type: [integer, "null"]
+          format: int64
+          description: |
+            Notification duration floor in seconds.  **Omitted from the
+            response when unset**, in which case every info-class
+            notification (`success`, `started`, `every-run`, `note`) fires
+            regardless of how short the run was.  Never set on `http`
+            monitors.  Never suppresses `down`, `fail`, `recovery` or
+            `blocked`.
+          example: 300
         blocked_timeout_s:
           type: [integer, "null"]
           format: int64
@@ -1230,6 +1293,25 @@ components:
           format: date-time
           description: RFC 3339 UTC expiry timestamp, or omitted for a key that never expires.
           example: "2026-12-31T00:00:00Z"
+        last_used_at:
+          type: string
+          format: date-time
+          description: |
+            RFC 3339 UTC timestamp of the most recent request this key
+            authenticated. Omitted if the key has never been used since this
+            field was added — never rendered as a zero/epoch time.
+          example: "2026-08-01T09:30:00Z"
+        last_used_surface:
+          type: string
+          enum: ["mcp", "terraform", "api"]
+          description: |
+            Which client surface last used this key, omitted if unknown.
+            Best-effort and spoofable: derived from the caller-controlled
+            `User-Agent` header on the authenticating request, not from any
+            cryptographic or protocol-level signal. Useful for an honest "did
+            my client ever successfully authenticate?" indicator — never use
+            it for authorization or access control.
+          example: "mcp"
 
     ApiKeyCreated:
       type: object
@@ -2095,8 +2177,8 @@ paths:
 
         - **Omitted field** — the stored value is left unchanged.
         - **Explicit `null`** — clears the value. Supported on `runaway_ceiling`,
-          `max_runtime_s`, `step_timeout_s`, `expect_every_s`, `monitor_from`,
-          `ci_workflow`, `ci_branch`, `tags`, and `agent_id` only; for `tags`, explicit `null`
+          `max_runtime_s`, `step_timeout_s`, `expect_every_s`, `notify_min_run_s`,
+          `monitor_from`, `ci_workflow`, `ci_branch`, `tags`, and `agent_id` only; for `tags`, explicit `null`
           is equivalent to sending `[]`; for `agent_id`, explicit `null`
           detaches the monitor from its agent without deleting either of them.
           `failure_threshold` is NOT clearable (the column is `NOT NULL DEFAULT
