@@ -1810,11 +1810,17 @@ resource "lastping_monitor" "ciimp" {
 				PlanOnly: true,
 			},
 			{
-				ResourceName:            "lastping_monitor.ciimp",
-				ImportState:             true,
-				ImportStateId:           "acc-ci-import",
-				ImportStateVerify:       true,
-				ImportStateVerifyIgnore: []string{"ci_workflow", "ci_branch"},
+				ResourceName:      "lastping_monitor.ciimp",
+				ImportState:       true,
+				ImportStateId:     "acc-ci-import",
+				ImportStateVerify: true,
+				// ci_secret joins the write-only filters for a different but
+				// equally structural reason: the API returns it ONLY on create
+				// and on the regenerate endpoint, never on the GET an import
+				// performs (api/checks.go's rowToDTO says so in as many words).
+				// So an imported CI monitor legitimately has no secret in
+				// state, exactly as the attribute's own documentation warns.
+				ImportStateVerifyIgnore: []string{"ci_workflow", "ci_branch", "ci_secret"},
 			},
 		},
 	})
