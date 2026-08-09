@@ -79,6 +79,25 @@ var knownSpecGaps = map[string]string{}
 const destinationConfigExempt = "flattened out of the API's free-form `config` object " +
 	"(ChannelCreate.config is additionalProperties, and the API never returns config at all)"
 
+// ciFilterWriteOnly is the reason ci_workflow and ci_branch are checked in the
+// send direction only.
+//
+// This is NOT a knownSpecGaps entry, and the distinction is the whole point of
+// keeping the two mechanisms apart: the spec is accurate here. CheckCreate and
+// CheckPatch both declare the properties, components.schemas.Check deliberately
+// does not, and the API agrees — api/checks.go's checkResponse has no field for
+// either, so rowToDTO could not populate them if it wanted to. The filters are
+// genuinely write-only, and an entry in knownSpecGaps would be asserting that a
+// correct spec is wrong.
+//
+// If the API ever starts returning them, this exemption is what has to go:
+// unlike knownSpecGaps it will not fail on its own when that happens, so the
+// change lands with the read-direction fix in modelFromMonitor's
+// writeOnlyString rather than before it.
+const ciFilterWriteOnly = "write-only: accepted on CheckCreate and CheckPatch, but no API response " +
+	"carries it (checkResponse has no such field), so the provider carries the prior state forward " +
+	"instead of refreshing"
+
 // destinationConfigAttrs is that set, kept in one place so a new credential
 // attribute has to be added deliberately.
 func destinationConfigExemptions() map[string]string {
@@ -132,6 +151,10 @@ func contractCases() map[string]contractCase {
 			response: schema("Check"),
 			sendExempt: map[string]string{
 				"paused": "maps onto POST /checks/{id}/pause and /resume, not a body field",
+			},
+			readExempt: map[string]string{
+				"ci_workflow": ciFilterWriteOnly,
+				"ci_branch":   ciFilterWriteOnly,
 			},
 		},
 		{

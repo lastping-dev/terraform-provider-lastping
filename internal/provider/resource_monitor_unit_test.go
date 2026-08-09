@@ -10,11 +10,14 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-go/tftypes"
 	"github.com/stretchr/testify/require"
 
 	"github.com/lastping-dev/terraform-provider-lastping/internal/client"
@@ -57,6 +60,27 @@ func validateInt64(t *testing.T, attrName string, value int64) validator.Int64Re
 	return resp
 }
 
+// normaliseMonitorSets gives every set attribute an element type.
+//
+// A zero-value types.Set carries none, which ObjectValueFrom rejects with an
+// opaque "MISSING TYPE" conversion error. Terraform itself can never hand the
+// provider one — every set attribute arrives typed, null or not — so this is
+// purely a test-fixture convenience: a fixture that says nothing about tags or
+// a block set means "none configured". Normalising here rather than in every
+// fixture keeps a new set attribute from breaking a dozen unrelated tests.
+func normaliseMonitorSets(ctx context.Context, m monitorResourceModel) monitorResourceModel {
+	if m.Tags.IsNull() && m.Tags.ElementType(ctx) == nil {
+		m.Tags = types.SetNull(types.StringType)
+	}
+	if m.Assertions.IsNull() && m.Assertions.ElementType(ctx) == nil {
+		m.Assertions = monitorAssertionSetNull()
+	}
+	if m.Guards.IsNull() && m.Guards.ElementType(ctx) == nil {
+		m.Guards = monitorGuardSetNull()
+	}
+	return m
+}
+
 // monitorValidateConfig runs the resource's ValidateConfig against a model, so
 // the plan-time refusals can be asserted without a live backend.
 func monitorValidateConfig(t *testing.T, m monitorResourceModel) diag.Diagnostics {
@@ -64,18 +88,7 @@ func monitorValidateConfig(t *testing.T, m monitorResourceModel) diag.Diagnostic
 	ctx := context.Background()
 	s := monitorSchema(t)
 
-	// A zero-value types.Set carries no element type, which ObjectValueFrom
-	// below rejects. Terraform itself can never hand the provider one — every
-	// block attribute arrives typed, null or not — so this is purely a
-	// test-fixture convenience: a fixture that says nothing about a block set
-	// means "no blocks configured". Normalising here rather than in every
-	// fixture keeps adding a block from breaking a dozen unrelated tests.
-	if m.Assertions.IsNull() && m.Assertions.ElementType(ctx) == nil {
-		m.Assertions = monitorAssertionSetNull()
-	}
-	if m.Guards.IsNull() && m.Guards.ElementType(ctx) == nil {
-		m.Guards = monitorGuardSetNull()
-	}
+	m = normaliseMonitorSets(ctx, m)
 
 	objType, ok := s.Type().(types.ObjectType)
 	require.True(t, ok, "a resource schema is always an object")
@@ -121,6 +134,16 @@ func TestMonitorNewInt64Validators(t *testing.T) {
 		{"expect_every_s", 31536000, true},
 		{"expect_every_s", 59, false},
 		{"expect_every_s", 31536001, false},
+		// blocked_timeout_s has no server-side bounds at all, so the only
+		// values refused here are the ones core/check would read as "unset"
+		// and silently replace with the 24-hour default. There is no upper
+		// bound to assert: the API declares none, and inventing one would
+		// refuse a configuration the API accepts.
+		{"blocked_timeout_s", 1, true},
+		{"blocked_timeout_s", 86400, true},
+		{"blocked_timeout_s", 31536000, true},
+		{"blocked_timeout_s", 0, false},
+		{"blocked_timeout_s", -1, false},
 	} {
 		t.Run(fmt.Sprintf("%s=%d", tc.attr, tc.value), func(t *testing.T) {
 			resp := validateInt64(t, tc.attr, tc.value)
@@ -309,6 +332,217 @@ func TestMonitorAgentIDRequiresUUID(t *testing.T) {
 	require.True(t, validateString(t, "agent_id", "").Diagnostics.HasError())
 }
 
+// monitorRawValue renders a model as the raw Terraform value tfsdk.State and
+// tfsdk.Plan carry, which the RequiresReplace modifier inspects to tell a
+// create (null state) and a destroy (null plan) from a real change.
+func monitorRawValue(t *testing.T, m monitorResourceModel) tftypes.Value {
+	t.Helper()
+	ctx := context.Background()
+	m = normaliseMonitorSets(ctx, m)
+
+	objType, ok := monitorSchema(t).Type().(types.ObjectType)
+	require.True(t, ok, "a resource schema is always an object")
+
+	obj, diags := types.ObjectValueFrom(ctx, objType.AttributeTypes(), m)
+	require.False(t, diags.HasError(), "%v", diags)
+
+	raw, err := obj.ToTerraformValue(ctx)
+	require.NoError(t, err)
+	return raw
+}
+
+// monitorStringRequiresReplace runs a string attribute's plan modifiers over an
+// in-place change and reports whether they demanded a replacement.
+func monitorStringRequiresReplace(t *testing.T, attrName, from, to string) bool {
+	t.Helper()
+	ctx := context.Background()
+
+	attr, ok := monitorSchema(t).Attributes[attrName].(schema.StringAttribute)
+	require.True(t, ok, "%s must be a string attribute", attrName)
+
+	base := monitorResourceModel{Name: types.StringValue("acc")}
+	stateModel, planModel := base, base
+	stateVal, planVal := types.StringValue(from), types.StringValue(to)
+
+	resp := &planmodifier.StringResponse{PlanValue: planVal}
+	for _, mod := range attr.PlanModifiers {
+		mod.PlanModifyString(ctx, planmodifier.StringRequest{
+			Path:        path.Root(attrName),
+			State:       tfsdk.State{Schema: monitorSchema(t), Raw: monitorRawValue(t, stateModel)},
+			Plan:        tfsdk.Plan{Schema: monitorSchema(t), Raw: monitorRawValue(t, planModel)},
+			StateValue:  stateVal,
+			PlanValue:   planVal,
+			ConfigValue: planVal,
+		}, resp)
+	}
+	return resp.RequiresReplace
+}
+
+// TestMonitorCIProviderRequiresReplace pins the decision that a changed
+// ci_provider is a replacement and not an in-place update.
+//
+// It is not a style choice. `PATCH /api/v1/checks/{id}` does not decode
+// ci_provider at all — api/checks_patch.go's checkPatchRequest has no member
+// for it, and the spec lists it beside slug, monitor_type and ci_secret as
+// immutable and ignored if present. Without RequiresReplace, changing
+// `github` to `gitlab` would produce a plan reading as a clean one-attribute
+// update, an apply that returned 200 having changed nothing, and the same diff
+// on every plan thereafter — a configuration that can never converge, with no
+// error anywhere to say why.
+//
+// The comparison case is monitor_type, which the provider already treats this
+// way for exactly the same reason; agent_id is the counter-example, an
+// attribute the API really does update in place.
+func TestMonitorCIProviderRequiresReplace(t *testing.T) {
+	require.True(t, monitorStringRequiresReplace(t, "ci_provider", "github", "gitlab"),
+		"ci_provider is create-only on the API, so changing it must replace the monitor")
+
+	require.True(t, monitorStringRequiresReplace(t, "monitor_type", "heartbeat", "ci"),
+		"monitor_type is the existing precedent this follows")
+
+	require.False(t, monitorStringRequiresReplace(t, "agent_id",
+		"11111111-2222-4333-8444-555555555555", "99999999-2222-4333-8444-555555555555"),
+		"agent_id is genuinely PATCH-able, so it must NOT force a replacement")
+}
+
+// TestMonitorCIProviderRejectsUnknownProvider mirrors the API's
+// knownCIProviders set (api/checks.go), which answers 400 for anything else.
+func TestMonitorCIProviderRejectsUnknownProvider(t *testing.T) {
+	for _, ok := range []string{"github", "gitlab", "jenkins"} {
+		require.False(t, validateString(t, "ci_provider", ok).Diagnostics.HasError(), "%s must be accepted", ok)
+	}
+	for _, bad := range []string{"circleci", "GitHub", ""} {
+		require.True(t, validateString(t, "ci_provider", bad).Diagnostics.HasError(), "%q must be refused", bad)
+	}
+}
+
+// TestMonitorCIFiltersRequireProvider: the API accepts ci_workflow/ci_branch on
+// a monitor with no CI binding and silently discards them, and because no
+// response reports either attribute back, the provider would write the
+// configured value into state unchallenged. The result is a configuration that
+// applies cleanly, plans clean forever, and does not do what it says.
+func TestMonitorCIFiltersRequireProvider(t *testing.T) {
+	t.Run("filters without a provider are refused", func(t *testing.T) {
+		diags := monitorValidateConfig(t, monitorResourceModel{
+			Name:       types.StringValue("acc"),
+			CiWorkflow: types.StringValue("ci.yml"),
+		})
+		require.True(t, diags.HasError(), "ci_workflow without ci_provider must be a plan-time error")
+		require.Contains(t, diags.Errors()[0].Summary(), "ci_workflow")
+
+		diags = monitorValidateConfig(t, monitorResourceModel{
+			Name:     types.StringValue("acc"),
+			CiBranch: types.StringValue("main"),
+		})
+		require.True(t, diags.HasError(), "ci_branch without ci_provider must be a plan-time error")
+		require.Contains(t, diags.Errors()[0].Summary(), "ci_branch")
+	})
+
+	t.Run("filters with a provider are fine", func(t *testing.T) {
+		diags := monitorValidateConfig(t, monitorResourceModel{
+			Name:       types.StringValue("acc"),
+			CiProvider: types.StringValue("github"),
+			CiWorkflow: types.StringValue("ci.yml"),
+			CiBranch:   types.StringValue("main"),
+		})
+		require.False(t, diags.HasError(), "%v", diags)
+	})
+
+	t.Run("a bare provider is fine", func(t *testing.T) {
+		diags := monitorValidateConfig(t, monitorResourceModel{
+			Name:       types.StringValue("acc"),
+			CiProvider: types.StringValue("jenkins"),
+		})
+		require.False(t, diags.HasError(), "%v", diags)
+	})
+}
+
+// TestMonitorCIFiltersSurviveRefresh pins the read half of the write-only
+// problem.
+//
+// ci_workflow and ci_branch are accepted by the API and never reported back:
+// api/checks.go's checkResponse has no field for either, so every GET decodes
+// them as "". Mapping that "" through stringOrNull — the obvious thing, and
+// what every other user-supplied string here does — would null both attributes
+// on the first refresh after an apply, leaving a permanent diff against any
+// configuration that sets them. The prior value has to be carried forward
+// instead.
+func TestMonitorCIFiltersSurviveRefresh(t *testing.T) {
+	ctx := context.Background()
+
+	// What the API actually returns for a CI monitor: the provider, never the
+	// filters.
+	fromAPI := &client.Monitor{
+		ID: "3f7c1f5a-1a2b-4c3d-8e9f-0a1b2c3d4e5f", Name: "acc",
+		MonitorType: "ci", ScheduleKind: "simple", PeriodS: 3600, TZ: "UTC", GraceS: 1800,
+		CiProvider: "github",
+	}
+
+	prior := monitorResourceModel{
+		Tags:       types.SetNull(types.StringType),
+		CiWorkflow: types.StringValue("ci.yml"),
+		CiBranch:   types.StringValue("main"),
+	}
+
+	got, err := modelFromMonitor(ctx, fromAPI, prior)
+	require.NoError(t, err)
+	require.Equal(t, types.StringValue("github"), got.CiProvider,
+		"ci_provider IS reported by the API and must refresh from it")
+	require.Equal(t, types.StringValue("ci.yml"), got.CiWorkflow,
+		"the API never reports ci_workflow, so refresh must keep what Terraform last wrote")
+	require.Equal(t, types.StringValue("main"), got.CiBranch)
+
+	// Import: no prior state at all. Both filters read null however the monitor
+	// is really configured — the documented cost of a write-only attribute, and
+	// the reason this is asserted rather than left to be discovered.
+	imported, err := modelFromMonitor(ctx, fromAPI, monitorResourceModel{Tags: types.SetNull(types.StringType)})
+	require.NoError(t, err)
+	require.True(t, imported.CiWorkflow.IsNull(), "an import cannot recover a value the API never sends")
+	require.True(t, imported.CiBranch.IsNull())
+	require.Equal(t, types.StringValue("github"), imported.CiProvider,
+		"ci_provider, by contrast, DOES survive an import — that is the part of the bug this fixes")
+
+	// The seam that makes this correct the day the API starts reporting the
+	// filters: a real value always beats the carried-forward one.
+	answered := *fromAPI
+	answered.CiWorkflow = "release.yml"
+	got, err = modelFromMonitor(ctx, &answered, prior)
+	require.NoError(t, err)
+	require.Equal(t, types.StringValue("release.yml"), got.CiWorkflow,
+		"an API that answers must win over the prior state")
+}
+
+// TestMonitorBlockedTimeoutReadsAbsentAsNull: the API omits blocked_timeout_s
+// when it is unset, and "unset" means the 24-hour default applies — not that
+// the monitor waits forever, and not 0. Null is the only reading that
+// round-trips an omitted attribute.
+func TestMonitorBlockedTimeoutReadsAbsentAsNull(t *testing.T) {
+	ctx := context.Background()
+	base := client.Monitor{
+		ID: "3f7c1f5a-1a2b-4c3d-8e9f-0a1b2c3d4e5f", Name: "acc",
+		MonitorType: "heartbeat", ScheduleKind: "simple", PeriodS: 3600, TZ: "UTC", GraceS: 1800,
+	}
+	prior := monitorResourceModel{Tags: types.SetNull(types.StringType)}
+
+	got, err := modelFromMonitor(ctx, &base, prior)
+	require.NoError(t, err)
+	require.True(t, got.BlockedTimeoutS.IsNull(), "an omitted blocked_timeout_s must read as null, never 0")
+
+	set := base
+	set.BlockedTimeoutS = ptrTo(int64(7200))
+	got, err = modelFromMonitor(ctx, &set, prior)
+	require.NoError(t, err)
+	require.Equal(t, types.Int64Value(7200), got.BlockedTimeoutS)
+
+	// Both monitor surfaces have to agree, for the same reason
+	// TestMonitorSurfacesAgreeOnEmptyValues exists for the others.
+	data, diags := monitorDataFromAPI(ctx, &base)
+	require.False(t, diags.HasError(), "%v", diags)
+	require.Equal(t, got.BlockedTimeoutS, types.Int64Value(7200))
+	require.True(t, data.BlockedTimeoutS.IsNull())
+	require.Equal(t, types.StringNull(), data.CiProvider, "no CI binding reads as null on the data source too")
+}
+
 // TestMonitorOptionalOnlyAttributesAreNotComputed pins the "attributes can never
 // be unset" regression: a purely user-supplied attribute marked Computed keeps
 // its old value in state when it is removed from the configuration.
@@ -317,7 +551,13 @@ func TestMonitorOptionalOnlyAttributesAreNotComputed(t *testing.T) {
 	for _, name := range []string{
 		"slug", "cron_expr", "tags", "runaway_ceiling", "monitor_from",
 		"probe_url", "probe_interval_s", "probe_expected_body", "max_runtime_s",
-		"step_timeout_s", "expect_every_s", "agent_id",
+		"step_timeout_s", "expect_every_s", "blocked_timeout_s", "agent_id",
+		// ci_workflow and ci_branch are the ones most likely to be "fixed" into
+		// Computed one day: no API response carries them, so the provider
+		// carries prior state forward, and Computed looks like the tidy way to
+		// express that. It is not — it would pin the last written filter and
+		// make clearing one impossible.
+		"ci_provider", "ci_workflow", "ci_branch",
 	} {
 		attr, ok := s.Attributes[name]
 		require.True(t, ok, "missing attribute %s", name)
@@ -422,11 +662,15 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		MaxRuntimeS:          types.Int64Value(14400),
 		StepTimeoutS:         types.Int64Value(900),
 		ExpectEveryS:         types.Int64Value(1800),
+		BlockedTimeoutS:      types.Int64Value(7200),
 		FailureThreshold:     types.Int64Value(3),
 		Tags:                 tags,
 		RunawayCeiling:       types.Int64Value(40),
 		MonitorFrom:          types.StringValue("2027-01-01T00:00:00Z"),
 		AgentID:              types.StringValue("11111111-2222-4333-8444-555555555555"),
+		CiProvider:           types.StringValue("github"),
+		CiWorkflow:           types.StringValue("ci.yml"),
+		CiBranch:             types.StringValue("main"),
 		ProbeMethod:          types.StringValue("GET"),
 		ProbeExpectedStatus:  types.Int64Value(200),
 		ProbeTimeoutS:        types.Int64Value(10),
@@ -453,7 +697,11 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		"max_runtime_s":          int64(14400),
 		"step_timeout_s":         int64(900),
 		"expect_every_s":         int64(1800),
+		"blocked_timeout_s":      int64(7200),
 		"failure_threshold":      int64(3),
+		"ci_provider":            "github",
+		"ci_workflow":            "ci.yml",
+		"ci_branch":              "main",
 		"cron_expr":              "",
 		"probe_method":           "GET",
 		"probe_expected_status":  int64(200),
@@ -483,7 +731,10 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		cfg.MaxRuntimeS = types.Int64Null()
 		cfg.StepTimeoutS = types.Int64Null()
 		cfg.ExpectEveryS = types.Int64Null()
+		cfg.BlockedTimeoutS = types.Int64Null()
 		cfg.AgentID = types.StringNull()
+		cfg.CiWorkflow = types.StringNull()
+		cfg.CiBranch = types.StringNull()
 
 		want := client.MonitorPatch{}
 		for k, v := range fullyConfigured {
@@ -495,7 +746,16 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		want["max_runtime_s"] = nil
 		want["step_timeout_s"] = nil
 		want["expect_every_s"] = nil
+		want["blocked_timeout_s"] = nil
 		want["agent_id"] = nil
+		// ci_workflow and ci_branch clear to null and NEVER to "": the API
+		// reads "" on these two as "leave the stored filter alone", so the
+		// empty-string form would be the exact opposite of deleting the
+		// attribute. ci_provider is untouched here — it is immutable on the
+		// API and RequiresReplace in the schema, so it has no cleared form to
+		// reach through a PATCH at all.
+		want["ci_workflow"] = nil
+		want["ci_branch"] = nil
 
 		got, err := monitorPatchFromModel(ctx, cfg, cfg)
 		require.NoError(t, err)
@@ -513,7 +773,13 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		require.Contains(t, string(body), `"monitor_from":null`)
 		require.Contains(t, string(body), `"max_runtime_s":null`)
 		require.Contains(t, string(body), `"step_timeout_s":null`)
+		require.Contains(t, string(body), `"blocked_timeout_s":null`)
 		require.Contains(t, string(body), `"agent_id":null`)
+		require.Contains(t, string(body), `"ci_workflow":null`)
+		require.Contains(t, string(body), `"ci_branch":null`)
+		require.NotContains(t, string(body), `"ci_workflow":""`,
+			`"" preserves the stored filter server-side, so it must never stand in for a clear`)
+		require.NotContains(t, string(body), `"ci_branch":""`)
 	})
 
 	// failure_threshold is the counter-example to the block above: it is
@@ -588,7 +854,10 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		cfg.MaxRuntimeS = types.Int64Null()
 		cfg.StepTimeoutS = types.Int64Null()
 		cfg.ExpectEveryS = types.Int64Null()
+		cfg.BlockedTimeoutS = types.Int64Null()
 		cfg.AgentID = types.StringNull()
+		cfg.CiWorkflow = types.StringNull()
+		cfg.CiBranch = types.StringNull()
 
 		got, err := monitorPatchFromModel(ctx, stored, cfg)
 		require.NoError(t, err)
@@ -605,8 +874,14 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		require.Nil(t, got["step_timeout_s"])
 		require.Contains(t, got, "expect_every_s")
 		require.Nil(t, got["expect_every_s"])
+		require.Contains(t, got, "blocked_timeout_s")
+		require.Nil(t, got["blocked_timeout_s"])
 		require.Contains(t, got, "agent_id")
 		require.Nil(t, got["agent_id"])
+		require.Contains(t, got, "ci_workflow")
+		require.Nil(t, got["ci_workflow"])
+		require.Contains(t, got, "ci_branch")
+		require.Nil(t, got["ci_branch"])
 	})
 
 	t.Run("explicitly empty tags are sent as an empty array", func(t *testing.T) {
@@ -687,11 +962,15 @@ func TestResolveUnknownsFromState_CoversEveryAttribute(t *testing.T) {
 		MaxRuntimeS:          types.Int64Value(14400),
 		StepTimeoutS:         types.Int64Value(900),
 		ExpectEveryS:         types.Int64Value(1800),
+		BlockedTimeoutS:      types.Int64Value(7200),
 		FailureThreshold:     types.Int64Value(3),
 		Tags:                 types.SetValueMust(types.StringType, []attr.Value{types.StringValue("prod")}),
 		RunawayCeiling:       types.Int64Value(40),
 		MonitorFrom:          types.StringValue("2027-01-01T00:00:00Z"),
 		AgentID:              types.StringValue("11111111-2222-4333-8444-555555555555"),
+		CiProvider:           types.StringValue("gitlab"),
+		CiWorkflow:           types.StringValue("nightly"),
+		CiBranch:             types.StringValue("release"),
 		ProbeURL:             types.StringValue("https://example.com/health"),
 		ProbeMethod:          types.StringValue("HEAD"),
 		ProbeIntervalS:       types.Int64Value(120),

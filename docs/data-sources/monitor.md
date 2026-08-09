@@ -71,6 +71,10 @@ variable "slack_webhook_url" {
 
 - `agent_id` (String) UUID of the `lastping_agent` that owns this monitor. Null when the monitor is unattached — including right after its owning agent was deleted.
 - `alert_after` (String) RFC 3339 UTC timestamp after which a missing ping raises an incident.
+- `blocked_timeout_s` (Number) How long a run may sit `blocked` — waiting on a human — before a `blocked` incident opens, in seconds. Null when unset, which does **not** mean the monitor waits forever: the server falls back to a 24-hour default. There is no state in which the blocked timeout is off.
+- `ci_provider` (String) CI provider bound to this monitor (`github`, `gitlab` or `jenkins`), or null when it has no CI binding.
+
+The binding's `ci_workflow` and `ci_branch` filters have no attribute here, and cannot: no API response carries them, so a data source could only ever report null. The `lastping_monitor` resource exposes them as write-only attributes for that reason.
 - `created_at` (String) RFC 3339 UTC timestamp when the monitor was created.
 - `cron_expr` (String) 5-field cron expression, for `schedule_kind = "cron"`.
 - `due_at` (String) RFC 3339 UTC timestamp of the next expected ping.

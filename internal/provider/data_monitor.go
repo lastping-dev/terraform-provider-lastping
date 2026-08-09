@@ -36,6 +36,8 @@ type monitorDataModel struct {
 	MaxRuntimeS          types.Int64  `tfsdk:"max_runtime_s"`
 	StepTimeoutS         types.Int64  `tfsdk:"step_timeout_s"`
 	ExpectEveryS         types.Int64  `tfsdk:"expect_every_s"`
+	BlockedTimeoutS      types.Int64  `tfsdk:"blocked_timeout_s"`
+	CiProvider           types.String `tfsdk:"ci_provider"`
 	FailureThreshold     types.Int64  `tfsdk:"failure_threshold"`
 	Tags                 types.Set    `tfsdk:"tags"`
 	RunawayCeiling       types.Int64  `tfsdk:"runaway_ceiling"`
@@ -120,6 +122,21 @@ func monitorDataAttributes() map[string]schema.Attribute {
 				"any kind before a `silence` incident opens, regardless of its schedule. Null when unset, " +
 				"in which case absence is detected only by the schedule — and, on a " +
 				"`schedule_kind = \"on_demand\"` monitor, not at all between runs.",
+		},
+		"blocked_timeout_s": schema.Int64Attribute{
+			Computed: true,
+			MarkdownDescription: "How long a run may sit `blocked` — waiting on a human — before a `blocked` " +
+				"incident opens, in seconds. Null when unset, which does **not** mean the monitor waits " +
+				"forever: the server falls back to a 24-hour default. There is no state in which the " +
+				"blocked timeout is off.",
+		},
+		"ci_provider": schema.StringAttribute{
+			Computed: true,
+			MarkdownDescription: "CI provider bound to this monitor (`github`, `gitlab` or `jenkins`), or " +
+				"null when it has no CI binding.\n\n" +
+				"The binding's `ci_workflow` and `ci_branch` filters have no attribute here, and cannot: " +
+				"no API response carries them, so a data source could only ever report null. The " +
+				"`lastping_monitor` resource exposes them as write-only attributes for that reason.",
 		},
 		"failure_threshold": schema.Int64Attribute{
 			Computed: true,
@@ -254,6 +271,7 @@ func monitorDataFromAPI(ctx context.Context, m *client.Monitor) (monitorDataMode
 		Tags:                 tags,
 		MonitorFrom:          timestampOrNull(m.MonitorFrom),
 		AgentID:              stringOrNull(m.AgentID),
+		CiProvider:           stringOrNull(m.CiProvider),
 		ProbeURL:             stringOrNull(m.ProbeURL),
 		ProbeMethod:          stringOrNull(m.ProbeMethod),
 		ProbeIntervalS:       int64OrNull(m.ProbeIntervalS),
@@ -289,6 +307,11 @@ func monitorDataFromAPI(ctx context.Context, m *client.Monitor) (monitorDataMode
 		out.ExpectEveryS = types.Int64Value(*m.ExpectEveryS)
 	} else {
 		out.ExpectEveryS = types.Int64Null()
+	}
+	if m.BlockedTimeoutS != nil {
+		out.BlockedTimeoutS = types.Int64Value(*m.BlockedTimeoutS)
+	} else {
+		out.BlockedTimeoutS = types.Int64Null()
 	}
 	return out, diags
 }

@@ -242,3 +242,44 @@ resource "lastping_monitor" "research_agent" {
   max_runtime_s  = 14400
   expect_every_s = 1800
 }
+
+# A CI job, monitored from your pipeline's own webhooks rather than from a ping
+# you have to remember to add to the job.
+#
+# `ci_provider` makes the server mint a webhook signing secret and expose an
+# ingest URL. It is CREATE-ONLY on the API — PATCH does not decode the field —
+# so changing it here replaces the monitor: a new id, a new webhook URL and a
+# new secret. That is shown in the plan rather than discovered on apply.
+#
+# The secret is returned exactly once, in the create response, and this provider
+# does not surface it. Read it from the dashboard or rotate it with
+# POST /api/v1/checks/{id}/ci/regenerate, then store it in your CI provider's
+# secret manager.
+#
+# `ci_workflow` and `ci_branch` narrow which inbound webhooks count. Both are
+# WRITE-ONLY: no API response carries them, so Terraform can only report what it
+# last wrote, a filter changed in the dashboard is invisible to `terraform
+# plan`, and an imported monitor starts with both null. Omit them to accept
+# every workflow and every branch.
+resource "lastping_monitor" "nightly_release" {
+  name          = "Nightly release pipeline"
+  slug          = "nightly-release"
+  monitor_type  = "ci"
+  schedule_kind = "simple"
+  period_s      = 86400
+  grace_s       = 3600
+
+  ci_provider = "github"
+  ci_workflow = "release.yml"
+  ci_branch   = "main"
+
+  # This pipeline pauses for a human to approve the production step. A `blocked`
+  # ping suspends the absence rules while it waits, which is right — a job
+  # correctly waiting for approval has not failed — but the suspension has to
+  # end somewhere: an approval nobody ever gives is itself an outage.
+  #
+  # Four hours here rather than the 24-hour default. Note that omitting the
+  # attribute does NOT mean "wait forever"; it means "take the 24-hour default".
+  # There is no way to turn the blocked timeout off, only to choose its length.
+  blocked_timeout_s = 14400
+}

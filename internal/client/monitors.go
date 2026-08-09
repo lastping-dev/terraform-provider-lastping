@@ -29,6 +29,7 @@ type Monitor struct {
 	MaxRuntimeS          *int64   `json:"max_runtime_s,omitempty"`
 	StepTimeoutS         *int64   `json:"step_timeout_s,omitempty"`
 	ExpectEveryS         *int64   `json:"expect_every_s,omitempty"`
+	BlockedTimeoutS      *int64   `json:"blocked_timeout_s,omitempty"`
 	FailureThreshold     int64    `json:"failure_threshold,omitempty"`
 	Tags                 []string `json:"tags,omitempty"`
 	RunawayCeiling       *int64   `json:"runaway_ceiling,omitempty"`
@@ -47,6 +48,30 @@ type Monitor struct {
 	// Updates go through MonitorPatch, not this field, the same as every other
 	// clearable attribute.
 	AgentID string `json:"agent_id,omitempty"`
+
+	// CI binding. CiProvider is create-only: POST /api/v1/checks generates a
+	// webhook secret and binds it, and PATCH does not decode the field at all
+	// (api/checks_patch.go: checkPatchRequest has no ci_provider member), so a
+	// changed provider is only reachable by replacing the monitor. GET and list
+	// DO report it (checkResponse.CiProvider), so it round-trips.
+	//
+	// CiWorkflow and CiBranch are WRITE-ONLY, and this is the sharpest edge in
+	// this struct: both are accepted on create and on PATCH, but no response
+	// ever carries them — api/checks.go's checkResponse has no field for
+	// either, so rowToDTO cannot populate them and GET/list omit them
+	// unconditionally. They therefore always decode as "" here regardless of
+	// what the server holds, and Terraform state for them has to be carried
+	// forward from the prior state rather than refreshed. See
+	// modelFromMonitor's writeOnlyString.
+	//
+	// Their PATCH semantics deliberately deviate from RFC 7396: an explicit ""
+	// PRESERVES the stored value (so a full-body client cannot silently unbind
+	// a live filter) and only an explicit null clears it. That is why
+	// monitorPatchFromModel never sends "" for either — see the clearable group
+	// there.
+	CiProvider string `json:"ci_provider,omitempty"`
+	CiWorkflow string `json:"ci_workflow,omitempty"`
+	CiBranch   string `json:"ci_branch,omitempty"`
 
 	// Computed.
 	Paused           bool    `json:"paused,omitempty"`
@@ -120,9 +145,12 @@ func (c *Client) GetMonitorBySlug(ctx context.Context, slug string) (*Monitor, e
 //   - a key that is absent leaves the stored value alone;
 //   - a key whose value is nil serialises as JSON `null`, which clears the
 //     field — the API honours that for runaway_ceiling, max_runtime_s,
-//     step_timeout_s, expect_every_s, monitor_from, tags, ci_workflow and
-//     ci_branch, and treats
-//     it as "absent" everywhere else. failure_threshold is deliberately NOT in
+//     step_timeout_s, expect_every_s, blocked_timeout_s, monitor_from, tags,
+//     ci_workflow and ci_branch, and treats
+//     it as "absent" everywhere else. A null blocked_timeout_s is the odd one
+//     out in that list: it does not mean "wait forever", it restores the
+//     check.DefaultBlockedTimeout fallback of 24 hours.
+//     failure_threshold is deliberately NOT in
 //     that list: its
 //     column is NOT NULL DEFAULT 1, so a null there is read as an omission and
 //     leaves the stored value alone;
