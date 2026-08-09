@@ -39,6 +39,8 @@ type monitorDataModel struct {
 	NotifyMinRunS        types.Int64  `tfsdk:"notify_min_run_s"`
 	BlockedTimeoutS      types.Int64  `tfsdk:"blocked_timeout_s"`
 	CiProvider           types.String `tfsdk:"ci_provider"`
+	CiWebhookURL         types.String `tfsdk:"ci_webhook_url"`
+	CiSecret             types.String `tfsdk:"ci_secret"`
 	FailureThreshold     types.Int64  `tfsdk:"failure_threshold"`
 	Tags                 types.Set    `tfsdk:"tags"`
 	RunawayCeiling       types.Int64  `tfsdk:"runaway_ceiling"`
@@ -57,6 +59,7 @@ type monitorDataModel struct {
 	CreatedAt            types.String `tfsdk:"created_at"`
 	LastPingAt           types.String `tfsdk:"last_ping_at"`
 	DueAt                types.String `tfsdk:"due_at"`
+	NextProbeAt          types.String `tfsdk:"next_probe_at"`
 	AlertAfter           types.String `tfsdk:"alert_after"`
 	MaintenanceUntil     types.String `tfsdk:"maintenance_until"`
 }
@@ -146,6 +149,21 @@ func monitorDataAttributes() map[string]schema.Attribute {
 				"no API response carries them, so a data source could only ever report null. The " +
 				"`lastping_monitor` resource exposes them as write-only attributes for that reason.",
 		},
+		"ci_webhook_url": schema.StringAttribute{
+			Computed: true,
+			MarkdownDescription: "The URL this monitor's CI pipeline `POST`s to, signed with `ci_secret`. " +
+				"Reported by every `GET`, unlike `ci_secret`. Null when the monitor has no CI binding.",
+		},
+		"ci_secret": schema.StringAttribute{
+			Computed:  true,
+			Sensitive: true,
+			MarkdownDescription: "The HMAC key `ci_webhook_url` requests are signed with.\n\n" +
+				"~> **Always null through this data source.** The API returns `ci_secret` only in the " +
+				"response to the `POST` that sets `ci_provider` — never on `GET` or list, which is all a " +
+				"data source ever calls. The `lastping_monitor` resource can hold the value because it " +
+				"captures it at creation and carries it forward across refreshes; a data source has no " +
+				"creation event of its own to capture it from.",
+		},
 		"failure_threshold": schema.Int64Attribute{
 			Computed: true,
 			MarkdownDescription: "Consecutive explicit failures required before an incident opens " +
@@ -222,6 +240,11 @@ func monitorDataAttributes() map[string]schema.Attribute {
 			Computed:            true,
 			MarkdownDescription: "RFC 3339 UTC timestamp of the next expected ping.",
 		},
+		"next_probe_at": schema.StringAttribute{
+			Computed: true,
+			MarkdownDescription: "RFC 3339 UTC timestamp when the prober will next probe this monitor — " +
+				"`due_at`'s counterpart for `monitor_type = \"http\"`. Null for every other monitor type.",
+		},
 		"alert_after": schema.StringAttribute{
 			Computed:            true,
 			MarkdownDescription: "RFC 3339 UTC timestamp after which a missing ping raises an incident.",
@@ -266,20 +289,28 @@ func monitorDataFromAPI(ctx context.Context, m *client.Monitor) (monitorDataMode
 	}
 
 	out := monitorDataModel{
-		ID:                   types.StringValue(m.ID),
-		Name:                 types.StringValue(m.Name),
-		Slug:                 stringOrNull(m.Slug),
-		MonitorType:          stringOrNull(m.MonitorType),
-		ScheduleKind:         stringOrNull(m.ScheduleKind),
-		PeriodS:              types.Int64Value(m.PeriodS),
-		CronExpr:             stringOrNull(m.CronExpr),
-		TZ:                   stringOrNull(m.TZ),
-		GraceS:               types.Int64Value(m.GraceS),
-		FailureThreshold:     types.Int64Value(m.FailureThreshold),
-		Tags:                 tags,
-		MonitorFrom:          timestampOrNull(m.MonitorFrom),
-		AgentID:              stringOrNull(m.AgentID),
-		CiProvider:           stringOrNull(m.CiProvider),
+		ID:               types.StringValue(m.ID),
+		Name:             types.StringValue(m.Name),
+		Slug:             stringOrNull(m.Slug),
+		MonitorType:      stringOrNull(m.MonitorType),
+		ScheduleKind:     stringOrNull(m.ScheduleKind),
+		PeriodS:          types.Int64Value(m.PeriodS),
+		CronExpr:         stringOrNull(m.CronExpr),
+		TZ:               stringOrNull(m.TZ),
+		GraceS:           types.Int64Value(m.GraceS),
+		FailureThreshold: types.Int64Value(m.FailureThreshold),
+		Tags:             tags,
+		MonitorFrom:      timestampOrNull(m.MonitorFrom),
+		AgentID:          stringOrNull(m.AgentID),
+		CiProvider:       stringOrNull(m.CiProvider),
+		// ci_webhook_url is an ordinary readable response field, refreshed the
+		// same as ci_provider. ci_secret is not: the API never returns it from
+		// GET/list (only from the create response), so it reads as null on
+		// every data source lookup — see its schema description. There is no
+		// prior state for a data source to carry a create-time value forward
+		// from, unlike the resource's CiSecret.
+		CiWebhookURL:         stringOrNull(m.CiWebhookURL),
+		CiSecret:             stringOrNull(m.CiSecret),
 		ProbeURL:             stringOrNull(m.ProbeURL),
 		ProbeMethod:          stringOrNull(m.ProbeMethod),
 		ProbeIntervalS:       int64OrNull(m.ProbeIntervalS),
@@ -293,6 +324,7 @@ func monitorDataFromAPI(ctx context.Context, m *client.Monitor) (monitorDataMode
 		CreatedAt:            stringOrNull(m.CreatedAt),
 		LastPingAt:           timestampOrNull(m.LastPingAt),
 		DueAt:                timestampOrNull(m.DueAt),
+		NextProbeAt:          timestampOrNull(m.NextProbeAt),
 		AlertAfter:           timestampOrNull(m.AlertAfter),
 		MaintenanceUntil:     timestampOrNull(m.MaintenanceUntil),
 	}

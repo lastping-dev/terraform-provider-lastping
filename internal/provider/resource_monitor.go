@@ -128,6 +128,8 @@ type monitorResourceModel struct {
 	CiProvider           types.String `tfsdk:"ci_provider"`
 	CiWorkflow           types.String `tfsdk:"ci_workflow"`
 	CiBranch             types.String `tfsdk:"ci_branch"`
+	CiWebhookURL         types.String `tfsdk:"ci_webhook_url"`
+	CiSecret             types.String `tfsdk:"ci_secret"`
 	ProbeURL             types.String `tfsdk:"probe_url"`
 	ProbeMethod          types.String `tfsdk:"probe_method"`
 	ProbeIntervalS       types.Int64  `tfsdk:"probe_interval_s"`
@@ -141,6 +143,7 @@ type monitorResourceModel struct {
 	CreatedAt            types.String `tfsdk:"created_at"`
 	LastPingAt           types.String `tfsdk:"last_ping_at"`
 	DueAt                types.String `tfsdk:"due_at"`
+	NextProbeAt          types.String `tfsdk:"next_probe_at"`
 	AlertAfter           types.String `tfsdk:"alert_after"`
 	MaintenanceUntil     types.String `tfsdk:"maintenance_until"`
 
@@ -422,10 +425,9 @@ func (r *monitorResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 					"subsequent plan forever. `RequiresReplace` is the only honest rendering: it shows the " +
 					"true cost of the change (a new monitor id, a new webhook URL and a new secret) at plan " +
 					"time, before anything is applied.\n\n" +
-					"~> **The webhook secret is returned exactly once, in the create response, and this " +
-					"provider does not surface it.** Read it from the dashboard, or rotate it with " +
-					"`POST /api/v1/checks/{id}/ci/regenerate`, and store it in your CI provider's secret " +
-					"manager.",
+					"~> **The webhook URL and signing secret are on `ci_webhook_url` and `ci_secret`, not " +
+					"here.** Both are set by this same create call; see `ci_secret` in particular for what " +
+					"it does and does not survive.",
 				Validators:    []validator.String{stringvalidator.OneOf("github", "gitlab", "jenkins")},
 				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
 			},
@@ -453,6 +455,37 @@ func (r *monitorResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 					"~> **Ignored unless `ci_provider` is set**, and **cannot be refreshed** — see " +
 					"`ci_workflow`, which carries both caveats on identical terms.",
 				Validators: []validator.String{stringvalidator.LengthAtLeast(1)},
+			},
+			"ci_webhook_url": schema.StringAttribute{
+				Computed: true,
+				MarkdownDescription: "The URL your CI provider's pipeline should `POST` to, signing the " +
+					"request body with `ci_secret` as an HMAC key. Set once, when `ci_provider` is set, and " +
+					"reported by every subsequent `GET` — unlike `ci_secret`, this one refreshes normally. " +
+					"Null when the monitor has no CI binding.\n\n" +
+					"Feed this straight into whatever manages your pipeline's webhook configuration — a " +
+					"`github_repository_webhook` resource, a GitLab webhook, a Jenkins job — instead of " +
+					"copying it out of the dashboard by hand.",
+			},
+			"ci_secret": schema.StringAttribute{
+				Computed:  true,
+				Sensitive: true,
+				MarkdownDescription: "The HMAC key your CI provider's pipeline signs its `ci_webhook_url` " +
+					"requests with.\n\n" +
+					"~> **WRITE-ONCE — returned only by the create call that sets `ci_provider`.** No " +
+					"`GET`, list or `PATCH` response ever carries it (api/checks.go: rowToDTO's own comment " +
+					"says so — \"ci_secret is NEVER populated here\"), so this provider carries the value " +
+					"captured at creation forward across every later refresh instead of re-reading it, the " +
+					"same pattern `lastping_api_key`'s `key` uses for its own write-once credential. A " +
+					"refresh reporting nothing new here is expected, not a sign anything is wrong.\n\n" +
+					"~> **`terraform import` cannot populate this.** Import works by `GET`, which never " +
+					"carries `ci_secret` either — a CI monitor brought in with `terraform import` starts " +
+					"with `ci_secret` null and, unlike `ci_workflow`/`ci_branch`, no later apply can fill it " +
+					"in, because this attribute cannot be configured. To get a usable secret into Terraform " +
+					"state for an imported CI monitor, either replace it " +
+					"(`terraform apply -replace=lastping_monitor.<name>`, which mints a new webhook and " +
+					"secret exactly as changing `ci_provider` would) or fetch a fresh one from " +
+					"`POST /api/v1/checks/{id}/ci/regenerate` and manage it outside Terraform — this " +
+					"provider does not call that endpoint.",
 			},
 			"probe_url": schema.StringAttribute{
 				Optional:            true,
@@ -517,6 +550,12 @@ func (r *monitorResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 			"due_at": schema.StringAttribute{
 				Computed:            true,
 				MarkdownDescription: "RFC 3339 UTC timestamp of the next expected ping.",
+			},
+			"next_probe_at": schema.StringAttribute{
+				Computed: true,
+				MarkdownDescription: "RFC 3339 UTC timestamp when the prober will next probe this monitor — " +
+					"`due_at`'s counterpart for `monitor_type = \"http\"`. Null for every other monitor " +
+					"type, which has no probe schedule to report.",
 			},
 			"alert_after": schema.StringAttribute{
 				Computed:            true,
@@ -1127,32 +1166,48 @@ func int64OrNull(v int64) types.Int64 {
 	return types.Int64Value(v)
 }
 
-// writeOnlyString maps an attribute the API accepts but never reports back —
-// ci_workflow and ci_branch, and nothing else today.
+// writeOnlyString maps a string attribute that the current API response does
+// not carry a fresh value for — apiVal decodes as "" — back onto whatever
+// Terraform already has for it, rather than nulling it out. Two different
+// attribute shapes need this and both use it as-is:
 //
-// Neither has a field on api/checks.go's checkResponse, so no GET, list or
-// PATCH response can carry one; the decoded value is always "", whatever the
-// server actually holds. Passing that "" through stringOrNull would null the
-// attribute on the first refresh after every apply, producing a permanent diff
-// against any configuration that sets it. Carrying the prior value forward
-// instead is the only self-consistent option available: state reports what
-// Terraform last wrote.
+//   - ci_workflow and ci_branch are write-only from the API's point of view:
+//     the provider sends them on create and PATCH, but no response — GET,
+//     list or PATCH's own reply — ever reports them back. checkResponse simply
+//     has no field for either.
+//   - ci_secret is the mirror shape, read-once: the provider never sends it
+//     (it cannot be configured at all), and the API reports it back exactly
+//     once, in the create response, per api/checks.go's rowToDTO comment
+//     ("ci_secret is NEVER populated here" — true of every other response).
 //
-// The cost is stated in the schema description rather than hidden: a filter
-// changed outside Terraform cannot be detected, and an imported monitor starts
-// with both attributes null regardless of how it is really configured. The
-// first apply after an import writes the configured values and the two agree
-// from then on.
+// In both cases, passing the API's "" straight through stringOrNull would null
+// the attribute on the very next refresh, producing a permanent diff (for
+// ci_workflow/ci_branch) or destroying the only copy that exists anywhere (for
+// ci_secret) — the same failure modelFromAPIKey's comment describes for
+// apiKeyResourceModel's Key. Carrying the prior value forward instead is the
+// only self-consistent option: state reports what Terraform last captured.
 //
-// The apiVal argument is not dead code standing in for that: it is the seam
-// that makes this correct the day the API starts returning the filters. A real
-// value always wins over the prior one, so the function turns into an ordinary
-// refresh with no call-site change.
+// The cost is stated in each attribute's schema description rather than
+// hidden: a filter changed outside Terraform cannot be detected, and a
+// monitor pulled in with `terraform import` starts with all three attributes
+// null regardless of how it is really configured. For ci_workflow/ci_branch
+// the first apply after the import writes the configured value and the two
+// agree from then on; ci_secret has no such recovery, because there is no
+// configured value to write — see its schema description.
+//
+// The apiVal argument is not dead code standing in for any of this: it is the
+// seam that makes the function correct the day a response starts answering
+// with a real value. A real value always wins over the prior one, so refresh
+// (or, for ci_secret, create) is an ordinary call with no special-casing at
+// the call site.
 //
 // An unknown prior resolves to null. Terraform resolves config-derived unknowns
 // before apply, so a plan should never reach here holding one — but writing an
 // unknown into state is a hard "invalid result object after apply" error, and
-// null is both a legal value and the truthful one for "not known here".
+// null is both a legal value and the truthful one for "not known here". This
+// is what makes ci_secret's create path safe: on a non-CI monitor, mon.CiSecret
+// is always "" and plan.CiSecret is always unknown (Computed, unconfigurable),
+// so the result is null rather than an unknown value escaping into state.
 func writeOnlyString(apiVal string, prior types.String) types.String {
 	if apiVal != "" {
 		return types.StringValue(apiVal)
@@ -1230,12 +1285,17 @@ func modelFromMonitor(ctx context.Context, mon *client.Monitor, prior monitorRes
 		// canonical UUID — never the slug a caller may have attached it with.
 		AgentID: stringOrNull(mon.AgentID),
 
-		// ci_provider IS reported by GET and list (checkResponse.CiProvider,
-		// omitempty), so it refreshes normally and an import picks it up. Its
-		// two filters do not — see writeOnlyString.
-		CiProvider: stringOrNull(mon.CiProvider),
-		CiWorkflow: writeOnlyString(mon.CiWorkflow, prior.CiWorkflow),
-		CiBranch:   writeOnlyString(mon.CiBranch, prior.CiBranch),
+		// ci_provider and ci_webhook_url ARE reported by GET and list
+		// (checkResponse.CiProvider / CiWebhookURL, both omitempty), so both
+		// refresh normally and an import picks them up. ci_workflow and
+		// ci_branch do not — see writeOnlyString — and neither does ci_secret,
+		// for the opposite (read-once, not write-only) reason writeOnlyString's
+		// comment also covers.
+		CiProvider:   stringOrNull(mon.CiProvider),
+		CiWorkflow:   writeOnlyString(mon.CiWorkflow, prior.CiWorkflow),
+		CiBranch:     writeOnlyString(mon.CiBranch, prior.CiBranch),
+		CiWebhookURL: stringOrNull(mon.CiWebhookURL),
+		CiSecret:     writeOnlyString(mon.CiSecret, prior.CiSecret),
 
 		// failure_threshold is NOT NULL DEFAULT 1 server-side and always comes
 		// back, so it is a concrete number rather than an int64OrNull.
@@ -1253,6 +1313,7 @@ func modelFromMonitor(ctx context.Context, mon *client.Monitor, prior monitorRes
 		CreatedAt:        types.StringValue(mon.CreatedAt),
 		LastPingAt:       timestampOrNull(mon.LastPingAt),
 		DueAt:            timestampOrNull(mon.DueAt),
+		NextProbeAt:      timestampOrNull(mon.NextProbeAt),
 		AlertAfter:       timestampOrNull(mon.AlertAfter),
 		MaintenanceUntil: timestampOrNull(mon.MaintenanceUntil),
 	}

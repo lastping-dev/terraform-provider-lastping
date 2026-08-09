@@ -74,6 +74,25 @@ type Monitor struct {
 	CiWorkflow string `json:"ci_workflow,omitempty"`
 	CiBranch   string `json:"ci_branch,omitempty"`
 
+	// CiWebhookURL is, unlike CiWorkflow/CiBranch, an ordinary readable
+	// response field: api/checks.go's rowToDTO populates it from row.CiProvider
+	// on every GET and list, exactly like CiProvider itself. Omitted (empty)
+	// when the monitor has no CI binding.
+	CiWebhookURL string `json:"ci_webhook_url,omitempty"`
+
+	// CiSecret is WRITE-ONCE in the other direction from CiWorkflow/CiBranch:
+	// the API returns it, but only in the 201 response to POST /api/v1/checks
+	// when ci_provider was set on that same request, and from
+	// POST /api/v1/checks/{id}/ci/regenerate (which this provider does not
+	// call). rowToDTO never populates it — api/checks.go's own comment on
+	// rowToDTO says so explicitly: "ci_secret is NEVER populated here". Every
+	// GET, list and PATCH response therefore decodes this as "", regardless of
+	// whether the monitor has a live secret, and modelFromMonitor has to carry
+	// the value forward from prior state instead of refreshing it — see
+	// writeOnlyString, the same mechanism CiWorkflow/CiBranch use for the
+	// opposite write-only shape.
+	CiSecret string `json:"ci_secret,omitempty"`
+
 	// Computed.
 	Paused           bool    `json:"paused,omitempty"`
 	Status           string  `json:"status,omitempty"`
@@ -83,6 +102,11 @@ type Monitor struct {
 	DueAt            *string `json:"due_at,omitempty"`
 	AlertAfter       *string `json:"alert_after,omitempty"`
 	MaintenanceUntil *string `json:"maintenance_until,omitempty"`
+	// NextProbeAt is due_at's counterpart for monitor_type = "http": when the
+	// prober will next probe the URL. api/checks.go's checkResponse omits it
+	// for every other monitor_type, so it decodes as nil there, the same as
+	// due_at would for a monitor type that has no due_at.
+	NextProbeAt *string `json:"next_probe_at,omitempty"`
 }
 
 // CreateMonitor creates a monitor with create-only semantics: If-None-Match: *

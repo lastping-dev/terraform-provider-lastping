@@ -193,52 +193,17 @@ const ciConfiguredExempt = "always exactly (ci_provider != null) — a derived b
 // stale, misleading entry behind — and so this map cannot quietly become a
 // dumping ground either.
 //
+// Empty is the healthy state, same as knownSpecGaps: ci_webhook_url,
+// ci_secret and next_probe_at were the three entries this test found on
+// components.schemas.Check on 2026-08-09, and all three are now modelled —
+// ci_webhook_url and next_probe_at as ordinary Computed attributes
+// (resource.lastping_monitor, data.lastping_monitor and
+// data.lastping_monitors.monitors), ci_secret the same way but Sensitive and
+// carried forward from the create response via writeOnlyString, since no
+// later response ever repeats it.
+//
 // Keys are "<case name>[.<nested attribute>].<spec property name>".
-var knownModellingGaps = map[string]string{
-	// ci_webhook_url is the URL a CI-bound check's pipeline should POST pings
-	// to. The provider models ci_provider/ci_workflow/ci_branch — what CI
-	// binding to configure — but never surfaces what the API hands back once
-	// that binding exists, so a Terraform-created `ci`-type monitor has no
-	// way to get its own webhook URL out of Terraform. Found auditing this
-	// test 2026-08-09; not implemented here — needs its own attribute, docs
-	// and tests as a separate change.
-	"resource.lastping_monitor.ci_webhook_url":       ciWebhookGap,
-	"data.lastping_monitor.ci_webhook_url":           ciWebhookGap,
-	"data.lastping_monitors.monitors.ci_webhook_url": ciWebhookGap,
-
-	// ci_secret is the write-once HMAC secret for that same webhook —
-	// returned only on create and on POST .../ci/regenerate, per its own spec
-	// description, never on GET/list. A real implementation would need the
-	// same carry-forward-from-create pattern apiKeyResourceModel already uses
-	// for its Key field. Same root cause as ci_webhook_url: without it a
-	// Terraform-created CI monitor cannot actually be wired up. Found
-	// 2026-08-09; not implemented here.
-	"resource.lastping_monitor.ci_secret":       ciSecretGap,
-	"data.lastping_monitor.ci_secret":           ciSecretGap,
-	"data.lastping_monitors.monitors.ci_secret": ciSecretGap,
-
-	// next_probe_at is the probe-monitor equivalent of due_at — "when is the
-	// next scheduled event" — and due_at IS modelled for heartbeat/cron
-	// monitors. The asymmetry (schedule visibility for one monitor_type but
-	// not the other) reads as an oversight, not an intended difference. Found
-	// 2026-08-09; not implemented here.
-	"resource.lastping_monitor.next_probe_at":       nextProbeAtGap,
-	"data.lastping_monitor.next_probe_at":           nextProbeAtGap,
-	"data.lastping_monitors.monitors.next_probe_at": nextProbeAtGap,
-}
-
-const (
-	ciWebhookGap = "real gap: the webhook URL a CI-bound check's pipeline should POST to is never " +
-		"surfaced, though ci_provider/ci_workflow/ci_branch (what to configure) are all modelled. " +
-		"Found 2026-08-09; needs its own attribute, docs and tests."
-	ciSecretGap = "real gap: the write-once HMAC secret for a CI-bound check's webhook (create/" +
-		"regenerate only, per its spec description) is never surfaced, so a Terraform-created CI " +
-		"monitor cannot be wired up end to end. Found 2026-08-09; needs the same carry-forward " +
-		"pattern apiKeyResourceModel uses for Key."
-	nextProbeAtGap = "real gap: the probe-monitor equivalent of due_at (already modelled) is not " +
-		"modelled, so schedule visibility is asymmetric between monitor_type=http and every other " +
-		"monitor_type. Found 2026-08-09."
-)
+var knownModellingGaps = map[string]string{}
 
 // destinationConfigExempt is the reason every per-kind credential attribute on
 // lastping_destination has no spec property of its own. They are flattened by

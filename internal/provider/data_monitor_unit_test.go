@@ -83,4 +83,71 @@ func TestMonitorSurfacesAgreeOnEmptyValues(t *testing.T) {
 	}
 }
 
+// TestMonitorDataSourceCiWebhookURLAgreesWithResource pins ci_webhook_url as
+// an ordinary readable field on the data source too: unlike ci_secret, it is
+// populated by rowToDTO on every GET, so both surfaces must report the
+// identical value for the identical response instead of the data source
+// reading a stale or null value.
+func TestMonitorDataSourceCiWebhookURLAgreesWithResource(t *testing.T) {
+	ctx := context.Background()
+	mon := client.Monitor{
+		ID: "3f7c1f5a-1a2b-4c3d-8e9f-0a1b2c3d4e5f", Name: "acc",
+		MonitorType: "heartbeat", ScheduleKind: "simple", PeriodS: 3600, TZ: "UTC", GraceS: 1800,
+		CiProvider:   "github",
+		CiWebhookURL: "https://ingest.lastping.dev/ci/github/3f7c1f5a-1a2b-4c3d-8e9f-0a1b2c3d4e5f",
+	}
+
+	res, err := modelFromMonitor(ctx, &mon, monitorResourceModel{Tags: types.SetNull(types.StringType)})
+	require.NoError(t, err)
+	data, diags := monitorDataFromAPI(ctx, &mon)
+	require.False(t, diags.HasError(), "%v", diags)
+
+	require.Equal(t, res.CiWebhookURL, data.CiWebhookURL)
+	require.Equal(t, types.StringValue(
+		"https://ingest.lastping.dev/ci/github/3f7c1f5a-1a2b-4c3d-8e9f-0a1b2c3d4e5f"), data.CiWebhookURL)
+}
+
+// TestMonitorDataSourceCiSecretAlwaysNull pins the documented asymmetry
+// against ci_webhook_url above: data.lastping_monitor and
+// data.lastping_monitors only ever call GET/list, which never carry
+// ci_secret, and a data source has no prior state of its own to carry a
+// create-time value forward from the way the resource does. So even when the
+// underlying client.Monitor happens to carry a secret (as it would for the
+// literal create response, if one were ever routed through here), the data
+// source must still read null — it is not this surface's job to interpret
+// where the value came from, and pretending otherwise would be lying about
+// what GET actually returns for every other caller of this data source.
+func TestMonitorDataSourceCiSecretAlwaysNull(t *testing.T) {
+	ctx := context.Background()
+	mon := client.Monitor{
+		ID: "3f7c1f5a-1a2b-4c3d-8e9f-0a1b2c3d4e5f", Name: "acc",
+		MonitorType: "heartbeat", ScheduleKind: "simple", PeriodS: 3600, TZ: "UTC", GraceS: 1800,
+		CiProvider: "github",
+	}
+	data, diags := monitorDataFromAPI(ctx, &mon)
+	require.False(t, diags.HasError(), "%v", diags)
+	require.True(t, data.CiSecret.IsNull(), "GET never carries ci_secret; the data source must not invent one")
+}
+
+// TestMonitorDataSourceNextProbeAtAgreesWithResource pins next_probe_at
+// parity between the two surfaces, the same way DueAt already implicitly
+// agrees by sharing timestampOrNull.
+func TestMonitorDataSourceNextProbeAtAgreesWithResource(t *testing.T) {
+	ctx := context.Background()
+	mon := client.Monitor{
+		ID: "3f7c1f5a-1a2b-4c3d-8e9f-0a1b2c3d4e5f", Name: "acc",
+		MonitorType: "http", ScheduleKind: "simple", PeriodS: 60, TZ: "UTC", GraceS: 120,
+		ProbeURL: "https://example.com/healthz", ProbeMethod: "GET",
+		NextProbeAt: ptrTo("2026-07-13T03:01:00Z"),
+	}
+
+	res, err := modelFromMonitor(ctx, &mon, monitorResourceModel{Tags: types.SetNull(types.StringType)})
+	require.NoError(t, err)
+	data, diags := monitorDataFromAPI(ctx, &mon)
+	require.False(t, diags.HasError(), "%v", diags)
+
+	require.Equal(t, res.NextProbeAt, data.NextProbeAt)
+	require.Equal(t, types.StringValue("2026-07-13T03:01:00Z"), data.NextProbeAt)
+}
+
 func ptrTo[T any](v T) *T { return &v }

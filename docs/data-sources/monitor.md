@@ -75,6 +75,10 @@ variable "slack_webhook_url" {
 - `ci_provider` (String) CI provider bound to this monitor (`github`, `gitlab` or `jenkins`), or null when it has no CI binding.
 
 The binding's `ci_workflow` and `ci_branch` filters have no attribute here, and cannot: no API response carries them, so a data source could only ever report null. The `lastping_monitor` resource exposes them as write-only attributes for that reason.
+- `ci_secret` (String, Sensitive) The HMAC key `ci_webhook_url` requests are signed with.
+
+~> **Always null through this data source.** The API returns `ci_secret` only in the response to the `POST` that sets `ci_provider` — never on `GET` or list, which is all a data source ever calls. The `lastping_monitor` resource can hold the value because it captures it at creation and carries it forward across refreshes; a data source has no creation event of its own to capture it from.
+- `ci_webhook_url` (String) The URL this monitor's CI pipeline `POST`s to, signed with `ci_secret`. Reported by every `GET`, unlike `ci_secret`. Null when the monitor has no CI binding.
 - `created_at` (String) RFC 3339 UTC timestamp when the monitor was created.
 - `cron_expr` (String) 5-field cron expression, for `schedule_kind = "cron"`.
 - `due_at` (String) RFC 3339 UTC timestamp of the next expected ping.
@@ -87,6 +91,7 @@ The binding's `ci_workflow` and `ci_branch` filters have no attribute here, and 
 - `monitor_from` (String) RFC 3339 UTC timestamp before which deadlines are not computed.
 - `monitor_type` (String) `heartbeat`, `ci`, or `http`.
 - `name` (String) Human-readable name.
+- `next_probe_at` (String) RFC 3339 UTC timestamp when the prober will next probe this monitor — `due_at`'s counterpart for `monitor_type = "http"`. Null for every other monitor type.
 - `notify_min_run_s` (Number) Notification duration floor in seconds: a run shorter than this produces no info-class notification (`success`, `every-run`, `note`). Null when unset, in which case every info-class event notifies regardless of how short the run was. Never suppresses `down`, `fail`, `recovery` or `blocked`, and never set on an `http` monitor.
 - `paused` (Boolean) Whether alerting is suspended for this monitor.
 - `period_s` (Number) Expected ping interval in seconds, for `schedule_kind = "simple"`.

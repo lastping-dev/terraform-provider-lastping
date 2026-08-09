@@ -148,6 +148,9 @@ resource "lastping_monitor" "probe" {
 					resource.TestCheckResourceAttr("lastping_monitor.probe", "schedule_kind", "simple"),
 					resource.TestCheckResourceAttr("lastping_monitor.probe", "period_s", "300"),
 					resource.TestCheckResourceAttr("lastping_monitor.probe", "probe_timeout_s", "10"),
+					// next_probe_at is due_at's http-monitor counterpart — server-set
+					// on creation, not something a config value could ever produce.
+					resource.TestCheckResourceAttrSet("lastping_monitor.probe", "next_probe_at"),
 				),
 			},
 			{
@@ -1697,6 +1700,12 @@ resource "lastping_monitor" "ci" {
 					resource.TestCheckResourceAttr("lastping_monitor.ci", "ci_provider", "github"),
 					resource.TestCheckResourceAttr("lastping_monitor.ci", "ci_workflow", "ci.yml"),
 					resource.TestCheckResourceAttr("lastping_monitor.ci", "ci_branch", "main"),
+					// ci_webhook_url and ci_secret are both minted by this same create
+					// call — see the write-once findings in resource_monitor.go's
+					// writeOnlyString comment.
+					resource.TestMatchResourceAttr("lastping_monitor.ci", "ci_webhook_url",
+						regexp.MustCompile(`^https?://.+/ci/github/`)),
+					resource.TestCheckResourceAttrSet("lastping_monitor.ci", "ci_secret"),
 					resource.TestCheckResourceAttrWith("lastping_monitor.ci", "id", func(id string) error {
 						mon, err := testAccDirectClient(t).GetMonitor(t.Context(), id)
 						if err != nil {
@@ -1708,6 +1717,15 @@ resource "lastping_monitor" "ci" {
 						return nil
 					}),
 				),
+			},
+			{
+				// A refresh against the live backend must not blank ci_secret —
+				// the same claim TestMonitorCiSecretSurvivesRefresh pins as a unit
+				// test, exercised here against the real GET response instead of a
+				// hand-built one. A default PlanOnly step expects an empty plan,
+				// so this fails the moment ci_secret goes null and produces a diff.
+				Config:   config,
+				PlanOnly: true,
 			},
 			{
 				// The filters update in place: only ci_provider is immutable.
@@ -1738,10 +1756,17 @@ resource "lastping_monitor" "ci" {
 				PlanOnly: true,
 			},
 			{
-				ResourceName:      "lastping_monitor.ci",
-				ImportState:       true,
-				ImportStateId:     "acc-ci-binding",
-				ImportStateVerify: true,
+				// ci_secret is ignored for the same reason ci_workflow/ci_branch
+				// are in TestAccMonitor_ciFiltersAreNotRefreshable: import performs
+				// a GET, which never carries it — see ci_secret's own schema
+				// description. ci_webhook_url is deliberately NOT ignored: unlike
+				// the other three, it IS reported by GET, so it must survive the
+				// import exactly like ci_provider already does.
+				ResourceName:            "lastping_monitor.ci",
+				ImportState:             true,
+				ImportStateId:           "acc-ci-binding",
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"ci_secret"},
 			},
 		},
 	})

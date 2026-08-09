@@ -550,6 +550,115 @@ func TestMonitorCIFiltersSurviveRefresh(t *testing.T) {
 		"an API that answers must win over the prior state")
 }
 
+// TestMonitorCiWebhookURLRefreshesNormally pins the OTHER half of the CI
+// fields: unlike ci_workflow/ci_branch/ci_secret, ci_webhook_url is an
+// ordinary readable response field (api/checks.go's rowToDTO populates it
+// from row.CiProvider on every GET, the same as ci_provider itself), so it
+// must NOT go through writeOnlyString's carry-forward — a stale prior value
+// must not survive a response that now says something different, and an
+// absent binding must read as null even with a stale prior in state.
+func TestMonitorCiWebhookURLRefreshesNormally(t *testing.T) {
+	ctx := context.Background()
+	prior := monitorResourceModel{
+		Tags:         types.SetNull(types.StringType),
+		CiWebhookURL: types.StringValue("https://ingest.lastping.dev/ci/github/OLD-ID"),
+	}
+
+	fromAPI := &client.Monitor{
+		ID: "3f7c1f5a-1a2b-4c3d-8e9f-0a1b2c3d4e5f", Name: "acc",
+		MonitorType: "heartbeat", ScheduleKind: "simple", PeriodS: 3600, TZ: "UTC", GraceS: 1800,
+		CiProvider:   "github",
+		CiWebhookURL: "https://ingest.lastping.dev/ci/github/3f7c1f5a-1a2b-4c3d-8e9f-0a1b2c3d4e5f",
+	}
+	got, err := modelFromMonitor(ctx, fromAPI, prior)
+	require.NoError(t, err)
+	require.Equal(t, types.StringValue("https://ingest.lastping.dev/ci/github/3f7c1f5a-1a2b-4c3d-8e9f-0a1b2c3d4e5f"),
+		got.CiWebhookURL, "the API's answer must win over a stale prior value")
+
+	unbound := *fromAPI
+	unbound.CiProvider, unbound.CiWebhookURL = "", ""
+	got, err = modelFromMonitor(ctx, &unbound, prior)
+	require.NoError(t, err)
+	require.True(t, got.CiWebhookURL.IsNull(),
+		"no CI binding must read as null even with a stale prior value in state")
+}
+
+// TestMonitorCiSecretSurvivesRefresh is the security-critical invariant for
+// ci_secret, on identical terms to TestAPIKeyModelPreservesPlaintext for
+// apiKeyResourceModel.Key: the API returns the plaintext secret exactly once,
+// in the create response, and never again — api/checks.go's rowToDTO comment
+// says so explicitly. A refresh (or an update, which also calls
+// modelFromMonitor) must carry the value already in state forward rather than
+// nulling it, or the one copy that exists anywhere is destroyed.
+//
+// This is the same shape TestMonitorCIFiltersSurviveRefresh already pins for
+// ci_workflow/ci_branch, but the failure mode ci_secret adds is sharper: for
+// ci_workflow, losing the value just breaks a filter that can be reconfigured.
+// For ci_secret there is no reconfiguring it — see the schema description's
+// import caveat.
+func TestMonitorCiSecretSurvivesRefresh(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("create takes the secret from the response", func(t *testing.T) {
+		fromAPI := &client.Monitor{
+			ID: "3f7c1f5a-1a2b-4c3d-8e9f-0a1b2c3d4e5f", Name: "acc",
+			MonitorType: "heartbeat", ScheduleKind: "simple", PeriodS: 3600, TZ: "UTC", GraceS: 1800,
+			CiProvider: "github", CiSecret: "a3f8c2d1e4b7a9f0c3d2e1b4a7f8c0d3",
+		}
+		// plan.CiSecret is Unknown here, exactly as terraform-plugin-framework
+		// plans an unconfigured Computed attribute on create — this is the case
+		// that must NOT leak an unknown value into state when the API omits it
+		// (covered below); here the API answers, so that path is not exercised.
+		plan := monitorResourceModel{Tags: types.SetNull(types.StringType), CiSecret: types.StringUnknown()}
+		got, err := modelFromMonitor(ctx, fromAPI, plan)
+		require.NoError(t, err)
+		require.Equal(t, types.StringValue("a3f8c2d1e4b7a9f0c3d2e1b4a7f8c0d3"), got.CiSecret)
+	})
+
+	t.Run("create of a non-CI monitor reads null, not unknown", func(t *testing.T) {
+		// The common case: no ci_provider, so the API never sets CiSecret and
+		// plan.CiSecret is Unknown (Computed, nothing configured it). Writing
+		// that unknown straight into state would be a hard "invalid result
+		// object after apply" error — this is exactly the edge case
+		// writeOnlyString's unknown-prior handling exists for.
+		fromAPI := &client.Monitor{
+			ID: "3f7c1f5a-1a2b-4c3d-8e9f-0a1b2c3d4e5f", Name: "acc",
+			MonitorType: "heartbeat", ScheduleKind: "simple", PeriodS: 3600, TZ: "UTC", GraceS: 1800,
+		}
+		plan := monitorResourceModel{Tags: types.SetNull(types.StringType), CiSecret: types.StringUnknown()}
+		got, err := modelFromMonitor(ctx, fromAPI, plan)
+		require.NoError(t, err)
+		require.True(t, got.CiSecret.IsNull(), "must be null, not unknown")
+	})
+
+	t.Run("refresh keeps the prior secret", func(t *testing.T) {
+		fromAPI := &client.Monitor{
+			ID: "3f7c1f5a-1a2b-4c3d-8e9f-0a1b2c3d4e5f", Name: "acc",
+			MonitorType: "heartbeat", ScheduleKind: "simple", PeriodS: 3600, TZ: "UTC", GraceS: 1800,
+			CiProvider: "github", // GET reports the binding, but never the secret.
+		}
+		prior := monitorResourceModel{
+			Tags: types.SetNull(types.StringType), CiSecret: types.StringValue("a3f8c2d1e4b7a9f0c3d2e1b4a7f8c0d3"),
+		}
+		got, err := modelFromMonitor(ctx, fromAPI, prior)
+		require.NoError(t, err)
+		require.Equal(t, types.StringValue("a3f8c2d1e4b7a9f0c3d2e1b4a7f8c0d3"), got.CiSecret,
+			"a GET response carries no secret and must not blank the stored one")
+	})
+
+	t.Run("import cannot recover the secret", func(t *testing.T) {
+		fromAPI := &client.Monitor{
+			ID: "3f7c1f5a-1a2b-4c3d-8e9f-0a1b2c3d4e5f", Name: "acc",
+			MonitorType: "heartbeat", ScheduleKind: "simple", PeriodS: 3600, TZ: "UTC", GraceS: 1800,
+			CiProvider: "github",
+		}
+		imported, err := modelFromMonitor(ctx, fromAPI, monitorResourceModel{Tags: types.SetNull(types.StringType)})
+		require.NoError(t, err)
+		require.True(t, imported.CiSecret.IsNull(),
+			"import performs a GET, which never carries ci_secret, and no later apply can fill it in")
+	})
+}
+
 // TestMonitorBlockedTimeoutReadsAbsentAsNull: the API omits blocked_timeout_s
 // when it is unset, and "unset" means the 24-hour default applies — not that
 // the monitor waits forever, and not 0. Null is the only reading that
@@ -607,11 +716,53 @@ func TestMonitorOptionalOnlyAttributesAreNotComputed(t *testing.T) {
 	// The converse: these are genuinely server-supplied and must stay Computed.
 	for _, name := range []string{
 		"grace_s", "monitor_type", "schedule_kind", "period_s", "tz", "failure_threshold",
+		"ci_webhook_url", "ci_secret", "next_probe_at",
 	} {
 		attr, ok := s.Attributes[name]
 		require.True(t, ok, "missing attribute %s", name)
 		require.True(t, attr.IsComputed(), "%s is server-derived and must stay computed", name)
 	}
+}
+
+// TestMonitorCiSecretIsSensitive pins the CLI-rendering half of the ci_secret
+// invariant, the same way TestProvider_Schema does for api_key. Sensitive does
+// not affect storage — see writeOnlyString's comment and ci_secret's own
+// MarkdownDescription — but it does keep the value out of the plan/apply
+// output a practitioner sees on their terminal, and losing the flag would be a
+// silent regression no other test here would catch.
+func TestMonitorCiSecretIsSensitive(t *testing.T) {
+	s := monitorSchema(t)
+	attr, ok := s.Attributes["ci_secret"]
+	require.True(t, ok, "missing attribute ci_secret")
+	require.True(t, attr.IsSensitive(), "ci_secret must be marked sensitive")
+	require.True(t, attr.IsComputed(), "ci_secret can only ever come from the server")
+	require.False(t, attr.IsOptional(), "ci_secret cannot be configured — the API has no field for it")
+}
+
+// TestMonitorNextProbeAtIsHTTPOnly pins due_at's http-monitor counterpart: the
+// API omits next_probe_at for every monitor_type other than http
+// (api/checks.go's checkResponse has `omitempty` on it), which has to read as
+// null rather than as an empty string.
+func TestMonitorNextProbeAtIsHTTPOnly(t *testing.T) {
+	ctx := context.Background()
+
+	httpMon := &client.Monitor{
+		ID: "3f7c1f5a-1a2b-4c3d-8e9f-0a1b2c3d4e5f", Name: "acc",
+		MonitorType: "http", ScheduleKind: "simple", PeriodS: 60, TZ: "UTC", GraceS: 120,
+		ProbeURL: "https://example.com/healthz", ProbeMethod: "GET",
+		NextProbeAt: ptrTo("2026-07-13T03:01:00Z"),
+	}
+	got, err := modelFromMonitor(ctx, httpMon, monitorResourceModel{Tags: types.SetNull(types.StringType)})
+	require.NoError(t, err)
+	require.Equal(t, types.StringValue("2026-07-13T03:01:00Z"), got.NextProbeAt)
+
+	heartbeatMon := &client.Monitor{
+		ID: "3f7c1f5a-1a2b-4c3d-8e9f-0a1b2c3d4e5f", Name: "acc",
+		MonitorType: "heartbeat", ScheduleKind: "simple", PeriodS: 3600, TZ: "UTC", GraceS: 1800,
+	}
+	got, err = modelFromMonitor(ctx, heartbeatMon, monitorResourceModel{Tags: types.SetNull(types.StringType)})
+	require.NoError(t, err)
+	require.True(t, got.NextProbeAt.IsNull(), "non-http monitor types have no probe schedule to report")
 }
 
 // TestMonitorFromValueKeepsEquivalentInstant: the API answers in UTC, so a
@@ -1018,6 +1169,8 @@ func TestResolveUnknownsFromState_CoversEveryAttribute(t *testing.T) {
 		CiProvider:           types.StringValue("gitlab"),
 		CiWorkflow:           types.StringValue("nightly"),
 		CiBranch:             types.StringValue("release"),
+		CiWebhookURL:         types.StringValue("https://ingest.lastping.dev/ci/gitlab/3f7c1f5a-1a2b-4c3d-8e9f-0a1b2c3d4e5f"),
+		CiSecret:             types.StringValue("a3f8c2d1e4b7a9f0c3d2e1b4a7f8c0d3"),
 		ProbeURL:             types.StringValue("https://example.com/health"),
 		ProbeMethod:          types.StringValue("HEAD"),
 		ProbeIntervalS:       types.Int64Value(120),
@@ -1031,6 +1184,7 @@ func TestResolveUnknownsFromState_CoversEveryAttribute(t *testing.T) {
 		CreatedAt:            types.StringValue("2026-01-01T00:00:00Z"),
 		LastPingAt:           types.StringValue("2026-01-02T00:00:00Z"),
 		DueAt:                types.StringValue("2026-01-03T00:00:00Z"),
+		NextProbeAt:          types.StringValue("2026-01-03T00:05:00Z"),
 		AlertAfter:           types.StringValue("2026-01-04T00:00:00Z"),
 		MaintenanceUntil:     types.StringValue("2026-01-05T00:00:00Z"),
 		Assertions: types.SetValueMust(assertionObjectType(), []attr.Value{

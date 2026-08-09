@@ -341,7 +341,7 @@ Accepted on every `monitor_type`, `http` included — unlike `max_runtime_s` and
 
 ~> **Changing or removing this replaces the monitor.** The API treats the CI binding as create-only: `POST /api/v1/checks` is the only place a provider can be set, and `PATCH /api/v1/checks/{id}` does not decode the field at all — it is listed alongside `slug`, `monitor_type` and `ci_secret` as immutable and ignored if present. Modelling that as an in-place update would produce a plan that reads as a clean one-attribute change and an apply that silently did nothing, leaving the same diff on every subsequent plan forever. `RequiresReplace` is the only honest rendering: it shows the true cost of the change (a new monitor id, a new webhook URL and a new secret) at plan time, before anything is applied.
 
-~> **The webhook secret is returned exactly once, in the create response, and this provider does not surface it.** Read it from the dashboard, or rotate it with `POST /api/v1/checks/{id}/ci/regenerate`, and store it in your CI provider's secret manager.
+~> **The webhook URL and signing secret are on `ci_webhook_url` and `ci_secret`, not here.** Both are set by this same create call; see `ci_secret` in particular for what it does and does not survive.
 - `ci_workflow` (String) Only accept inbound CI webhooks whose workflow name matches this (provider-specific — a GitHub Actions workflow file name such as `ci.yml`, for example). Omit it to accept every workflow. Unlike `ci_provider` this is an in-place update, and removing it from the configuration clears the filter.
 
 ~> **Ignored unless `ci_provider` is set**, which this provider refuses at plan time rather than letting the API accept and discard it.
@@ -413,11 +413,20 @@ A step is a liveness marker the job posts inside a run it has already started (`
 ### Read-Only
 
 - `alert_after` (String) RFC 3339 UTC timestamp after which a missing ping raises an incident.
+- `ci_secret` (String, Sensitive) The HMAC key your CI provider's pipeline signs its `ci_webhook_url` requests with.
+
+~> **WRITE-ONCE — returned only by the create call that sets `ci_provider`.** No `GET`, list or `PATCH` response ever carries it (api/checks.go: rowToDTO's own comment says so — "ci_secret is NEVER populated here"), so this provider carries the value captured at creation forward across every later refresh instead of re-reading it, the same pattern `lastping_api_key`'s `key` uses for its own write-once credential. A refresh reporting nothing new here is expected, not a sign anything is wrong.
+
+~> **`terraform import` cannot populate this.** Import works by `GET`, which never carries `ci_secret` either — a CI monitor brought in with `terraform import` starts with `ci_secret` null and, unlike `ci_workflow`/`ci_branch`, no later apply can fill it in, because this attribute cannot be configured. To get a usable secret into Terraform state for an imported CI monitor, either replace it (`terraform apply -replace=lastping_monitor.<name>`, which mints a new webhook and secret exactly as changing `ci_provider` would) or fetch a fresh one from `POST /api/v1/checks/{id}/ci/regenerate` and manage it outside Terraform — this provider does not call that endpoint.
+- `ci_webhook_url` (String) The URL your CI provider's pipeline should `POST` to, signing the request body with `ci_secret` as an HMAC key. Set once, when `ci_provider` is set, and reported by every subsequent `GET` — unlike `ci_secret`, this one refreshes normally. Null when the monitor has no CI binding.
+
+Feed this straight into whatever manages your pipeline's webhook configuration — a `github_repository_webhook` resource, a GitLab webhook, a Jenkins job — instead of copying it out of the dashboard by hand.
 - `created_at` (String) RFC 3339 UTC timestamp when the monitor was created.
 - `due_at` (String) RFC 3339 UTC timestamp of the next expected ping.
 - `id` (String) Monitor UUID, assigned by the server.
 - `last_ping_at` (String) RFC 3339 UTC timestamp of the most recent ping. Null until the first ping.
 - `maintenance_until` (String) RFC 3339 UTC timestamp until which alerting is suppressed for maintenance. Set through the API or dashboard, not by Terraform.
+- `next_probe_at` (String) RFC 3339 UTC timestamp when the prober will next probe this monitor — `due_at`'s counterpart for `monitor_type = "http"`. Null for every other monitor type, which has no probe schedule to report.
 - `ping_url` (String) URL your service should HTTP GET to record a successful ping.
 - `status` (String) Current status derived from ping history: `new`, `up`, `late`, or `down`.
 
