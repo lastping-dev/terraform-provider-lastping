@@ -34,15 +34,29 @@ const specPath = "../../testdata/openapi.yaml"
 // failure lands on a user's `terraform apply` as an unexplained 400 or a
 // silently-ignored attribute.
 //
-// These tests read the published spec and assert that every attribute the
-// provider sends exists as a request property, and every attribute it reads
-// back exists as a response property. Drift becomes a failing PR check.
+// These tests read the published spec and check both directions of the same
+// relationship. TestOpenAPIContract asserts that every attribute the provider
+// sends exists as a request property, and every attribute it reads back
+// exists as a response property — this catches the provider claiming a field
+// the API does not have. TestOpenAPIContract_SpecCoverage asserts the mirror:
+// that every request/response property the spec declares (on a schema an
+// existing case already checks) is modelled by the provider — this catches
+// the API growing a field the provider silently ignores, which is the more
+// common direction of drift since the API leads and Terraform follows.
 //
-// Deliberate mismatches are declared, not tolerated in silence: each entry in a
-// case's sendExempt/readExempt map carries the reason it cannot be a spec
-// property. knownSpecGaps (below) is separate and stricter — it names fields
-// the API genuinely implements but the spec omits, and it fails once the spec
-// is fixed so the entry cannot outlive the bug.
+// Deliberate mismatches are declared, not tolerated in silence, in both
+// directions:
+//   - sendExempt/readExempt (per case): a provider attribute has no spec
+//     property, and never should — TestOpenAPIContract skips it.
+//   - knownSpecGaps (below): the API genuinely implements a provider
+//     attribute the *spec* omits — a documentation bug, not tolerated
+//     forever: it fails once the spec is fixed so the entry cannot outlive it.
+//   - deliberatelyUnmodelled (below): a spec property has no provider
+//     attribute, and never should — TestOpenAPIContract_SpecCoverage skips it.
+//   - knownModellingGaps (below): the provider genuinely omits a spec
+//     property that probably SHOULD be modelled — a real, temporary gap, not
+//     a design decision, that fails once someone models it (or reclassifies
+//     it into deliberatelyUnmodelled) so the entry cannot outlive it either.
 // ─────────────────────────────────────────────────────────────────────────────
 
 // knownSpecGaps are provider attributes backed by real API behaviour that the
@@ -75,6 +89,156 @@ const specPath = "../../testdata/openapi.yaml"
 // data.lastping_monitors.monitors went once a resync picked up a deployment
 // that carried the property on CheckCreate, Check and CheckPatch.
 var knownSpecGaps = map[string]string{}
+
+// deliberatelyUnmodelled records spec properties that live on a schema an
+// existing contractCase already checks, that the provider does NOT model, and
+// that a human has decided it never should — a permanent design decision, the
+// reverse-direction mirror of a case's sendExempt/readExempt map rather than
+// of knownSpecGaps.
+//
+// This is NOT where a genuinely missing attribute goes. Each entry is a claim
+// that the property has no business being Terraform state, and a wrong claim
+// hides a real gap exactly as effectively as a bug — see knownModellingGaps
+// for where a real, not-yet-fixed gap belongs instead. Do not add an entry
+// here just to silence TestOpenAPIContract_SpecCoverage.
+//
+// Keys are "<case name>[.<nested attribute>].<spec property name>", matching
+// knownSpecGaps' key shape — see splitGapKey.
+var deliberatelyUnmodelled = map[string]string{
+	// last_used_at and last_used_surface (ApiKey, inherited by ApiKeyCreated)
+	// are REST/MCP/UI-only by design — see the monorepo's api/apikeys_api.go,
+	// the comment on apiKeyResponse: last_used_at changes on every
+	// authenticated request, so a computed Terraform attribute tracking it
+	// would produce a permanent, meaningless diff on every `terraform plan`.
+	// last_used_surface is derived from the caller-controlled, spoofable
+	// User-Agent header — best-effort client self-identification, never
+	// authorization, and not state a config-as-code tool should converge on.
+	"resource.lastping_api_key.last_used_at":       apiKeyTelemetryExempt,
+	"resource.lastping_api_key.last_used_surface":  apiKeyTelemetryExempt,
+	"ephemeral.lastping_api_key.last_used_at":      apiKeyTelemetryExempt,
+	"ephemeral.lastping_api_key.last_used_surface": apiKeyTelemetryExempt,
+
+	// The ephemeral resource never surfaces created_at or expires_at (only the
+	// managed lastping_api_key resource does). This mirrors the same map's
+	// ttl-vs-expires_at split the *forward* direction already exempts: the
+	// ephemeral resource's whole point, spelled out in its own schema
+	// description, is that nothing about it is written to plan or state — the
+	// caller configures a relative ttl and gets back only what using the key
+	// requires (id, prefix, key). Absolute timestamps that only matter for a
+	// value meant to be reconciled across runs add nothing for a value that
+	// lives and dies within one.
+	"ephemeral.lastping_api_key.created_at": "ephemeral.lastping_api_key deliberately keeps no " +
+		"persisted-looking fields — see the resource's own schema description. created_at describes " +
+		"a record that is never refreshed or diffed here, so exposing it would suggest state this " +
+		"resource explicitly does not keep.",
+	"ephemeral.lastping_api_key.expires_at": "ephemeral.lastping_api_key models its lifetime as the " +
+		"caller-supplied ttl (a duration), not the server's absolute expires_at — the same asymmetry " +
+		"ttl's sendExempt/readExempt entries already document. The resource is consumed and gone " +
+		"within one run, so there is nothing to reconcile an absolute timestamp against.",
+
+	// ci_configured is `true` exactly when ci_provider is set and omitted
+	// otherwise (see its spec description) — a boolean mirror of information
+	// the provider already exposes via ci_provider's presence/absence. A
+	// second attribute that is always derivable from the first would be
+	// redundant state, not a new capability.
+	"resource.lastping_monitor.ci_configured":       ciConfiguredExempt,
+	"data.lastping_monitor.ci_configured":           ciConfiguredExempt,
+	"data.lastping_monitors.monitors.ci_configured": ciConfiguredExempt,
+
+	// ChannelCreate.config is the API's single free-form request object; the
+	// provider flattens it into named, kind-specific attributes instead of
+	// exposing "config" itself. This is the same fact destinationConfigExempt
+	// already records for the *forward* direction (why none of the flattened
+	// attributes has a spec property of its own) — this entry is what closes
+	// the loop from the spec's side: "config" itself has no flattened
+	// counterpart to point at, because it is not one property but a bag of
+	// them, declared additionalProperties: true with no named members.
+	"resource.lastping_destination.config": destinationConfigExempt,
+
+	// Route's channel_ids is exactly resource_route.go's destination_ids: the
+	// provider says "destination" everywhere the API says "channel", so the
+	// attribute exists under a different name rather than not at all. The
+	// *forward* direction already exempts destination_ids for the identical
+	// reason (sendExempt/readExempt on "resource.lastping_route"); this is
+	// that same rename viewed from the spec's side.
+	"resource.lastping_route.channel_ids": "provider-side name for the API's channel_ids; the " +
+		"provider says \"destination\" everywhere the API says \"channel\" (see destination_ids in " +
+		"this case's sendExempt/readExempt)",
+}
+
+// apiKeyTelemetryExempt is shared by the managed and ephemeral api_key cases:
+// both omit last_used_at/last_used_surface for the same reason.
+const apiKeyTelemetryExempt = "REST/MCP/UI-only by design (monorepo api/apikeys_api.go, comment on " +
+	"apiKeyResponse): last_used_at changes on every authenticated request, so a computed Terraform " +
+	"attribute tracking it would produce a permanent, meaningless diff on every `terraform plan`. " +
+	"last_used_surface is derived from the spoofable User-Agent header — best-effort client " +
+	"self-identification, never authorization, not state to converge on."
+
+// ciConfiguredExempt is shared by all three monitor-reading cases.
+const ciConfiguredExempt = "always exactly (ci_provider != null) — a derived boolean mirror of " +
+	"information ci_provider already carries, not a new capability"
+
+// knownModellingGaps names spec properties that a schema an existing contract
+// case checks genuinely declares, that the provider does not model, and that
+// — unlike a deliberatelyUnmodelled entry — probably SHOULD be modelled. They
+// are real gaps this audit found, not design decisions: an entry here is not
+// a way to make TestOpenAPIContract_SpecCoverage stop mentioning a property,
+// it is a promise that someone still owes Terraform that attribute.
+//
+// This is the mirror of knownSpecGaps (the API implements something the spec
+// omits) for the direction this file exists to catch (the spec declares
+// something the provider omits). Exactly like knownSpecGaps,
+// TestOpenAPIContract_KnownModellingGapsStillExist asserts every entry is
+// STILL missing, so a gap that gets filled fails loudly instead of leaving a
+// stale, misleading entry behind — and so this map cannot quietly become a
+// dumping ground either.
+//
+// Keys are "<case name>[.<nested attribute>].<spec property name>".
+var knownModellingGaps = map[string]string{
+	// ci_webhook_url is the URL a CI-bound check's pipeline should POST pings
+	// to. The provider models ci_provider/ci_workflow/ci_branch — what CI
+	// binding to configure — but never surfaces what the API hands back once
+	// that binding exists, so a Terraform-created `ci`-type monitor has no
+	// way to get its own webhook URL out of Terraform. Found auditing this
+	// test 2026-08-09; not implemented here — needs its own attribute, docs
+	// and tests as a separate change.
+	"resource.lastping_monitor.ci_webhook_url":       ciWebhookGap,
+	"data.lastping_monitor.ci_webhook_url":           ciWebhookGap,
+	"data.lastping_monitors.monitors.ci_webhook_url": ciWebhookGap,
+
+	// ci_secret is the write-once HMAC secret for that same webhook —
+	// returned only on create and on POST .../ci/regenerate, per its own spec
+	// description, never on GET/list. A real implementation would need the
+	// same carry-forward-from-create pattern apiKeyResourceModel already uses
+	// for its Key field. Same root cause as ci_webhook_url: without it a
+	// Terraform-created CI monitor cannot actually be wired up. Found
+	// 2026-08-09; not implemented here.
+	"resource.lastping_monitor.ci_secret":       ciSecretGap,
+	"data.lastping_monitor.ci_secret":           ciSecretGap,
+	"data.lastping_monitors.monitors.ci_secret": ciSecretGap,
+
+	// next_probe_at is the probe-monitor equivalent of due_at — "when is the
+	// next scheduled event" — and due_at IS modelled for heartbeat/cron
+	// monitors. The asymmetry (schedule visibility for one monitor_type but
+	// not the other) reads as an oversight, not an intended difference. Found
+	// 2026-08-09; not implemented here.
+	"resource.lastping_monitor.next_probe_at":       nextProbeAtGap,
+	"data.lastping_monitor.next_probe_at":           nextProbeAtGap,
+	"data.lastping_monitors.monitors.next_probe_at": nextProbeAtGap,
+}
+
+const (
+	ciWebhookGap = "real gap: the webhook URL a CI-bound check's pipeline should POST to is never " +
+		"surfaced, though ci_provider/ci_workflow/ci_branch (what to configure) are all modelled. " +
+		"Found 2026-08-09; needs its own attribute, docs and tests."
+	ciSecretGap = "real gap: the write-once HMAC secret for a CI-bound check's webhook (create/" +
+		"regenerate only, per its spec description) is never surfaced, so a Terraform-created CI " +
+		"monitor cannot be wired up end to end. Found 2026-08-09; needs the same carry-forward " +
+		"pattern apiKeyResourceModel uses for Key."
+	nextProbeAtGap = "real gap: the probe-monitor equivalent of due_at (already modelled) is not " +
+		"modelled, so schedule visibility is asymmetric between monitor_type=http and every other " +
+		"monitor_type. Found 2026-08-09."
+)
 
 // destinationConfigExempt is the reason every per-kind credential attribute on
 // lastping_destination has no spec property of its own. They are flattened by
@@ -597,6 +761,261 @@ func TestOpenAPIContract_KnownSpecGapsStillExist(t *testing.T) {
 				"knownSpecGaps entry.\nOriginal reason: %s", key, strings.Join(locator, "."), why)
 
 		t.Logf("KNOWN SPEC GAP still open: %s — %s", key, why)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Reverse coverage: does the provider model everything the spec declares?
+//
+// Scope: TestOpenAPIContract_SpecCoverage checks exactly the schemas
+// contractCases() already binds to an existing resource, ephemeral resource
+// or data source — the same request/response locators TestOpenAPIContract
+// uses, walked in the other direction. That set is deliberately the whole
+// boundary: contractCases() already enumerates the provider's entire public
+// surface (TestOpenAPIContract_EverySurfaceIsCovered fails if a registered
+// resource or data source has no case), so a schema that backs no case backs
+// nothing the provider could model in the first place. This file does not
+// walk the other ~150KB of components.schemas that have no Terraform surface
+// to compare against — there is nothing there for "the provider omits this"
+// to mean. A case with a skipReason (currently only data.lastping_metrics,
+// whose 200 body is Prometheus text with no JSON properties to walk) is
+// skipped here for the identical reason it is skipped in the forward test.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// TestOpenAPIContract_SpecCoverage is TestOpenAPIContract in reverse: for
+// every request/response property the spec declares on a schema an existing
+// case checks, some provider attribute must model it — unless the omission is
+// recorded, with a reason, in deliberatelyUnmodelled or knownModellingGaps.
+//
+// An unrecorded miss is exactly the failure mode this file exists to catch:
+// the API grew a field and nothing noticed. See the file-level comment for
+// why this is the more common direction of drift than the one
+// TestOpenAPIContract already guards.
+func TestOpenAPIContract_SpecCoverage(t *testing.T) {
+	t.Parallel()
+	doc := loadSpec(t)
+	surfaces := providerSurfaces(t)
+	cases := contractCases()
+
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			if c.request == nil && c.response == nil {
+				require.NotEmpty(t, c.skipReason, "%s checks nothing and gives no reason", name)
+				t.Skip(c.skipReason)
+			}
+
+			attrs := surfaces[name]
+			if c.request != nil {
+				assertSpecPropsModelled(t, name, propsAt(t, doc, c.request), attrs, c.request)
+			}
+			// A case's own top-level response is skipped when a nested case
+			// already points at the identical schema (data.lastping_monitors and
+			// data.lastping_incidents: response and nested["monitors"/"incidents"]
+			// both resolve to Check/Incident). There the top-level attrs are only
+			// the envelope — a filter argument plus the list field itself, always
+			// exempted in the forward direction — so walking the schema's
+			// properties against them a second time would flag every real
+			// property as "missing from the envelope", which the nested walk
+			// against the actual element attrs already checks correctly.
+			if c.response != nil && !responseSharedWithNested(c) {
+				assertSpecPropsModelled(t, name, propsAt(t, doc, c.response), attrs, c.response)
+			}
+			for attrName, nc := range c.nested {
+				info, ok := attrs[attrName]
+				require.True(t, ok, "%s: nested case for unknown attribute %q", name, attrName)
+				require.NotNil(t, info.nested, "%s.%s is not a nested attribute", name, attrName)
+				props := propsAt(t, doc, nc.response)
+				assertSpecPropsModelled(t, name+"."+attrName, props, info.nested, nc.response)
+			}
+		})
+	}
+}
+
+// assertSpecPropsModelled is the reverse-direction check: every spec
+// property must correspond to a provider attribute of the same name, unless
+// it is recorded as a deliberate decision or a known, temporary gap.
+func assertSpecPropsModelled(
+	t *testing.T,
+	caseName string,
+	props map[string]bool,
+	attrs map[string]attrInfo,
+	locator []string,
+) {
+	t.Helper()
+
+	for _, prop := range sortedKeys(props) {
+		if _, ok := attrs[prop]; ok {
+			continue
+		}
+		if why, ok := deliberatelyUnmodelled[caseName+"."+prop]; ok {
+			require.NotEmpty(t, why, "%s.%s is in deliberatelyUnmodelled with no reason given", caseName, prop)
+			continue
+		}
+		if why, ok := knownModellingGaps[caseName+"."+prop]; ok {
+			require.NotEmpty(t, why, "%s.%s is in knownModellingGaps with no reason given", caseName, prop)
+			continue
+		}
+
+		t.Errorf("the OpenAPI spec's %s declares %q, but no %s attribute models it.\n"+
+			"Provider attributes: %s\n\n"+
+			"If this should be a Terraform attribute, that is a real gap: report it and add it to "+
+			"knownModellingGaps with a reason, but do not implement it as part of a change whose job "+
+			"is only to detect drift. If it deliberately should never be a Terraform attribute, add "+
+			"%q to deliberatelyUnmodelled with a comment saying why.",
+			strings.Join(locator, "."), prop, caseName, strings.Join(sortedAttrNames(attrs), ", "), prop)
+	}
+}
+
+// sortedAttrNames lists a provider attribute set's names, for error messages.
+func sortedAttrNames(attrs map[string]attrInfo) []string {
+	out := make([]string, 0, len(attrs))
+	for name := range attrs {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// responseSharedWithNested reports whether c's own top-level response resolves
+// to the identical schema as one of its nested cases — see the comment where
+// this is called in TestOpenAPIContract_SpecCoverage.
+func responseSharedWithNested(c contractCase) bool {
+	for _, nc := range c.nested {
+		if locatorEqual(c.response, nc.response) {
+			return true
+		}
+	}
+	return false
+}
+
+func locatorEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// contractCaseLocators returns every top-level schema location a case checks
+// (request and/or response, in that order). Unlike TestOpenAPIContract_
+// KnownSpecGapsStillExist's single c.response, a deliberatelyUnmodelled or
+// knownModellingGaps entry can legitimately name a request-only property
+// (ChannelCreate's config, say), so the stale-entry checks below cannot
+// assume the response schema is the right — or only — place to look.
+func contractCaseLocators(c contractCase) [][]string {
+	var out [][]string
+	if c.request != nil {
+		out = append(out, c.request)
+	}
+	if c.response != nil {
+		out = append(out, c.response)
+	}
+	return out
+}
+
+// resolveReverseGapKey splits a deliberatelyUnmodelled/knownModellingGaps key
+// into the attribute set to check it against and the schema locations that
+// might still declare it, following the same case-name-then-optional-nested-
+// attribute shape splitGapKey and TestOpenAPIContract_KnownSpecGapsStillExist
+// use for knownSpecGaps.
+func resolveReverseGapKey(
+	t *testing.T,
+	key string,
+	cases map[string]contractCase,
+	surfaces map[string]map[string]attrInfo,
+) (attrs map[string]attrInfo, locators [][]string, propName string) {
+	t.Helper()
+
+	caseName, propPath, ok := splitGapKey(key, cases)
+	require.True(t, ok, "key %q does not name a known contract case", key)
+
+	c := cases[caseName]
+	attrs = surfaces[caseName]
+	locators = contractCaseLocators(c)
+	propName = propPath
+
+	if idx := strings.Index(propPath, "."); idx >= 0 {
+		parent, child := propPath[:idx], propPath[idx+1:]
+		nc, ok := c.nested[parent]
+		require.True(t, ok, "key %q: %s has no nested case %q", key, caseName, parent)
+		attrs = attrs[parent].nested
+		locators = nil
+		if nc.response != nil {
+			locators = [][]string{nc.response}
+		}
+		propName = child
+	}
+	return attrs, locators, propName
+}
+
+// TestOpenAPIContract_DeliberatelyUnmodelledStaysValid keeps
+// deliberatelyUnmodelled honest: every entry must name a property the
+// provider still does not model, that still exists in the spec. A property
+// the provider has since grown means the decision is moot; a property that
+// has vanished from the spec means the decision no longer applies to
+// anything. Either way the entry is stale and must be deleted, rather than
+// left behind to silently cover for something else later.
+func TestOpenAPIContract_DeliberatelyUnmodelledStaysValid(t *testing.T) {
+	t.Parallel()
+	doc := loadSpec(t)
+	surfaces := providerSurfaces(t)
+	cases := contractCases()
+
+	for key, why := range deliberatelyUnmodelled {
+		require.NotEmpty(t, why, "deliberatelyUnmodelled key %q has no reason", key)
+		attrs, locators, prop := resolveReverseGapKey(t, key, cases, surfaces)
+
+		require.NotContains(t, attrs, prop,
+			"deliberatelyUnmodelled key %q names %q, which the provider now models — the decision is "+
+				"moot, so delete this entry.\nOriginal reason: %s", key, prop, why)
+
+		found := false
+		for _, loc := range locators {
+			if propsAt(t, doc, loc)[prop] {
+				found = true
+				break
+			}
+		}
+		require.True(t, found, "deliberatelyUnmodelled key %q: %q is no longer present in any schema "+
+			"this case checks — delete this entry.\nOriginal reason: %s", key, prop, why)
+	}
+}
+
+// TestOpenAPIContract_KnownModellingGapsStillExist is knownModellingGaps'
+// mirror of TestOpenAPIContract_KnownSpecGapsStillExist: every entry must
+// still name a real, still-missing gap, so a gap that gets filled fails
+// loudly here instead of leaving a stale entry that quietly hides whatever
+// happens to collide with its name next.
+func TestOpenAPIContract_KnownModellingGapsStillExist(t *testing.T) {
+	t.Parallel()
+	doc := loadSpec(t)
+	surfaces := providerSurfaces(t)
+	cases := contractCases()
+
+	for key, why := range knownModellingGaps {
+		require.NotEmpty(t, why, "knownModellingGaps key %q has no reason", key)
+		attrs, locators, prop := resolveReverseGapKey(t, key, cases, surfaces)
+
+		require.NotContains(t, attrs, prop,
+			"knownModellingGaps key %q names %q, which the provider now models — the gap is closed, "+
+				"so delete this entry.\nOriginal reason: %s", key, prop, why)
+
+		found := false
+		for _, loc := range locators {
+			if propsAt(t, doc, loc)[prop] {
+				found = true
+				break
+			}
+		}
+		require.True(t, found, "knownModellingGaps key %q: %q is no longer present in any schema this "+
+			"case checks — the gap is gone (or the spec regressed); either way, delete this entry.\n"+
+			"Original reason: %s", key, prop, why)
+
+		t.Logf("KNOWN MODELLING GAP still open: %s — %s", key, why)
 	}
 }
 
