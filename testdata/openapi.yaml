@@ -416,6 +416,51 @@ components:
             that does not exist can never conjure one into being. Create the
             agent first with `POST /api/v1/agents`.
           example: "nightly-etl-bot"
+        source_kind:
+          type: string
+          maxLength: 64
+          pattern: '^[a-z0-9]+(-[a-z0-9]+)*$'
+          description: |
+            **Discovery source identity, part 1 of 2.** The scanner that found
+            this thing: `crontab`, `github-actions`, `k8s-cronjob`,
+            `systemd-timer`. Lowercase, dash-separated — it is compared
+            byte-for-byte, so `GitHub Actions` and `github-actions` would be
+            two different identities for one scanner.
+
+            Together with `source_ref` and the project, this is the
+            **reconcile key** that makes a discovery scan safe to re-run: the
+            second run diffs against what already exists instead of creating
+            every monitor a second time.
+
+            Omit both fields for a hand-made monitor. Monitors with no source
+            are never reconciled, so discovery can never adopt, modify or
+            delete something a human created.
+          example: "github-actions"
+        source_ref:
+          type: string
+          maxLength: 512
+          description: |
+            **Discovery source identity, part 2 of 2.** A stable path within
+            `source_kind` — `.github/workflows/nightly.yml#build`,
+            `/etc/cron.d/backup#0 3 * * *`. Must be valid UTF-8 with no control
+            characters.
+
+            **Must be sent together with `source_kind`** — exactly one of the
+            two is rejected with 400 (`SOURCE_INCOMPLETE`). Half an identity
+            reconciles against nothing.
+
+            **A pair this project already monitors is rejected with 409
+            (`SOURCE_ALREADY_MONITORED`).** That rejection is the feature: it
+            is what stops a re-run of discovery from duplicating every
+            monitor.
+
+            **On a slug upsert these two fields are read-only.** `POST
+            /api/v1/checks` with a `slug` that already exists never rewrites a
+            monitor's source — that would let a slug collision silently adopt a
+            hand-made monitor into discovery — and returns 409
+            (`SOURCE_IMMUTABLE_ON_UPSERT`) if the body offers a different pair.
+            Change a source deliberately with `PATCH /api/v1/checks/{id}`.
+          example: ".github/workflows/nightly.yml#build"
 
     CheckPatch:
       type: object
@@ -434,12 +479,19 @@ components:
           `runaway_ceiling`, `max_runtime_s`, `step_timeout_s`,
           `blocked_timeout_s`, `expect_every_s`, `notify_min_run_s`,
           `monitor_from`, `ci_workflow`, `ci_branch`,
-          `tags` and `agent_id`; those are the eleven properties typed to
-          allow `null` below. For `agent_id`, explicit `null` detaches the monitor
+          `tags`, `agent_id`, `source_kind` and `source_ref`; those are the
+          thirteen properties typed to
+          allow `null` below. `ci_workflow`, `ci_branch`, `source_kind` and
+          `source_ref` treat an explicit empty string `""` as **omission**, not
+          as a clear — see the operation description for `PATCH
+          /api/v1/checks/{id}`. For `agent_id`, explicit `null` detaches the monitor
           from its agent — it does not delete the agent or the monitor. For
           `blocked_timeout_s`, explicit `null` does NOT mean "wait forever" —
           it restores the fallback to `check.DefaultBlockedTimeout` (24h),
-          same as omitting the field entirely.
+          same as omitting the field entirely. `source_kind` and `source_ref`
+          are cleared as a PAIR — nulling one alone is a 400
+          (`SOURCE_INCOMPLETE`), because half a discovery identity reconciles
+          against nothing.
         - **Any other value** — replaces the stored value.
 
         `slug`, `monitor_type`, `ci_provider` and `ci_secret` are immutable on
@@ -707,6 +759,53 @@ components:
             **An unknown or foreign agent reference is rejected with 400
             (`UNKNOWN_AGENT`)** and never implicitly creates the agent.
           example: "nightly-etl-bot"
+        source_kind:
+          type: [string, "null"]
+          maxLength: 64
+          pattern: '^[a-z0-9]+(-[a-z0-9]+)*$'
+          description: |
+            The scanner that discovered this monitor. Omitting the field —
+            **or sending an explicit empty string `""`** — leaves the stored
+            value alone; only an explicit `null` clears it, and only together
+            with `source_ref`.
+
+            The `""`-preserves rule matches `ci_workflow`/`ci_branch` and
+            exists for the same full-body clients, with a sharper consequence:
+            every other clearable field here is a *setting*, but this pair is
+            an *identity*. A source cleared by accident is a monitor the next
+            discovery scan no longer recognises, so the scan reports the source
+            as unmonitored and creates a **second** monitor for it — the exact
+            duplicate the reconcile key exists to prevent.
+
+            **PATCH is the only surface that can change a monitor's source
+            after create.** That is deliberate: a slug upsert body cannot tell
+            "omitted" from "clear", so allowing it to write here would let a
+            slug collision silently adopt a hand-made monitor into discovery.
+            A PATCH names a specific monitor and a specific field, which makes
+            adoption an explicit act — and is exactly what Terraform's
+            import-then-apply flow performs.
+          example: "github-actions"
+        source_ref:
+          type: [string, "null"]
+          maxLength: 512
+          description: |
+            The stable path within `source_kind`. Same merge-patch rules as
+            `source_kind` above.
+
+            **The two are resolved as a pair.** Whatever the request and the
+            stored row combine to, the result must be either both set or both
+            empty — `{"source_ref": null}` alone is rejected with 400
+            (`SOURCE_INCOMPLETE`), not applied as a half-cleared identity.
+            **Clearing therefore takes an explicit `null` on both keys.**
+
+            A pair another monitor in this project already claims is rejected
+            with 409 (`SOURCE_ALREADY_MONITORED`): two monitors reconciling to
+            one source would make every later discovery run ambiguous.
+
+            A PATCH that mentions neither key issues no source write at all, so
+            a discovered monitor cannot lose its identity to an unrelated edit
+            such as a rename.
+          example: ".github/workflows/nightly.yml#build"
 
     Check:
       type: object
@@ -945,6 +1044,206 @@ components:
             was deleted: `DELETE /api/v1/agents/{id}` unowns the monitors it
             owned, it does not delete them.
           example: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+        source_kind:
+          type: string
+          description: |
+            The scanner that discovered this monitor (`crontab`,
+            `github-actions`, `k8s-cronjob`, `systemd-timer`). **Omitted when
+            a human created the monitor**, which is the state of every monitor
+            that predates discovery — and such a monitor is never reconciled,
+            so a scan can neither adopt nor delete it.
+          example: "github-actions"
+        source_ref:
+          type: string
+          description: |
+            The stable path within `source_kind` that identifies exactly what
+            was found. Together with `source_kind` and the project it is the
+            discovery reconcile key.
+
+            `source_kind` and `source_ref` are always either both present or
+            both omitted: a database CHECK constraint makes a half-set
+            identity unrepresentable.
+          example: ".github/workflows/nightly.yml#build"
+
+    DiscoverySource:
+      type: object
+      description: |
+        One thing a scanner found and believes should be monitored.
+
+        All scanning happens agent-side — LastPing never reads a customer
+        repository — so every field here is what a scanner reported, not
+        something the service went and looked up.
+      required: [source_kind, source_ref]
+      properties:
+        source_kind:
+          type: string
+          description: |
+            The scanner that found this, as a lowercase machine identifier:
+            `crontab`, `github-actions`, `k8s-cronjob`, `systemd-timer`.
+
+            Required. Together with `source_ref` it is the key reconcile
+            diffs against, and it is compared byte-for-byte — a kind that
+            changes shape between scanner releases makes every monitor look
+            new, and the next run duplicates the whole fleet.
+          example: "github-actions"
+        source_ref:
+          type: string
+          maxLength: 512
+          description: |
+            The stable path within `source_kind` that identifies exactly what
+            was found. Required, and **stable** is the operative word: it must
+            name the same thing on the next scan, or reconcile cannot match it
+            to the monitor it already created.
+          example: ".github/workflows/nightly.yml#build"
+        name:
+          type: string
+          maxLength: 200
+          description: |
+            Display name for a monitor created from this source. Defaults to
+            `source_ref` when omitted, and truncated to 200 **characters**
+            (not bytes, so multi-byte names are never cut mid-character).
+
+            Must be valid UTF-8 and free of control characters — a newline
+            picked up from a crontab comment is rejected with 400
+            (`INVALID_NAME`) rather than stored.
+
+            Ignored for a source that is already monitored: reconcile never
+            modifies an existing monitor, including its name.
+          example: "nightly build"
+        schedule_cron:
+          type: string
+          description: |
+            The 5-field cron expression this job actually runs on, read out of
+            the source (a crontab line, a workflow `schedule:` block, a
+            CronJob spec). Evaluated in `tz`.
+
+            When present the monitor is created as a `cron` monitor, so
+            LastPing arms a deadline from the same expression the job runs on,
+            and `expect_every_s` is seeded from the interval between fire
+            times (see the reconcile endpoint).
+
+            When absent the monitor is created `on_demand`: a workflow that
+            triggers on push has no cadence to be late against.
+          example: "0 3 * * *"
+        tz:
+          type: string
+          description: |
+            The IANA timezone `schedule_cron` fires in.
+
+            Deliberately declares NO `default`, even though the server defaults
+            it to `UTC` outside the required case. A generated client
+            materializes schema defaults, so declaring one here would fill
+            `"UTC"` into every crontab source automatically — satisfying the
+            conditional requirement below with exactly the reflexive answer it
+            exists to prevent, and producing a monitor whose deadline is armed
+            against the wrong wall clock on any host that is not UTC. That is
+            the one failure this endpoint cannot detect from the server side:
+            a stated `"UTC"` from an informed scanner and a stated `"UTC"` from
+            a client filling in a default are indistinguishable on the wire.
+
+            **Required when `source_kind` is `crontab` or `systemd-timer` and
+            `schedule_cron` is present** — omitting it is a 400
+            (`TIMEZONE_REQUIRED`), not a defaulted UTC. Those two scanners fire
+            in host-local time, and assuming UTC is a false incident every
+            single day rather than a cosmetic slip: a host at UTC+4 running
+            `0 3 * * *` pings at 23:00 UTC while a monitor storing `tz: UTC`
+            computes its deadline as 03:00 UTC plus grace, roughly twenty hours
+            before the job is next due. The derived silence floor is looser than
+            the cron deadline, so it does not mask it either.
+
+            The requirement is that the zone be **stated**, never that it differ
+            from UTC: a host genuinely set to UTC sends `"UTC"` and is accepted.
+
+            Optional everywhere else, defaulting to `UTC`. That default is
+            correct for `github-actions` and `k8s-cronjob` — both evaluate cron
+            in UTC — and a source with no `schedule_cron` becomes an `on_demand`
+            monitor, where the zone is inert.
+
+            Validated even for a source with no `schedule_cron`, so a bad zone
+            is a 400 (`INVALID_TIMEZONE`) now rather than a 500 the first time
+            somebody PATCHes a schedule onto the monitor.
+          example: "Europe/Berlin"
+        suggested_expect_every_s:
+          type: integer
+          format: int64
+          minimum: 60
+          maximum: 31536000
+          description: |
+            An explicit silence floor for a monitor created from this source,
+            in seconds. Takes precedence over the value derived from
+            `schedule_cron` — an explicit statement beats an inference — and is
+            the only way to give a floor to a source with no cron at all.
+          example: 90000
+
+    ReconcileRequest:
+      type: object
+      description: |
+        Everything one scan found. The list is complete by definition: any
+        monitor in this project carrying a source identity that is NOT in this
+        list is reported back as orphaned.
+      required: [sources]
+      properties:
+        sources:
+          type: array
+          maxItems: 1000
+          description: |
+            The sources this scan found. Required — an omitted `sources` key is
+            a 400 (`MISSING_SOURCES`), because it is far more likely to be a
+            misspelled field than a genuine claim that the whole fleet is
+            gone.
+
+            An explicit empty array **is** such a claim and is accepted: it
+            reports every discovered monitor as orphaned. Nothing is deleted
+            either way.
+          items:
+            $ref: "#/components/schemas/DiscoverySource"
+
+    ReconcileResult:
+      type: object
+      description: |
+        The diff between what a scan found and what this project already
+        monitors. All three arrays are always present and never null,
+        including when empty.
+      required: [created, existing, orphaned]
+      properties:
+        created:
+          type: array
+          description: |
+            Monitors that did not exist before this call and do now. Empty on
+            every run after the first, which is the steady state this endpoint
+            is designed around.
+          items:
+            $ref: "#/components/schemas/Check"
+        existing:
+          type: array
+          description: |
+            Sources that were already monitored, returned exactly as stored.
+
+            These rows were not written to at all. Reconcile does not refresh
+            a name, a schedule or a threshold from the payload: a user who
+            hand-tuned `expect_every_s` and watched a scan silently revert it
+            would stop letting the scan run unattended, and a scan nobody runs
+            unattended cannot detect drift.
+          items:
+            $ref: "#/components/schemas/Check"
+        orphaned:
+          type: array
+          description: |
+            Monitors carrying a source identity that this scan did **not**
+            report — the drift signal, and the reason this endpoint exists.
+
+            They are left completely alone. Nothing here is deleted, paused or
+            modified: a scanner bug, a moved file, a shallow clone or a
+            checkout of the wrong branch would otherwise tear down production
+            monitoring, which would make the endpoint unsafe to run on a
+            schedule. Treat this list as a question for a human, never as an
+            action already taken.
+
+            Monitors created by hand never appear here. They carry no source,
+            were never discovered, and are invisible to reconcile in both
+            directions.
+          items:
+            $ref: "#/components/schemas/Check"
 
     AgentCreate:
       type: object
@@ -1071,6 +1370,318 @@ components:
           format: date-time
           description: RFC 3339 UTC timestamp when the agent was created.
           example: "2026-07-01T12:00:00Z"
+
+    OpenIncident:
+      type: object
+      description: |
+        One entry in an agent's failure inbox
+        (`GET /api/v1/agents/{id}/open-incidents`).
+
+        `exit_code`, `failed_step`, `failure_signature`, `duration_vs_normal`
+        and `ci` are each **omitted entirely** when unknown — they are never
+        emitted as null or as a zero value. Absence means "LastPing does not
+        know this", which an agent can act on; a fabricated zero cannot be told
+        apart from a real one. That distinction is sharpest on `exit_code`,
+        where `0` is itself a meaningful status: see its description.
+      required: [incident_id, check_id, check_slug, check_name, cause, opened_at]
+      properties:
+        incident_id:
+          type: integer
+          format: int64
+          description: Identifies this incident. Stable for its lifetime.
+          example: 4821
+        check_id:
+          type: string
+          format: uuid
+          description: The monitor this incident is about.
+          example: "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+        check_slug:
+          type: string
+          example: "nightly-etl"
+        check_name:
+          type: string
+          example: "Nightly ETL"
+        cause:
+          type: string
+          enum: [silence, fail, overrun, never_started, runaway, stalled, blocked, assertion]
+          description: |
+            Why the incident opened. These need different responses, which is
+            the reason this field leads the payload:
+
+            - `fail` — the job ran and explicitly reported failure.
+            - `assertion` — the job reported success, but its output violated
+              criteria the agent itself declared at the start of that run.
+            - `silence` — nothing was reported within the expected window.
+              Suspect the scheduler or the host before the job.
+            - `never_started` — the monitor has never reported at all; the
+              wiring is probably wrong.
+            - `overrun` — the run exceeded its maximum runtime.
+            - `stalled` — the run is alive but has reported no step progress.
+              `failed_step` is the diagnosis here.
+            - `runaway` — the monitor exceeded a ping-rate ceiling or a metric
+              guard.
+            - `blocked` — a run is waiting on a human.
+          example: "fail"
+        opened_at:
+          type: string
+          format: date-time
+          description: RFC 3339 UTC timestamp when the incident opened.
+          example: "2026-08-21T03:14:07Z"
+        detail:
+          type: string
+          description: |
+            Why it opened, when the opener knew more than the cause code can
+            say — which assertion rejected the output, which metric guard
+            tripped, or a CI job's own failure detail. Omitted when empty.
+          example: "assertion contains(\"rows_written\") failed"
+        run_id:
+          type: string
+          description: |
+            The `rid` of the run this incident is about, so the agent can line
+            it up against its own logs. Recorded when the incident opens, which
+            is the only moment it can be: the transition that opens an incident
+            also clears the monitor's in-flight run, so the identity does not
+            survive anywhere else.
+
+            Omitted when there was no run to name — a `never_started` incident,
+            or a monitor that reported without ever opening a run.
+          example: "2026-08-21T03-00-00Z-a91f"
+        body_excerpt:
+          type: string
+          description: |
+            The failure output the run reported: the body of the ping that
+            opened the incident, or — for an incident the detector opened,
+            where no ping coincides with `opened_at` — the latest `fail`
+            reported while the incident has been open.
+
+            That second case matters more than it looks. Incidents open only on
+            the transition into down, so a cron that runs late and then fails
+            keeps its original `silence` incident: without the fallback the
+            agent would be told "silence" while the error text sat unread.
+
+            Omitted only when nothing was reported at all, which for
+            `never_started` and an ongoing `silence` is the incident itself.
+          example: "psycopg2.OperationalError: could not connect to server"
+        exit_code:
+          type: integer
+          format: int32
+          minimum: -32768
+          maximum: 32767
+          description: |
+            The status the run exited with, as sent through the numeric ping
+            form `POST /ping/{check_id}/{code}`. Read from the **same ping**
+            `body_excerpt` comes from, so the output and the status always
+            describe one run.
+
+            **Omitted means no exit code was reported. It never means
+            "exited cleanly".** A job reports a status only through the numeric
+            form; the word forms (`/fail`, `/start`, …) carry none, an incident
+            the detector opened has no ping at all, and pings recorded before
+            this field existed did not keep the number and cannot be
+            backfilled. A clean exit is the **present** value `0` — which does
+            occur on an incident, since an `assertion` incident opens on a run
+            that reported success and then failed the criteria the agent
+            declared for it.
+
+            Two conventions are worth decoding, and are what the console shows
+            in words beside the number:
+
+            - **128 + n is death by signal** — `137` is SIGKILL (most often the
+              OOM killer or a container runtime), `143` is SIGTERM (a shutdown
+              the job did not survive), `139` is SIGSEGV.
+            - **`124` is a `timeout(1)` kill** — the status GNU `timeout` uses
+              when it kills the command it wrapped.
+
+            Everything else is **application-defined**: `1`, `2` and the rest
+            mean whatever the program that exited chose them to mean, and
+            LastPing does not guess.
+          example: 137
+        failed_step:
+          type: object
+          description: |
+            The last step the run reported before it stopped progressing —
+            where it died. Omitted when the run reported no steps.
+          properties:
+            name:
+              type: string
+              example: "load-warehouse"
+            seq:
+              type: integer
+              format: int32
+              description: Position in the run's step timeline, starting at 1.
+              example: 4
+            at:
+              type: string
+              format: date-time
+              example: "2026-08-21T03:12:44Z"
+        failure_signature:
+          type: object
+          description: |
+            **New problem, or the fortieth repeat.** The recurrence record for
+            this exact failure, matched by fingerprinting the failure body
+            through the same normalisation the writer used — timestamps,
+            UUIDs, IPs, absolute paths, hex runs and integers are replaced by
+            placeholders, so the same underlying failure matches across runs
+            even though its text differs every time.
+
+            Omitted when the incident has no failure body, or when this body
+            has no recorded history yet.
+          properties:
+            fingerprint:
+              type: string
+              description: |
+                16 hex characters. Exposed so an agent can correlate two
+                incidents as "the same failure" itself, across monitors and
+                across polls.
+              example: "9f2c1ab30de54771"
+            occurrences:
+              type: integer
+              format: int64
+              description: |
+                How many times this exact failure has been recorded on this
+                monitor — every occurrence, not only the ones that opened an
+                incident, so a job that fails repeatedly while already down
+                still accrues history.
+              example: 40
+            first_seen:
+              type: string
+              format: date-time
+              description: |
+                When this failure was first recorded. Survives ping retention:
+                the signature history is deliberately never pruned, so this can
+                predate the oldest ping still stored.
+              example: "2026-06-02T03:11:58Z"
+            last_seen:
+              type: string
+              format: date-time
+              example: "2026-08-21T03:14:07Z"
+        duration_vs_normal:
+          type: object
+          description: |
+            Was this run unusually slow — the only form of the duration
+            question worth asking. Omitted when the run's duration is unknown,
+            or when there is no archived baseline to compare against (a
+            brand-new monitor has neither).
+
+            `run_ms` is the run's measured duration when it completed;
+            otherwise — for a `fail`, and for every run that never finished,
+            which is every `overrun` and `stalled` — it is how long the run had
+            been going when the incident opened. That figure is fixed at the
+            moment of judgement, so polling the same open incident twice always
+            reports the same number.
+          properties:
+            run_ms:
+              type: integer
+              format: int64
+              example: 2400000
+            typical_ms:
+              type: integer
+              format: int64
+              description: |
+                What a normal run costs. Named `typical_ms`, not `p50_ms`, on
+                purpose: it is a median of the archived daily medians, since
+                percentiles do not recombine. Calling it a p50 would claim a
+                precision the daily summaries cannot deliver.
+              example: 288000
+            ratio:
+              type: number
+              format: double
+              description: "`run_ms / typical_ms`. This is the diagnosis."
+              example: 8.33
+            days_sampled:
+              type: integer
+              format: int64
+              description: |
+                How many archived days the baseline was computed from, so a
+                thirty-day norm can be told from a two-day one instead of both
+                reading as settled.
+              example: 30
+            summary:
+              type: string
+              description: The comparison as one sentence.
+              example: "8.3x the typical run (40m0s vs 4m48s), from 30 archived days"
+        ci:
+          type: object
+          description: |
+            Provider-side context for a CI failure, decoded from the failing
+            run's CI metadata. Omitted entirely for non-CI monitors.
+            `run_url` is the valuable one: it is where the agent goes for the
+            full log when `body_excerpt` is not enough.
+          properties:
+            run_url:
+              type: string
+              example: "https://github.com/acme/etl/actions/runs/1234567890"
+            failing_stage:
+              type: string
+              example: "integration-tests"
+            outcome:
+              type: string
+              example: "failure"
+            branch:
+              type: string
+              example: "main"
+            commit_sha:
+              type: string
+              example: "9f2c1ab30de547714a0f2c1ab30de547714a0f2c"
+
+    IncidentNoteCreate:
+      type: object
+      description: |
+        Body for `POST /api/v1/incidents/{id}/notes`.
+
+        One field, deliberately. There is no `author` — see the endpoint's own
+        description — and no timestamp: the server stamps the note, so its
+        position in the incident's log cannot be back-dated by its writer.
+      required: [body]
+      properties:
+        body:
+          type: string
+          maxLength: 8192
+          description: |
+            What you found out, in two or three sentences: what you saw, what
+            you tried, and where you stopped. Not a log dump — the failing
+            run's own output is already stored and already shown beside your
+            note.
+
+            Must not be empty or whitespace-only (400). Bodies over 8192 bytes
+            are **rejected, not truncated** (400): a truncated diagnosis reads
+            as a complete one that trails off, and the reader has no way to
+            tell that the sentence naming the cause was the one cut.
+          example: "Upstream billing API returned 503 on all three retries; same failure as the last two nights. I stopped rather than risk re-charging anyone."
+
+    IncidentNote:
+      type: object
+      description: |
+        One note on an incident: what an agent learned about a failure, in its
+        own words. Returned by `POST /api/v1/incidents/{id}/notes` and rendered
+        on the incident page in the dashboard.
+      required: [id, incident_id, author, body, created_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 917
+        incident_id:
+          type: integer
+          format: int64
+          description: The incident this note is about.
+          example: 4821
+        author:
+          type: string
+          enum: [agent, user]
+          description: |
+            Who wrote it. Decided by the surface the note arrived on, never by
+            the caller — every note written through this API is `agent`.
+            `user` is reserved for notes written by a person in the dashboard.
+          example: "agent"
+        body:
+          type: string
+          example: "Upstream billing API returned 503 on all three retries; same failure as the last two nights. I stopped rather than risk re-charging anyone."
+        created_at:
+          type: string
+          format: date-time
+          description: RFC 3339 UTC timestamp, stamped by the server.
+          example: "2026-08-23T03:19:44Z"
 
     ChannelCreate:
       type: object
@@ -1473,6 +2084,26 @@ components:
             Run id this ping carried (`?rid=`), omitted when the ping carried
             none. It is the key `steps` are matched on.
           example: "9876543210"
+        title:
+          type: string
+          description: |
+            Title for this run: `pings.title`, a dedicated column on the
+            run's `/start` ping (migration `000044_ping_title`) — distinct
+            from `body_excerpt`, which is a separate column. Matched on `rid`
+            the same way `steps` is — both pings of a run (its start and its
+            terminal ping) carry it. Set by whichever call reaches it FIRST
+            with a non-empty title: the body of the run's own `/start` call,
+            or a later `POST .../title?rid=<run-id>` sent any time while the
+            run is still open — same request shape as `/blocked` and `/note`,
+            but (unlike them) it writes no `pings` row of its own: it only
+            ever updates `title` on the run's existing `/start` row, so it
+            never appears as a `kind` in the `Ping` schema. Only the first
+            non-empty write counts; neither a later `/start` body nor a
+            later `/title` call can change a title once one is set. Omitted
+            when nothing has set a title yet, which is the common case:
+            every existing monitor's runs are untitled until a caller starts
+            setting one.
+          example: "nightly backup"
         steps:
           type: array
           description: |
@@ -1869,6 +2500,146 @@ components:
           items:
             $ref: "#/components/schemas/Assertion"
 
+    PingInstructions:
+      type: object
+      description: >-
+        Everything needed to make a monitor actually report: the ping URL,
+        copy-paste check-in snippets, and the three MECHANISMS for reporting,
+        returned together. This is the exact payload the MCP
+        `get_ping_instructions` tool returns — both surfaces are rendered from
+        the same source (internal/pinginstructions), so they can never
+        describe the reporting protocol differently.
+
+        `reporting_options` explains how to choose between `how_to`
+        (the universal manual protocol — works in any agent, any language,
+        any tool, with no prerequisite), `hook_install` (an optional
+        shortcut, Claude Code specific), and `run_wrapper` (wraps a launched
+        command — cron, CI, a script — so a separate process reports for
+        you). Read it before defaulting to the raw curl list.
+      required:
+        - monitor_id
+        - monitor_name
+        - ping_url
+        - success_url
+        - start_url
+        - fail_url
+        - step_url
+        - curl_success
+        - curl_start
+        - curl_fail
+        - curl_step
+        - cron_example
+        - run_example
+        - step_timeout_s
+        - reporting_options
+        - run_wrapper
+        - hook_install
+        - how_to
+        - how_to_steps
+        - expectations_how_to
+        - failure_inbox_how_to
+        - discovery_how_to
+      properties:
+        monitor_id:
+          type: string
+          format: uuid
+        monitor_name:
+          type: string
+        ping_url:
+          type: string
+          description: The success-ping URL — a bare POST (or GET/HEAD) reports success.
+        success_url:
+          type: string
+          description: Identical to `ping_url`; present under both names for readability at each call site.
+        start_url:
+          type: string
+          description: "`{ping_url}/start` — send before long or possibly-hung runs, to enable overrun/never-finished detection."
+        fail_url:
+          type: string
+          description: "`{ping_url}/fail` — reports a failed run."
+        step_url:
+          type: string
+          description: >-
+            `{ping_url}/step?rid=<run-id>&step=<step-name>` — a liveness
+            marker inside an already-started run. `<run-id>` and
+            `<step-name>` are literal placeholders to fill in, not escaped
+            example values.
+        curl_success:
+          type: string
+        curl_start:
+          type: string
+        curl_fail:
+          type: string
+        curl_step:
+          type: string
+          description: A worked curl example carrying a literal `$RID` shell variable and a sample step label.
+        cron_example:
+          type: string
+          description: A one-liner pairing a job with its success ping, for a crontab entry.
+        run_example:
+          type: string
+          description: >-
+            The whole armed run in the order it happens — start, steps,
+            terminal ping — sharing one `$RID`, which the individual curl_*
+            fields cannot show on their own.
+        step_timeout_s:
+          type: integer
+          format: int64
+          nullable: true
+          description: >-
+            The monitor's stall budget, echoed back so the caller can see
+            whether the steps it is about to emit are actually watched. `null`
+            means stall detection is off (the default).
+        reporting_options:
+          type: string
+          description: The decision rule for choosing between `how_to`, `hook_install` and `run_wrapper`, keyed on what the monitored thing IS.
+        run_wrapper:
+          type: string
+          description: The `lastping run` command-wrapper snippet. Fits anything launched as a command; cannot send `blocked` or `note`.
+        hook_install:
+          type: string
+          description: The one-time Claude Code hook install. Claude Code specific; the only mechanism that can send every state this product models.
+        how_to:
+          type: string
+          description: The manual protocol prompt — the universal path, fitting any agent, any language, any tool.
+        how_to_steps:
+          type: string
+          description: Explains step reporting (`curl_step`) and whether stall detection is armed on this monitor.
+        expectations_how_to:
+          type: string
+          description: >-
+            How to commit, at the START of a run, to the criteria that run
+            will be judged by when it closes — before the outcome is
+            knowable. Immutable once declared; declaring nothing is allowed
+            and leaves the monitor's own assertions in force.
+        failure_inbox_how_to:
+          type: string
+          description: >-
+            The RETURN path: how to read what broke while this agent was not
+            running (`GET /api/v1/agents/{id}/open-incidents`) and how to
+            write the diagnosis back onto the incident a human reads
+            (`POST /api/v1/incidents/{id}/notes`). Every other field here is
+            about reporting outward; this is the only one that flows back.
+        discovery_how_to:
+          type: string
+          description: >-
+            How to find what ELSE ought to be monitored — crontab lines,
+            GitHub Actions schedules, Kubernetes CronJobs, systemd timers —
+            and reconcile the scan into monitors via
+            `POST /api/v1/discovery/reconcile`. Scanning is entirely
+            agent-side; LastPing never reads a repository or logs into a
+            host. Carries the three rules that make the scan safe: propose
+            what you found and get agreement before creating anything, READ
+            the host's timezone rather than assume one for `crontab` and
+            `systemd-timer` sources (they fire in local time), and the fact
+            that reconcile never deletes, pauses or edits anything — which is
+            what makes it safe to re-run as drift detection.
+
+            Project-scoped rather than check-scoped, and served here on
+            purpose: this is the endpoint an agent is already told to call
+            right after creating a monitor, which is the moment the question
+            "what else here is unwatched?" is both live and answerable.
+
     MetricGuard:
       type: object
       description: >-
@@ -2081,6 +2852,25 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+        "409":
+          description: |
+            A discovery source conflict. Two codes are returned here:
+
+            - `SOURCE_ALREADY_MONITORED` — this project already has a monitor
+              for the given `source_kind`/`source_ref`. This is the reconcile
+              key doing its job: it is what stops a second run of a discovery
+              scan from creating every monitor twice. Nothing is created.
+            - `SOURCE_IMMUTABLE_ON_UPSERT` — the request matched an existing
+              check by `slug` and offered a `source_kind`/`source_ref` pair
+              different from the one stored (including offering a pair for a
+              monitor that has none). A slug upsert never rewrites a monitor's
+              source, because that would let a slug collision silently adopt a
+              hand-made monitor into discovery. Nothing is updated. Use
+              `PATCH /api/v1/checks/{id}` to change a source deliberately.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
         "412":
           description: |
             `If-None-Match: *` was sent and a check with the given `slug`
@@ -2177,10 +2967,19 @@ paths:
 
         - **Omitted field** — the stored value is left unchanged.
         - **Explicit `null`** — clears the value. Supported on `runaway_ceiling`,
-          `max_runtime_s`, `step_timeout_s`, `expect_every_s`, `notify_min_run_s`,
-          `monitor_from`, `ci_workflow`, `ci_branch`, `tags`, and `agent_id` only; for `tags`, explicit `null`
-          is equivalent to sending `[]`; for `agent_id`, explicit `null`
-          detaches the monitor from its agent without deleting either of them.
+          `max_runtime_s`, `step_timeout_s`, `blocked_timeout_s`,
+          `expect_every_s`, `notify_min_run_s`,
+          `monitor_from`, `ci_workflow`, `ci_branch`, `tags`, `agent_id`,
+          `source_kind` and `source_ref` only — the same thirteen properties
+          typed to allow `null` in the `CheckPatch` schema; for `tags`, explicit
+          `null` is equivalent to sending `[]`; for `blocked_timeout_s`,
+          explicit `null` does not mean "wait forever" — it restores the 24h
+          `check.DefaultBlockedTimeout` fallback, same as omitting the field;
+          for `agent_id`, explicit `null`
+          detaches the monitor from its agent without deleting either of them;
+          for the source pair, `null` must be sent on **both** keys, since a
+          half-cleared discovery identity reconciles against nothing and is
+          rejected with 400 (`SOURCE_INCOMPLETE`).
           `failure_threshold` is NOT clearable (the column is `NOT NULL DEFAULT
           1`); a `null` there is treated as omission.
         - **Any other value** — replaces the stored value.
@@ -2193,12 +2992,15 @@ paths:
         all tags. `slug`, `monitor_type`, `ci_provider` and `ci_secret` are
         immutable and are ignored if present.
 
-        `ci_workflow` and `ci_branch` deliberately deviate from strict RFC 7396:
-        an explicit empty string `""` preserves the stored value, the same as
-        omitting the field. This protects full-body clients (e.g. Terraform)
-        that always send `""` for an unset filter from silently unbinding a
-        live CI filter. Explicit `null` is the documented way to clear either
-        field.
+        `ci_workflow`, `ci_branch`, `source_kind` and `source_ref` deliberately
+        deviate from strict RFC 7396: an explicit empty string `""` preserves
+        the stored value, the same as omitting the field. This protects
+        full-body clients (e.g. Terraform) that always send `""` for an unset
+        attribute from silently unbinding a live CI filter — or, for the source
+        pair, from destroying a monitor's discovery identity, after which the
+        next scan no longer recognises the source and creates a **second**
+        monitor for it. Explicit `null` is the documented way to clear any of
+        these fields.
 
         Sending a complete body remains valid and behaves as a full replace.
       tags: [Checks]
@@ -2240,6 +3042,17 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+        "409":
+          description: |
+            `SOURCE_ALREADY_MONITORED` — another monitor in this project
+            already claims the requested `source_kind`/`source_ref` identity.
+            Two monitors reconciling to one source would make every later
+            discovery run ambiguous, so the PATCH is refused and the monitor
+            is left completely unmodified.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
 
     delete:
       operationId: deleteCheck
@@ -2251,6 +3064,61 @@ paths:
       responses:
         "204":
           description: Check deleted.
+        "400":
+          description: id is not a valid UUID.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: Check not found in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/checks/{id}/ping-instructions:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: UUID of the check.
+        schema:
+          type: string
+          format: uuid
+        example: "550e8400-e29b-41d4-a716-446655440000"
+
+    get:
+      operationId: getPingInstructions
+      summary: Get ping instructions for a check
+      description: |
+        Returns everything needed to make this monitor actually report: the
+        ping URL, copy-paste check-in snippets, and the three reporting
+        mechanisms (`how_to`, `hook_install`, `run_wrapper`) together.
+
+        This is the exact payload the MCP `get_ping_instructions` tool
+        returns — call this endpoint right after creating a check to hand an
+        agent (or a human) everything it needs in one response, rather than
+        composing curl commands from `ping_url` by hand.
+
+        404 if the check does not exist in the authenticated project (no
+        existence oracle).
+      tags: [Checks]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: Ping instructions for this check.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PingInstructions"
         "400":
           description: id is not a valid UUID.
           content:
@@ -2533,7 +3401,7 @@ paths:
         `{schedule}`, `{incident_url}`, `{run_url}`, `{branch}`, `{commit}`,
         `{actor}`, `{failing_stage}`, `{duration}`, `{latency}`, `{status_code}`,
         `{url}`, `{last_step}`, `{step_count}`, `{run_duration}`, `{body}`,
-        `{detail}`.
+        `{detail}`, `{title}`.
         Unknown placeholders are **rejected** at write time. `{body}` is the
         triggering ping's free-text body (`body_excerpt`, see the `Ping`
         schema), truncated to 500 characters with a trailing "…" if longer
@@ -2567,6 +3435,20 @@ paths:
         report a number about a different run.  `{run_duration}` is the absolute
         elapsed time from the run's `/start`; a run that wedged before its first
         `/step` leaves `{last_step}` and `{step_count}` empty rather than `0`.
+
+        `{title}` is the title of the run the alert is about: whichever text
+        reached `pings.title` FIRST for that run's `rid` — the free-text body
+        posted with the run's `/start` ping, or a later
+        `POST .../title?rid=<run-id>` sent any time while the run was still
+        open (see the `CIRun` schema's `title` field). Populated for a `fail`
+        when the failing ping carried a `rid` whose run had a title set by
+        either path, and for `stalled`/`overrun` under the same
+        run-identification rule as `{last_step}` above. Renders empty for the
+        common case — a run with no title, which is every run for a monitor
+        that has not started setting one — and for every event type not
+        about one specific run (`down` with cause
+        `silence`/`never_started`/`runaway`, `recovery`, `every-run`,
+        `success`, `started`, `blocked`, `note`).
 
         Not every placeholder is populated for every provider. `{failing_stage}`
         in particular renders empty on Jenkins (its Notification Plugin payload
@@ -3046,6 +3928,149 @@ paths:
 
   # ── Channels ─────────────────────────────────────────────────────────────────
 
+  /api/v1/discovery/reconcile:
+    post:
+      operationId: reconcileDiscovery
+      summary: Reconcile a discovery scan into monitors
+      description: |
+        Takes everything one scan of a repo or a host found and reconciles it
+        against what this project already monitors: new sources become
+        monitors, already-monitored sources are reported untouched, and
+        monitors whose source has vanished are reported and never deleted.
+
+        **This is what makes discovery re-runnable.** A scan you can only run
+        once is a setup wizard. A scan that is safe to re-run — nightly, on
+        every CI build, on every deploy — is drift detection: *"you added a
+        scheduled workflow last week and nothing is watching it."* Point it at
+        the same repo every night and the answer converges.
+
+        The project comes from the API key, like every other endpoint here.
+        There is no project id in the path.
+
+        ### The three rules
+
+        - A source that is **new** becomes a monitor and is returned under
+          `created`.
+        - A source that is **already monitored** is returned under `existing`
+          and is **not modified** — not its name, not its schedule, not its
+          thresholds. Whatever a user tuned by hand survives every future
+          scan.
+        - A monitor whose source is **absent from the payload** is returned
+          under `orphaned` and is **never deleted**. Reporting it is the whole
+          point; deleting it would mean a scanner bug or a wrong branch could
+          tear down production monitoring.
+
+        Monitors created by hand carry no source identity. They are invisible
+        to reconcile in both directions: a scan can neither adopt one nor
+        report one as orphaned.
+
+        ### What a created monitor looks like
+
+        - `schedule_cron` present → a `cron` monitor on that expression, in
+          the source's `tz` (default `UTC`), so LastPing arms a deadline from
+          the same expression the job runs on. `tz` is **required** for
+          `crontab` and `systemd-timer` sources that carry a `schedule_cron`:
+          they fire in host-local time, and a UTC-assumed deadline on a host
+          that is not on UTC is a false incident every day. Sending `"UTC"`
+          explicitly satisfies it; omitting it is a 400.
+        - `schedule_cron` absent → an `on_demand` monitor. A push-triggered
+          workflow has no cadence to be late against.
+        - `expect_every_s` (the silence floor) is seeded from the **longest**
+          gap between consecutive fire times of `schedule_cron`, times two.
+          The longest gap, because cron intervals are routinely irregular —
+          `0 9 * * 1-5` alternates 24-hour gaps with a 72-hour one, and a
+          floor set from the short gap would page every weekend. An explicit
+          `suggested_expect_every_s` overrides it.
+        - `grace_s` is 300. A scanner has no way to know how late a job is
+          allowed to be; that is a judgement about the business, not about the
+          repository. PATCH it once and reconcile will never touch it again.
+        - No slug, and `monitor_from` is unset — so a freshly created monitor
+          is not armed until its first ping, rather than paging minutes after
+          every scan for jobs nobody has wired a ping into yet.
+
+        ### All or nothing
+
+        The write half runs in one transaction. Either every new monitor
+        exists or none does — a half-created fleet would leave the caller
+        unable to tell which half landed.
+      tags: [Discovery]
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReconcileRequest"
+            example:
+              sources:
+                - source_kind: "github-actions"
+                  source_ref: ".github/workflows/nightly.yml#build"
+                  name: "nightly build"
+                  schedule_cron: "0 3 * * *"
+                - source_kind: "crontab"
+                  source_ref: "/etc/cron.d/backup#0 4 * * *"
+                  name: "nightly backup"
+                  schedule_cron: "0 4 * * *"
+                  # Required for crontab/systemd-timer with a cron: the host
+                  # evaluates the expression in its own zone, not in UTC.
+                  tz: "Europe/Berlin"
+                - source_kind: "github-actions"
+                  source_ref: ".github/workflows/deploy.yml#deploy"
+                  name: "deploy on push"
+      responses:
+        "200":
+          description: |
+            The reconcile diff. 200 rather than 201 even when monitors were
+            created: the response is a report, and a run that creates nothing
+            is the success case, not an empty result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReconcileResult"
+        "400":
+          description: |
+            Invalid body. Codes: `MISSING_SOURCES` (the `sources` key was
+            omitted), `TOO_MANY_SOURCES`, `SOURCE_REQUIRED` (an entry with no
+            source identity — it could not be diffed, so it would be
+            re-created on every scan), `SOURCE_INCOMPLETE`,
+            `INVALID_SOURCE_KIND`, `INVALID_SOURCE_REF`, `DUPLICATE_SOURCE`
+            (one source named twice in one payload), `INVALID_NAME`,
+            `TIMEZONE_REQUIRED` (a `crontab` or `systemd-timer` entry with a
+            `schedule_cron` but no `tz` — those scanners fire in host-local
+            time, so a defaulted UTC would page falsely every day),
+            `INVALID_TIMEZONE`, `INVALID_CRON_EXPR`, `INVALID_EXPECT_EVERY`.
+            Nothing is written.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "403":
+          description: |
+            `MONITOR_CAP_REACHED` — the batch would take this project past its
+            monitor limit. Nothing was created; the cap is applied to the whole
+            batch rather than filling up to it and refusing the remainder.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "409":
+          description: |
+            `SOURCE_ALREADY_MONITORED` — another writer claimed one of these
+            source identities while the reconcile was running. Nothing was
+            created; run the same reconcile again and it converges (the source
+            is now reported under `existing`).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
   /api/v1/agents:
     post:
       operationId: createAgent
@@ -3255,6 +4280,197 @@ paths:
                 $ref: "#/components/schemas/Problem"
         "404":
           description: Agent not found in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/agents/{id}/open-incidents:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: UUID of the agent.
+        schema:
+          type: string
+          format: uuid
+        example: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+      - name: limit
+        in: query
+        required: false
+        description: |
+          Maximum incidents to return. Absent, non-numeric or ≤ 0 → `50`;
+          above `200` → `200`.
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 200
+          default: 50
+
+    get:
+      operationId: listAgentOpenIncidents
+      summary: List an agent's open incidents (the failure inbox)
+      description: |
+        Everything currently broken on the monitors this agent owns, newest
+        first, as a JSON array (never null). This is the **pull** half of
+        failure delivery: an agent polls it at the start of its next run and
+        learns what broke while it was not looking — no webhook, no inbox, no
+        chat integration to configure.
+
+        Only **open** incidents are returned. There is no `closed_at` field:
+        it would be null on every row this endpoint can emit.
+
+        The payload carries what an agent cannot work out from its own run:
+
+        - `cause` — `silence` and `fail` demand opposite responses. A `fail`
+          means the job ran and reported an error; a `silence` means it never
+          reported at all, which usually implicates the scheduler or the host
+          rather than the job.
+        - `body_excerpt` — the error text the failing run printed.
+        - `failed_step` — where it died. For a `stalled` incident this is the
+          whole diagnosis: the run is alive but has not moved past this step.
+        - `failure_signature` — **new problem, or the fortieth repeat.** The
+          single fact that decides retry versus escalate.
+        - `duration_vs_normal` — a comparison, never a bare number. "40
+          minutes" is a measurement; "8.3x the typical run" is a diagnosis.
+
+        **Every enrichment degrades to absent rather than erroring.** A
+        brand-new monitor has no fingerprint history and no archived daily
+        stats; an incident opened by silence has no failure body because
+        nothing was reported — that is the complaint itself. The thin payload
+        is still useful and thickens on its own as history accumulates. This
+        endpoint never fails over a missing enrichment.
+
+        - `exit_code` — the status the run exited with, when it sent one.
+          `137` (SIGKILL, usually the OOM killer) and `1` demand different
+          responses, and only the numeric ping form `/ping/{id}/{code}` carries
+          one. The field is **absent when no code was reported**, which is not
+          the same as `0`; see the `OpenIncident` schema.
+      tags: [Agents]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: Array of open incidents (may be empty).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/OpenIncident"
+        "400":
+          description: id is not a valid UUID.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: Agent not found in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/incidents/{id}/notes:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: |
+          The incident's numeric id, taken straight from an inbox entry's
+          `incident_id` (`GET /api/v1/agents/{id}/open-incidents`).
+        schema:
+          type: integer
+          format: int64
+        example: 4821
+
+    post:
+      operationId: addIncidentNote
+      summary: Write back what you found out about an incident
+      description: |
+        The **push** half of failure delivery, and the reason the inbox is
+        worth reading. Instead of "check failed at 03:04", the person who gets
+        paged reads *"failed because the upstream API returned 503; same
+        failure as the last three nights; I retried twice and stopped."*
+
+        Notes appear on the incident's page in the dashboard, attributed to
+        their author, in the order they were written.
+
+        **Send one whether or not you fixed the problem.** With no note, an
+        incident is indistinguishable from one nobody has looked at yet — so
+        an agent that writes back only its successes leaves a record that is
+        worse than none. "Could not reproduce, gave up after two attempts" is
+        a finding.
+
+        **Notes are append-only.** There is no endpoint to edit one and none
+        to delete one, by design: a diagnosis that can be rewritten is not
+        evidence, and a reader has to be able to trust that a note still says
+        what it said when it was written. Corrections are made by appending
+        another note. The database enforces this too — an `UPDATE` against the
+        underlying table is refused outright.
+
+        **Authorship is not yours to choose.** The request body has no
+        `author` field. Every note written through this API is stored as
+        `agent`, because this is the API-key surface and its caller is a
+        machine; `user` is reserved for a note a person writes in the
+        dashboard. A reader must never be misled about who diagnosed what,
+        and an endpoint whose caller could name its own author would make the
+        distinction meaningless.
+
+        Notes may be added to a **closed** incident on purpose: the run that
+        finally succeeded is usually the one that understood why the previous
+        one did not, and refusing the note would lose the explanation exactly
+        when it became available.
+
+        At most 50 notes per incident.
+      tags: [Incidents]
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IncidentNoteCreate"
+      responses:
+        "201":
+          description: The stored note.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IncidentNote"
+        "400":
+          description: |
+            The id is not a positive integer, the JSON is malformed, or the
+            body is empty, whitespace-only, or over 8192 bytes.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: |
+            No such incident **in this project**. An incident belonging to
+            another project answers exactly the same way as one that does not
+            exist, so this endpoint cannot be used to probe for other tenants'
+            incident ids.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "409":
+          description: This incident already has the maximum of 50 notes.
           content:
             application/problem+json:
               schema:
@@ -4653,6 +5869,173 @@ paths:
                 $ref: "#/components/schemas/Problem"
         "404":
           description: Check not found in this project.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /api/v1/checks/{id}/runs/{rid}/expectations:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: UUID of the check.
+        schema:
+          type: string
+          format: uuid
+        example: "550e8400-e29b-41d4-a716-446655440000"
+      - name: rid
+        in: path
+        required: true
+        description: The run id, exactly as sent on this run's `/start` ping.
+        schema:
+          type: string
+        example: "run-2026-08-23-001"
+
+    post:
+      operationId: declareRunExpectations
+      summary: Declare a run's success criteria before its outcome is known
+      description: |
+        Lets an agent commit, at the start of a run, to the criteria by which
+        that run will be judged when it closes — instead of the run's own
+        success ping grading itself. The declared set is evaluated against
+        the run's ping body when the run closes, using the same evaluator as
+        per-check output assertions (`core/assertion.Evaluate`); a failed
+        expectation turns that close into a `fail` with cause `assertion`.
+
+        **Immutable: declare-once.** A second declaration for the same `rid`
+        is rejected with `409` and the first set is left unchanged — an agent
+        that could rewrite its criteria mid-run once it can see failure
+        coming would be self-grading again with extra steps.
+
+        Every assertion is validated before any write, using the same
+        evaluator this endpoint's response is later judged by
+        (`core/assertion.Validate`): an uncompilable regexp, a `matches`
+        pattern over 1000 bytes, a missing required field for the given
+        `kind`, or a `json_path` containing `[`, `*` or `$` all fail the
+        request with `400` and **nothing is written**.
+
+        At most **20 assertions** are allowed per run, the same cap applied
+        to per-check output assertions.
+
+        Unlike per-check assertions, a declared run assertion has no `id` and
+        no `name` — nothing about it is ever referenced or edited after this
+        call, and it is not authored by a human choosing an alert label.
+      tags: [Checks]
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - assertions
+              properties:
+                assertions:
+                  type: array
+                  minItems: 1
+                  description: >-
+                    The run's complete set of expectations (1-20 entries). An
+                    empty array is rejected with 400 — declaring no criteria
+                    means never calling this endpoint, since an empty
+                    declaration would write nothing and leave a later call
+                    free to declare a full set after the outcome is already
+                    known, which is exactly the evasion declare-once
+                    immutability exists to prevent.
+                  items:
+                    type: object
+                    required:
+                      - kind
+                    properties:
+                      kind:
+                        type: string
+                        enum: [contains, not_contains, matches, json_path]
+                        description: >-
+                          How the run's ping body will be inspected at close —
+                          same semantics as the `Assertion` schema's `kind`.
+                      value:
+                        type: string
+                        description: Required for `contains`, `not_contains` and `matches`. For `json_path`, the expected value compared via `op`.
+                      path:
+                        type: string
+                        description: Dotted path (e.g. `result.rows_processed`), `json_path` only.
+                      op:
+                        type: string
+                        enum: [eq, ne, gt, gte, lt, lte]
+                        description: Comparison operator, `json_path` only.
+            examples:
+              rows_processed:
+                summary: Declare that the run must report rows_processed > 0
+                value:
+                  assertions:
+                    - kind: "json_path"
+                      path: "result.rows_processed"
+                      op: "gt"
+                      value: "0"
+      responses:
+        "201":
+          description: The declared set, as stored.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  assertions:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        kind:
+                          type: string
+                        value:
+                          type: string
+                        path:
+                          type: string
+                        op:
+                          type: string
+              example:
+                assertions:
+                  - kind: "json_path"
+                    path: "result.rows_processed"
+                    op: "gt"
+                    value: "0"
+        "400":
+          description: |
+            Invalid request — one of:
+            - An empty `assertions` array. Declaring no criteria is expressed
+              by not calling this endpoint at all, never by an empty array —
+              see the `assertions` field description above.
+            - More than 20 assertions in the request.
+            - An assertion fails `core/assertion.Validate`: missing `value`/`path`/`op`
+              for the given `kind`, an uncompilable `matches` regexp, a `matches`
+              pattern over 1000 bytes, an invalid `op`, or a `json_path` containing
+              `[`, `*` or `$`. The 400 names the offending entry by its array
+              position (e.g. `assertion "assertion[0]": ...`), since a
+              declared run assertion has no `name` to report instead.
+            - Malformed JSON body, or a missing `rid` path segment.
+            Nothing is written when any entry fails validation.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: Check not found in this project, or `rid` has never been armed by a `/start` ping.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "409":
+          description: The run has already closed, or expectations were already declared for this rid.
           content:
             application/problem+json:
               schema:

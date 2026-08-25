@@ -41,6 +41,8 @@ type monitorDataModel struct {
 	CiProvider           types.String `tfsdk:"ci_provider"`
 	CiWebhookURL         types.String `tfsdk:"ci_webhook_url"`
 	CiSecret             types.String `tfsdk:"ci_secret"`
+	SourceKind           types.String `tfsdk:"source_kind"`
+	SourceRef            types.String `tfsdk:"source_ref"`
 	FailureThreshold     types.Int64  `tfsdk:"failure_threshold"`
 	Tags                 types.Set    `tfsdk:"tags"`
 	RunawayCeiling       types.Int64  `tfsdk:"runaway_ceiling"`
@@ -163,6 +165,25 @@ func monitorDataAttributes() map[string]schema.Attribute {
 				"data source ever calls. The `lastping_monitor` resource can hold the value because it " +
 				"captures it at creation and carries it forward across refreshes; a data source has no " +
 				"creation event of its own to capture it from.",
+		},
+		"source_kind": schema.StringAttribute{
+			Computed: true,
+			MarkdownDescription: "**Discovery source identity, part 1 of 2.** The scanner that " +
+				"discovered this monitor: `crontab`, `github-actions`, `k8s-cronjob`, `systemd-timer`. " +
+				"**Null when a human created the monitor**, which is the state of every monitor that " +
+				"predates discovery — and such a monitor is never reconciled, so a scan can neither adopt " +
+				"nor delete it.\n\n" +
+				"Use it to tell apart the monitors a scan owns from the ones you wrote by hand, without " +
+				"importing either.",
+		},
+		"source_ref": schema.StringAttribute{
+			Computed: true,
+			MarkdownDescription: "**Discovery source identity, part 2 of 2.** The stable path within " +
+				"`source_kind` that identifies exactly what was found, such as " +
+				"`.github/workflows/nightly.yml#build`. Together with `source_kind` and the project it is " +
+				"the discovery reconcile key.\n\n" +
+				"Always either both present or both null with `source_kind`: a database CHECK constraint " +
+				"makes a half-set identity unrepresentable.",
 		},
 		"failure_threshold": schema.Int64Attribute{
 			Computed: true,
@@ -309,8 +330,13 @@ func monitorDataFromAPI(ctx context.Context, m *client.Monitor) (monitorDataMode
 		// every data source lookup — see its schema description. There is no
 		// prior state for a data source to carry a create-time value forward
 		// from, unlike the resource's CiSecret.
-		CiWebhookURL:         stringOrNull(m.CiWebhookURL),
-		CiSecret:             stringOrNull(m.CiSecret),
+		CiWebhookURL: stringOrNull(m.CiWebhookURL),
+		CiSecret:     stringOrNull(m.CiSecret),
+		// The discovery identity. stringOrNull for the same reason the resource
+		// uses it: the API omits both fields for a hand-made monitor, and "" in
+		// state would claim an identity of "" rather than none.
+		SourceKind:           stringOrNull(m.SourceKind),
+		SourceRef:            stringOrNull(m.SourceRef),
 		ProbeURL:             stringOrNull(m.ProbeURL),
 		ProbeMethod:          stringOrNull(m.ProbeMethod),
 		ProbeIntervalS:       int64OrNull(m.ProbeIntervalS),

@@ -81,6 +81,22 @@ func IsNotFound(err error) bool { return statusIs(err, http.StatusNotFound) }
 // a slug collision.
 func IsPreconditionFailed(err error) bool { return statusIs(err, http.StatusPreconditionFailed) }
 
+// ProblemCode returns the machine-readable `code` LastPing attaches to a
+// problem response, or "" when err is not a *Problem or carries no code.
+//
+// Problem.Error already appends the code in brackets, so a caller that only
+// wants it visible needs nothing here. This exists for the narrower case where
+// the code selects a DIFFERENT diagnostic: a 409 SOURCE_ALREADY_MONITORED and a
+// 409 SOURCE_IMMUTABLE_ON_UPSERT need different things done about them, and
+// "conflict" alone tells a practitioner neither.
+func ProblemCode(err error) string {
+	var p *Problem
+	if errors.As(err, &p) {
+		return p.Code
+	}
+	return ""
+}
+
 func statusIs(err error, code int) bool {
 	var p *Problem
 	return errors.As(err, &p) && p.Status == code

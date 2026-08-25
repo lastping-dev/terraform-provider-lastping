@@ -93,6 +93,35 @@ type Monitor struct {
 	// opposite write-only shape.
 	CiSecret string `json:"ci_secret,omitempty"`
 
+	// SourceKind and SourceRef are the discovery source identity: the scanner
+	// that found this thing (crontab, github-actions, k8s-cronjob,
+	// systemd-timer) and a stable path within it
+	// (.github/workflows/nightly.yml#build). Together with the project they are
+	// the reconcile key that makes a discovery scan safe to re-run — the second
+	// run diffs against what exists instead of creating every monitor again.
+	//
+	// They are ordinary readable response fields: api/checks.go's checkResponse
+	// carries both with `omitempty`, so a hand-made monitor (the state of every
+	// monitor that predates discovery) decodes both as "". That is why the
+	// provider maps them through stringOrNull and never through
+	// writeOnlyString — absent means "no source", not "the API declined to
+	// tell me".
+	//
+	// The `omitempty` here is load-bearing in the SEND direction and is the
+	// first of the three ways a discovery identity can be silently destroyed:
+	// the API treats an explicit "" on these two as OMISSION, not as a clear
+	// (the same RFC 7396 deviation ci_workflow/ci_branch carry, for the same
+	// full-body clients). So "" on the wire never means what a caller thinks it
+	// means, and dropping it is the only safe rendering. Only an explicit null
+	// clears, and only through MonitorPatch — see monitorPatchFromModel.
+	//
+	// They are also the only pair in this struct the API validates jointly:
+	// exactly one of the two is 400 SOURCE_INCOMPLETE, a pair another monitor
+	// in the project already claims is 409 SOURCE_ALREADY_MONITORED, and a slug
+	// upsert offering a different pair is 409 SOURCE_IMMUTABLE_ON_UPSERT.
+	SourceKind string `json:"source_kind,omitempty"`
+	SourceRef  string `json:"source_ref,omitempty"`
+
 	// Computed.
 	Paused           bool    `json:"paused,omitempty"`
 	Status           string  `json:"status,omitempty"`
@@ -172,7 +201,7 @@ func (c *Client) GetMonitorBySlug(ctx context.Context, slug string) (*Monitor, e
 //     field — the API honours that for runaway_ceiling, max_runtime_s,
 //     step_timeout_s, expect_every_s, blocked_timeout_s, notify_min_run_s,
 //     monitor_from, tags,
-//     ci_workflow and ci_branch, and treats
+//     ci_workflow, ci_branch, source_kind and source_ref, and treats
 //     it as "absent" everywhere else. A null blocked_timeout_s is the odd one
 //     out in that list: it does not mean "wait forever", it restores the
 //     check.DefaultBlockedTimeout fallback of 24 hours.
@@ -181,6 +210,19 @@ func (c *Client) GetMonitorBySlug(ctx context.Context, slug string) (*Monitor, e
 //     column is NOT NULL DEFAULT 1, so a null there is read as an omission and
 //     leaves the stored value alone;
 //   - any other value replaces the stored one.
+//
+// source_kind and source_ref are the one pair in that list with a joint rule:
+// they are resolved TOGETHER, so whatever the request and the stored row
+// combine to must be either both set or both empty. A lone
+// {"source_ref": null} is a 400 SOURCE_INCOMPLETE, not a half-cleared
+// identity, and clearing therefore takes an explicit null on both keys. They
+// also share ci_workflow/ci_branch's deviation from RFC 7396 — an explicit ""
+// PRESERVES the stored value — with a sharper consequence, because this pair is
+// an identity rather than a setting: a source cleared by accident is a monitor
+// the next discovery scan no longer recognises, so the scan creates a SECOND
+// monitor for the same source. A patch that mentions neither key issues no
+// source write at all, which is what keeps an unrelated edit (a rename, say)
+// off the reconcile key entirely.
 //
 // slug, monitor_type, ci_provider and ci_secret are create-only and ignored if
 // present.
