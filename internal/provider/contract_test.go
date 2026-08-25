@@ -178,6 +178,33 @@ var deliberatelyUnmodelled = map[string]string{
 	"resource.lastping_route.channel_ids": "provider-side name for the API's channel_ids; the " +
 		"provider says \"destination\" everywhere the API says \"channel\" (see destination_ids in " +
 		"this case's sendExempt/readExempt)",
+
+	// The rest of discovery has NO entry here, and cannot have one — no
+	// contractCase covers POST /api/v1/discovery/reconcile or
+	// components.schemas.DiscoverySource, so nothing in this file would flag
+	// them either way. That silence is the reason to write it down here rather
+	// than nowhere:
+	//
+	// The reconcile endpoint is an ACTION, not state. It takes everything one
+	// scan found and answers with what it created, what already existed and
+	// what has gone missing — a report about a moment, not a description of a
+	// desired world. Terraform's whole contract is "make reality match this
+	// document, and say so when it already does", and there is no document a
+	// user could write that means "run a scan": running it twice is not
+	// idempotent in the sense that matters (the second run's answer is
+	// different and that difference is the product), and its `orphaned` list is
+	// information for a human, not a diff to converge. Modelling it as a
+	// resource would make every plan want to re-run it, or make it a
+	// create-once resource whose state describes a scan nobody can reproduce.
+	// That is the same line run expectations and incident notes fall on the far
+	// side of, and it is why the MCP server owns discovery_monitors_reconcile
+	// while Terraform owns the identity the scan writes.
+	//
+	// What discovery leaves BEHIND is state, and that half is modelled: a
+	// monitor's source_kind/source_ref pair is the reconcile key itself, it is
+	// declarative, and it is on all three monitor surfaces as of 2026-08-25.
+	// The rule this split follows: Terraform models the key, the agent performs
+	// the scan.
 }
 
 // apiKeyLastUsedSurfaceExempt is shared by the managed and ephemeral
@@ -216,6 +243,21 @@ const ciConfiguredExempt = "always exactly (ci_provider != null) — a derived b
 // data.lastping_monitors.monitors), ci_secret the same way but Sensitive and
 // carried forward from the create response via writeOnlyString, since no
 // later response ever repeats it.
+//
+// source_kind and source_ref were the next two, found on 2026-08-25 by the
+// resync that first pulled a spec containing them, and they are worth
+// recording because of HOW long they were invisible: the vendored copy had been
+// stale since 2026-08-09 and carried zero occurrences of either, so the test
+// that exists to catch exactly this drift reported a clean suite while the
+// provider could not express a monitor's discovery identity at all. A stale
+// spec does not read as a gap. It reads as no gap. Resync before trusting a
+// green run here.
+//
+// Both are now modelled on all three monitor surfaces
+// (resource.lastping_monitor, data.lastping_monitor and
+// data.lastping_monitors.monitors), so neither has an entry — but see
+// deliberatelyUnmodelled's tail comment for the part of discovery that stays
+// out, and why that is a decision rather than a second silent gap.
 //
 // Keys are "<case name>[.<nested attribute>].<spec property name>".
 var knownModellingGaps = map[string]string{}

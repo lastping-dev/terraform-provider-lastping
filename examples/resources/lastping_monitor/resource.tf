@@ -291,3 +291,44 @@ resource "lastping_monitor" "nightly_release" {
   # There is no way to turn the blocked timeout off, only to choose its length.
   blocked_timeout_s = 14400
 }
+
+# A monitor a discovery scan created, expressed as code.
+#
+# `source_kind` and `source_ref` are the discovery source identity: the scanner
+# that found the thing, and a stable path within it. Together with the project
+# they are the RECONCILE KEY — the pair that lets a scan be re-run safely,
+# because the second run diffs against what already exists instead of creating
+# every monitor a second time. Omit both for a hand-made monitor; a monitor with
+# no source is never reconciled, so discovery can neither adopt nor delete it.
+#
+# Setting them here is how you hand-write a monitor that a future scan will
+# recognise as already-monitored and leave alone, rather than duplicate. The
+# API refuses a pair another monitor in the project already claims (409
+# SOURCE_ALREADY_MONITORED) — that refusal is the feature.
+#
+# Two things about them are unlike every other optional attribute here:
+#
+#   - They must be set TOGETHER. Half an identity reconciles against nothing,
+#     so one without the other is refused at plan time.
+#
+#   - DELETING these two lines does not clear the identity, it keeps it. That
+#     is deliberate: the normal state after `terraform import` of a discovered
+#     monitor is a configuration that never mentions its source, and an
+#     attribute that cleared itself when unwritten would destroy the reconcile
+#     key on the first apply — after which the next scan would create a second
+#     monitor for the same source. To genuinely un-discover a monitor, clear
+#     the pair out of band (PATCH with two explicit nulls, the MCP
+#     `update_monitor` tool, or the dashboard); the next refresh adopts it and
+#     nothing here puts it back.
+resource "lastping_monitor" "discovered_nightly" {
+  name          = "nightly / build"
+  slug          = "nightly-build"
+  schedule_kind = "cron"
+  cron_expr     = "0 2 * * *"
+  grace_s       = 1800
+
+  source_kind = "github-actions"
+  source_ref  = ".github/workflows/nightly.yml#build"
+
+  tags = ["env:prod", "discovered"]
+}

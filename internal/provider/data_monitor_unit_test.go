@@ -150,4 +150,52 @@ func TestMonitorDataSourceNextProbeAtAgreesWithResource(t *testing.T) {
 	require.Equal(t, types.StringValue("2026-07-13T03:01:00Z"), data.NextProbeAt)
 }
 
+// TestMonitorDataSourceSourceAgreesWithResource pins the discovery identity's
+// null-versus-empty convention across both surfaces at once.
+//
+// This is the read hazard from the resource's own section, checked where it can
+// diverge silently: the resource and the data source map the same response
+// through two different functions, and a data source that reported "" for a
+// hand-made monitor would make `data.lastping_monitor.x.source_kind == ""` the
+// test for "discovered" in every user's configuration — a condition that is
+// true for exactly the monitors that are NOT discovered.
+func TestMonitorDataSourceSourceAgreesWithResource(t *testing.T) {
+	ctx := context.Background()
+
+	handMade := client.Monitor{
+		ID: "3f7c1f5a-1a2b-4c3d-8e9f-0a1b2c3d4e5f", Name: "acc",
+		MonitorType: "heartbeat", ScheduleKind: "simple", PeriodS: 3600, TZ: "UTC", GraceS: 1800,
+	}
+	discovered := handMade
+	discovered.SourceKind = "github-actions"
+	discovered.SourceRef = ".github/workflows/nightly.yml#build"
+
+	for _, tc := range []struct {
+		name string
+		mon  client.Monitor
+	}{
+		{"hand-made monitor has no source", handMade},
+		{"discovered monitor carries both halves", discovered},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := modelFromMonitor(ctx, &tc.mon, monitorResourceModel{
+				Tags: types.SetNull(types.StringType),
+			})
+			require.NoError(t, err)
+			data, diags := monitorDataFromAPI(ctx, &tc.mon)
+			require.False(t, diags.HasError(), "%v", diags)
+
+			require.Equal(t, res.SourceKind, data.SourceKind,
+				"source_kind must read identically on both surfaces; the API omits it for a "+
+					"hand-made monitor, so both sides must report null rather than \"\"")
+			require.Equal(t, res.SourceRef, data.SourceRef, "likewise for source_ref")
+		})
+	}
+
+	data, diags := monitorDataFromAPI(ctx, &handMade)
+	require.False(t, diags.HasError(), "%v", diags)
+	require.True(t, data.SourceKind.IsNull())
+	require.True(t, data.SourceRef.IsNull())
+}
+
 func ptrTo[T any](v T) *T { return &v }

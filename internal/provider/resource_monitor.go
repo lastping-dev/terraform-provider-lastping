@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
+	"github.com/hashicorp/terraform-plugin-framework-validators/resourcevalidator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
@@ -26,10 +27,11 @@ import (
 )
 
 var (
-	_ resource.Resource                   = (*monitorResource)(nil)
-	_ resource.ResourceWithConfigure      = (*monitorResource)(nil)
-	_ resource.ResourceWithImportState    = (*monitorResource)(nil)
-	_ resource.ResourceWithValidateConfig = (*monitorResource)(nil)
+	_ resource.Resource                     = (*monitorResource)(nil)
+	_ resource.ResourceWithConfigure        = (*monitorResource)(nil)
+	_ resource.ResourceWithImportState      = (*monitorResource)(nil)
+	_ resource.ResourceWithValidateConfig   = (*monitorResource)(nil)
+	_ resource.ResourceWithConfigValidators = (*monitorResource)(nil)
 
 	_ validator.String = notUUIDSlugValidator{}
 	_ validator.String = rfc3339Validator{}
@@ -43,6 +45,16 @@ var (
 // differs from a known config value), so the only correct answer is to refuse
 // the un-normalised form at plan time.
 var slugPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,48}[a-z0-9]$`)
+
+// sourceKindPattern mirrors api/check_source.go's sourceKindRe exactly.
+//
+// Refusing a malformed kind at plan time is not politeness about a 400. The
+// reconcile key is compared byte-for-byte by a unique index, so "GitHub
+// Actions" and "github-actions" are two DIFFERENT identities for one scanner —
+// a kind whose spelling drifts rediscovers, and re-creates, every monitor the
+// scanner had already made. The API refuses the shape at the door with 400
+// INVALID_SOURCE_KIND for that reason, and so does this.
+var sourceKindPattern = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 
 // notUUIDSlugValidator rejects UUID-shaped slugs, which the server also rejects:
 // they are ambiguous with a monitor id during import.
@@ -105,6 +117,12 @@ type monitorResource struct {
 // carrying a provider-side Default. Everything else is plain Optional so that
 // removing it from the configuration actually unsets it — a blanket
 // Optional+Computed pins the previous value in state forever.
+//
+// source_kind and source_ref are the one deliberate exception to that rule, and
+// they are Optional+Computed for the opposite reason to the rest: not because
+// the server supplies a value the configuration cannot, but because "pins the
+// previous value" is the CORRECT behaviour for a discovery identity and the
+// alternative destroys data. See their schema entries.
 type monitorResourceModel struct {
 	ID                   types.String `tfsdk:"id"`
 	Name                 types.String `tfsdk:"name"`
@@ -130,6 +148,8 @@ type monitorResourceModel struct {
 	CiBranch             types.String `tfsdk:"ci_branch"`
 	CiWebhookURL         types.String `tfsdk:"ci_webhook_url"`
 	CiSecret             types.String `tfsdk:"ci_secret"`
+	SourceKind           types.String `tfsdk:"source_kind"`
+	SourceRef            types.String `tfsdk:"source_ref"`
 	ProbeURL             types.String `tfsdk:"probe_url"`
 	ProbeMethod          types.String `tfsdk:"probe_method"`
 	ProbeIntervalS       types.Int64  `tfsdk:"probe_interval_s"`
@@ -487,6 +507,70 @@ func (r *monitorResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 					"`POST /api/v1/checks/{id}/ci/regenerate` and manage it outside Terraform — this " +
 					"provider does not call that endpoint.",
 			},
+			"source_kind": schema.StringAttribute{
+				Optional: true,
+				Computed: true,
+				MarkdownDescription: "**Discovery source identity, part 1 of 2.** The scanner that found " +
+					"this thing: `crontab`, `github-actions`, `k8s-cronjob`, `systemd-timer`. Lowercase and " +
+					"dash-separated, because the API compares it byte-for-byte — `GitHub Actions` and " +
+					"`github-actions` would be two different identities for one scanner.\n\n" +
+					"Together with `source_ref` and the project this is the **reconcile key** that makes a " +
+					"discovery scan safe to re-run: the second run diffs against what already exists " +
+					"instead of creating every monitor a second time. Omit both for a hand-made monitor — " +
+					"a monitor with no source is never reconciled, so discovery can neither adopt nor " +
+					"delete it.\n\n" +
+					"~> **Must be set together with `source_ref`.** Half an identity reconciles against " +
+					"nothing, so the API rejects one without the other with 400 `SOURCE_INCOMPLETE`; this " +
+					"provider refuses it at plan time instead.\n\n" +
+					"~> **Omitting this attribute keeps whatever the monitor already has — it does not " +
+					"clear it.** That is what `Computed` buys here, and it is deliberate: the normal state " +
+					"after `terraform import` of a discovered monitor is a configuration that never " +
+					"mentions the source, and a plain `Optional` attribute would plan `null` there and wipe " +
+					"the identity on the first apply. The next scan would then no longer recognise the " +
+					"monitor and would create a **second** one for the same source — the exact duplicate " +
+					"the reconcile key exists to prevent. The cost is that an identity cannot be removed " +
+					"by deleting these lines; see `source_ref` for how to clear one.",
+				Validators: []validator.String{
+					stringvalidator.LengthAtMost(64),
+					stringvalidator.RegexMatches(sourceKindPattern,
+						"must be lowercase alphanumeric segments joined by single dashes, "+
+							"e.g. \"github-actions\""),
+				},
+				PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
+			},
+			"source_ref": schema.StringAttribute{
+				Optional: true,
+				Computed: true,
+				MarkdownDescription: "**Discovery source identity, part 2 of 2.** A stable path within " +
+					"`source_kind` — `.github/workflows/nightly.yml#build`, " +
+					"`/etc/cron.d/backup#0 3 * * *`. Carries the same set-together rule and the same " +
+					"keeps-its-stored-value behaviour as `source_kind`.\n\n" +
+					"~> **A pair another monitor in this project already claims is refused** with 409 " +
+					"`SOURCE_ALREADY_MONITORED`. That refusal is the feature, not a bug to work around: " +
+					"two monitors reconciling to one source would make every later discovery run " +
+					"ambiguous.\n\n" +
+					"~> **Changing a source is an in-place update, never a replacement.** The provider " +
+					"sends it on `PATCH /api/v1/checks/{id}`, which is the only surface allowed to rewrite " +
+					"a source — a slug upsert answers 409 `SOURCE_IMMUTABLE_ON_UPSERT` rather than let a " +
+					"slug collision silently adopt a hand-made monitor into discovery.\n\n" +
+					"~> **Clearing a source is deliberately not something deleting these lines does.** " +
+					"Delete them and the stored identity is kept, per `source_kind` above. To genuinely " +
+					"un-discover a monitor, clear the pair outside Terraform (`PATCH /api/v1/checks/{id}` " +
+					"with `{\"source_kind\": null, \"source_ref\": null}`, the MCP `update_monitor` tool, " +
+					"or the dashboard) and let the next refresh adopt the result — a configuration that " +
+					"does not mention the source will not put it back, and the plan stays empty. Sending " +
+					"`\"\"` does **not** clear it: the API reads an empty string on this pair as " +
+					"\"leave it alone\", so this provider never puts one on the wire.",
+				// LengthBetween, not LengthAtMost: the floor is what makes a
+				// configured "" unreachable. The API reads an empty string on
+				// this pair as "leave the stored value alone", so a
+				// `source_ref = ""` would apply with a 200, change nothing, and
+				// leave a configuration claiming a ref the monitor does not
+				// have. source_kind needs no separate floor — its pattern
+				// requires at least one character.
+				Validators:    []validator.String{stringvalidator.LengthBetween(1, 512)},
+				PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
+			},
 			"probe_url": schema.StringAttribute{
 				Optional:            true,
 				MarkdownDescription: "Absolute http(s) URL to probe. Required for `monitor_type = \"http\"`.",
@@ -614,6 +698,29 @@ func (r *monitorResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 // `assertion` block must be one core/assertion.Validate would accept (see
 // validateAssertions, which also refuses assertions on an http monitor — a
 // probe has no ping body, so they could never be evaluated).
+// ConfigValidators enforces the discovery identity's set-together rule at plan
+// time.
+//
+// The API refuses exactly one of the pair with 400 SOURCE_INCOMPLETE, and does
+// so on create and on update alike. Catching it here costs a round trip rather
+// than an apply, but the real reason it belongs at plan time is that the failure
+// is otherwise invisible in the configuration: `source_kind` alone reads as a
+// perfectly ordinary attribute, and nothing on the page says the other half is
+// missing.
+//
+// RequiredTogether reads the CONFIGURATION, which is what makes it correct for
+// an Optional+Computed pair: a configuration that mentions neither is null for
+// both and passes, exactly as an imported discovered monitor's configuration
+// should.
+func (r *monitorResource) ConfigValidators(context.Context) []resource.ConfigValidator {
+	return []resource.ConfigValidator{
+		resourcevalidator.RequiredTogether(
+			path.MatchRoot("source_kind"),
+			path.MatchRoot("source_ref"),
+		),
+	}
+}
+
 func (r *monitorResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
 	var cfg monitorResourceModel
 	resp.Diagnostics.Append(req.Config.Get(ctx, &cfg)...)
@@ -858,6 +965,20 @@ func monitorFromModel(ctx context.Context, m monitorResourceModel) (client.Monit
 		CiProvider: m.CiProvider.ValueString(),
 		CiWorkflow: m.CiWorkflow.ValueString(),
 		CiBranch:   m.CiBranch.ValueString(),
+
+		// The discovery identity. Both are Optional+Computed, so a
+		// configuration that does not mention them plans UNKNOWN on create,
+		// and ValueString() renders an unknown as "" — which client.Monitor's
+		// `omitempty` then drops. That is the outcome wanted twice over: an
+		// omitted pair is "a human made this", and "" must never reach the wire
+		// on these two at all, because the API reads it as "leave it alone"
+		// rather than as a value. There is no shape of this model that can
+		// produce a `"source_kind": ""` request.
+		//
+		// This function also backs monitorPatchNeeded, which is what makes a
+		// changed source count as a real diff rather than a no-op apply.
+		SourceKind: m.SourceKind.ValueString(),
+		SourceRef:  m.SourceRef.ValueString(),
 	}
 	if !m.BlockedTimeoutS.IsNull() && !m.BlockedTimeoutS.IsUnknown() {
 		v := m.BlockedTimeoutS.ValueInt64()
@@ -958,6 +1079,12 @@ func monitorFromModel(ctx context.Context, m monitorResourceModel) (client.Monit
 //     create-only attributes, and they must keep being sent: omitting them is
 //     only safe against a server that merges, and this provider still has to
 //     work against one that replaces. Narrowing them is a separate change.
+//
+//  4. The discovery identity — source_kind and source_ref, which belong to no
+//     other group and whose whole rule is that an absent configuration must
+//     produce an absent KEY rather than a null. Read that block before
+//     touching it: it is the one place in this function where following the
+//     surrounding pattern destroys user data.
 func monitorPatchFromModel(ctx context.Context, desired, cfg monitorResourceModel) (client.MonitorPatch, error) {
 	patch := client.MonitorPatch{
 		"name": desired.Name.ValueString(),
@@ -1103,6 +1230,49 @@ func monitorPatchFromModel(ctx context.Context, desired, cfg monitorResourceMode
 		patch["ci_branch"] = nil
 	} else {
 		patch["ci_branch"] = desired.CiBranch.ValueString()
+	}
+
+	// Group 4 — the discovery identity, which is in NO other group and must not
+	// be quietly folded into one.
+	//
+	// source_kind/source_ref are the only Optional+Computed attributes on this
+	// resource that a PATCH can write, and that combination is what makes
+	// group 1's shape lethal here. Group 1 reads "config is null, therefore
+	// send null, therefore clear"; for this pair, config being null is the
+	// NORMAL state after importing a discovered monitor and not hand-writing
+	// its source. Sending null there would clear the reconcile key on the first
+	// unrelated apply, and the next discovery scan — no longer recognising the
+	// monitor — would create a second one for the same source. That is the
+	// exact duplicate the key exists to prevent, produced by a rename.
+	//
+	// So presence is taken from the CONFIGURATION and nothing else:
+	//
+	//   - the configuration names a source: send both keys, always as a pair,
+	//     so the API resolves a complete identity. Sending an unchanged pair is
+	//     a harmless no-op (SOURCE_ALREADY_MONITORED is only raised for a pair
+	//     another monitor holds).
+	//   - the configuration names neither: send NEITHER key. Not null, and not
+	//     "" — an empty string is read by the API as "leave it alone", so it is
+	//     never what a caller means, and omission says the same thing without
+	//     relying on that deviation. A patch that mentions neither key issues no
+	//     source write at all, which keeps an unrelated edit off the unique
+	//     index entirely.
+	//
+	// Clearing an identity is therefore not reachable from this function, by
+	// design and at a stated cost: see source_ref's schema description for the
+	// out-of-band route. Unclearable is recoverable; silently destroyed is not.
+	//
+	// ConfigValidators has already refused exactly one of the two, so the pair
+	// is written or absent together. The empty-string guard below is belt and
+	// braces for that: the schema's validators make a configured "" unreachable,
+	// and if that ever changes this refuses to put one on the wire rather than
+	// send the one value whose meaning is inverted.
+	if !cfg.SourceKind.IsNull() && !cfg.SourceRef.IsNull() {
+		kind, ref := desired.SourceKind.ValueString(), desired.SourceRef.ValueString()
+		if kind != "" && ref != "" {
+			patch["source_kind"] = kind
+			patch["source_ref"] = ref
+		}
 	}
 
 	if cfg.MonitorFrom.IsNull() || desired.MonitorFrom.ValueString() == "" {
@@ -1297,6 +1467,22 @@ func modelFromMonitor(ctx context.Context, mon *client.Monitor, prior monitorRes
 		CiWebhookURL: stringOrNull(mon.CiWebhookURL),
 		CiSecret:     writeOnlyString(mon.CiSecret, prior.CiSecret),
 
+		// The discovery identity refreshes normally: checkResponse carries
+		// both fields, and a monitor with no source simply omits them, which
+		// decodes as "".
+		//
+		// stringOrNull, and emphatically NOT types.StringValue(mon.SourceKind).
+		// Mapping an absent field to "" would put an empty string into state
+		// for every hand-made monitor in a user's configuration — the
+		// overwhelming majority — where the configuration says null, and that
+		// is a diff on every plan forever. It is also not writeOnlyString's
+		// shape despite the superficial resemblance: "" here is a real answer
+		// ("this monitor has no source"), not the API declining to report a
+		// value it holds, so carrying a prior value forward would mask a source
+		// genuinely cleared outside Terraform.
+		SourceKind: stringOrNull(mon.SourceKind),
+		SourceRef:  stringOrNull(mon.SourceRef),
+
 		// failure_threshold is NOT NULL DEFAULT 1 server-side and always comes
 		// back, so it is a concrete number rather than an int64OrNull.
 		FailureThreshold: types.Int64Value(mon.FailureThreshold),
@@ -1373,6 +1559,50 @@ func modelFromMonitor(ctx context.Context, mon *client.Monitor, prior monitorRes
 	return m, nil
 }
 
+// addSourceConflictDiag turns the API's two discovery-source 409s into
+// diagnostics that name the code, and reports whether it handled err.
+//
+// Both are 409s and both are about source_kind/source_ref, and that is where
+// the resemblance ends — one says "somebody else already has this identity",
+// the other says "you asked the wrong endpoint to change an identity". A single
+// "conflict" diagnostic would tell a practitioner neither, and the code is the
+// only part of the answer that is searchable, so it goes in the title rather
+// than being left to Problem.Error's bracketed suffix at the end of the detail.
+func addSourceConflictDiag(diags *diag.Diagnostics, err error, kind, ref string) bool {
+	identity := fmt.Sprintf("%s %s", kind, ref)
+	switch client.ProblemCode(err) {
+	case "SOURCE_ALREADY_MONITORED":
+		diags.AddError(
+			"Discovery source already monitored (SOURCE_ALREADY_MONITORED)",
+			fmt.Sprintf("Another monitor in this project already claims the discovery identity %q.\n\n"+
+				"The API refuses this on purpose, and the refusal is the feature: (project, source_kind, "+
+				"source_ref) is the reconcile key that lets a discovery scan be re-run safely, and two "+
+				"monitors reconciling to one source would make every later scan ambiguous.\n\n"+
+				"Either import the monitor that already holds this identity instead of creating a second "+
+				"one:\n  terraform import lastping_monitor.<name> <slug-or-id>\n\nor give this monitor a "+
+				"source_ref that names a different thing.\n\nAPI said: %s", identity, err),
+		)
+		return true
+	case "SOURCE_IMMUTABLE_ON_UPSERT":
+		// Not reachable through this provider today, and kept anyway: Create
+		// sends If-None-Match: *, which the API evaluates BEFORE it reaches the
+		// upsert branch that raises this, so a slug collision comes back as the
+		// 412 handled above. That ordering is the API's to change, and if it
+		// ever does, the failure must not degrade into an unexplained conflict.
+		diags.AddError(
+			"Discovery source cannot be changed this way (SOURCE_IMMUTABLE_ON_UPSERT)",
+			fmt.Sprintf("The API matched an existing monitor by slug and refused to rewrite its "+
+				"source_kind/source_ref to %q. A slug upsert never rewrites a source — that would let a "+
+				"slug collision silently adopt a hand-made monitor into discovery.\n\nChanging a source "+
+				"is an in-place update on a monitor Terraform already manages, so import the existing "+
+				"monitor and change the attributes on it:\n"+
+				"  terraform import lastping_monitor.<name> <slug-or-id>\n\nAPI said: %s", identity, err),
+		)
+		return true
+	}
+	return false
+}
+
 func (r *monitorResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
 	var plan monitorResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
@@ -1398,6 +1628,10 @@ func (r *monitorResource) Create(ctx context.Context, req resource.CreateRequest
 					"  terraform import lastping_monitor.<name> %s\n\nOr choose a different slug.",
 					plan.Slug.ValueString(), plan.Slug.ValueString()),
 			)
+			return
+		}
+		if addSourceConflictDiag(&resp.Diagnostics, err,
+			plan.SourceKind.ValueString(), plan.SourceRef.ValueString()) {
 			return
 		}
 		resp.Diagnostics.AddError("Unable to create monitor", err.Error())
@@ -1636,6 +1870,13 @@ func (r *monitorResource) Update(ctx context.Context, req resource.UpdateRequest
 	if patchNeeded {
 		out, err = r.client.UpdateMonitor(ctx, id, patch)
 		if err != nil {
+			// PATCH is the only surface allowed to change a monitor's source,
+			// so this is where SOURCE_ALREADY_MONITORED actually shows up for
+			// a practitioner: two configurations pointed at one scanner path.
+			if addSourceConflictDiag(&resp.Diagnostics, err,
+				desired.SourceKind.ValueString(), desired.SourceRef.ValueString()) {
+				return
+			}
 			resp.Diagnostics.AddError("Unable to update monitor", err.Error())
 			return
 		}

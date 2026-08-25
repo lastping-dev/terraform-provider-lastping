@@ -1902,3 +1902,449 @@ resource "lastping_monitor" "orphan" {
 		}},
 	})
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Discovery source identity (source_kind / source_ref)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// TestAccMonitor_discoverySource covers the ordinary lifecycle: create with an
+// identity, move it in place, and import it back.
+//
+// The move matters as much as the create. Changing a source must be an
+// in-place PATCH, never a replacement — a replaced monitor is a new id, a new
+// ping URL and a lost history, and it would also mean the reconcile key could
+// never be corrected without discarding the very monitor it identifies.
+func TestAccMonitor_discoverySource(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "lastping_monitor" "src" {
+  name          = "acc-source"
+  slug          = "acc-source"
+  schedule_kind = "simple"
+  period_s      = 3600
+  grace_s       = 300
+  source_kind   = "github-actions"
+  source_ref    = ".github/workflows/nightly.yml#build"
+}`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("lastping_monitor.src", "source_kind", "github-actions"),
+					resource.TestCheckResourceAttr("lastping_monitor.src", "source_ref",
+						".github/workflows/nightly.yml#build"),
+				),
+			},
+			{
+				// The workflow's job was renamed. The identity moves with it,
+				// in place: PATCH is the only surface allowed to rewrite a
+				// source, and the monitor must survive the edit.
+				Config: `
+resource "lastping_monitor" "src" {
+  name          = "acc-source"
+  slug          = "acc-source"
+  schedule_kind = "simple"
+  period_s      = 3600
+  grace_s       = 300
+  source_kind   = "github-actions"
+  source_ref    = ".github/workflows/nightly.yml#publish"
+}`,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("lastping_monitor.src", plancheck.ResourceActionUpdate),
+					},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("lastping_monitor.src", "source_ref",
+						".github/workflows/nightly.yml#publish"),
+					// Read it off the server, not just out of state: a PATCH
+					// that never carried the keys would leave state agreeing
+					// with the plan while the row still held the old ref.
+					resource.TestCheckResourceAttrWith("lastping_monitor.src", "id", func(id string) error {
+						mon, err := testAccDirectClient(t).GetMonitor(t.Context(), id)
+						if err != nil {
+							return err
+						}
+						if mon.SourceRef != ".github/workflows/nightly.yml#publish" {
+							return fmt.Errorf("server holds source_ref=%q, want the new one", mon.SourceRef)
+						}
+						if mon.SourceKind != "github-actions" {
+							return fmt.Errorf("server holds source_kind=%q, want github-actions", mon.SourceKind)
+						}
+						return nil
+					}),
+				),
+			},
+			{
+				ResourceName:      "lastping_monitor.src",
+				ImportState:       true,
+				ImportStateId:     "acc-source",
+				ImportStateVerify: true,
+			},
+		},
+	})
+}
+
+// TestAccMonitor_discoverySourceSurvivesAnUnrelatedUpdate is THE acceptance
+// test of this change, and an empty plan in step 2 is the whole proof.
+//
+// Step 1 creates a discovered monitor and step 2 hands it a configuration that
+// does not mention its source at all — which is not a contrivance, it is what
+// every configuration looks like after `terraform import` of a monitor a scan
+// created, and after an `export_terraform` whose source lines were deleted to
+// suit an older provider.
+//
+// With a plain Optional attribute this plans null, the first apply sends null,
+// the API clears the reconcile key, and the next discovery scan — no longer
+// recognising the monitor — creates a SECOND monitor for the same source. The
+// duplicate is the failure the whole key exists to prevent, and nothing about
+// the apply that caused it looks wrong: it renames a monitor and reports
+// success.
+//
+// Step 3 then makes the same point through a real import rather than a
+// remembered state, and step 4 changes something unrelated and reads the
+// server back directly, because "state still says github-actions" and "the row
+// still says github-actions" are different claims.
+func TestAccMonitor_discoverySourceSurvivesAnUnrelatedUpdate(t *testing.T) {
+	const withoutSource = `
+resource "lastping_monitor" "keep" {
+  name          = "acc-source-keep"
+  slug          = "acc-source-keep"
+  schedule_kind = "simple"
+  period_s      = 3600
+  grace_s       = 300
+}`
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "lastping_monitor" "keep" {
+  name          = "acc-source-keep"
+  slug          = "acc-source-keep"
+  schedule_kind = "simple"
+  period_s      = 3600
+  grace_s       = 300
+  source_kind   = "crontab"
+  source_ref    = "/etc/cron.d/backup#0 4 * * *"
+}`,
+				Check: resource.TestCheckResourceAttr("lastping_monitor.keep", "source_kind", "crontab"),
+			},
+			{
+				// The attributes are gone from the configuration. Nothing may
+				// move — not the plan, and not the row.
+				Config:   withoutSource,
+				PlanOnly: true,
+			},
+			{
+				ResourceName:      "lastping_monitor.keep",
+				ImportState:       true,
+				ImportStateId:     "acc-source-keep",
+				ImportStateVerify: true,
+			},
+			{
+				// An apply that changes only the name, against a configuration
+				// that still never mentions the source. This is the apply that
+				// destroys the identity if the serializer treats "unwritten" as
+				// "clear it".
+				Config: `
+resource "lastping_monitor" "keep" {
+  name          = "acc-source-keep-renamed"
+  slug          = "acc-source-keep"
+  schedule_kind = "simple"
+  period_s      = 3600
+  grace_s       = 300
+}`,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("lastping_monitor.keep", plancheck.ResourceActionUpdate),
+					},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("lastping_monitor.keep", "source_kind", "crontab"),
+					resource.TestCheckResourceAttr("lastping_monitor.keep", "source_ref",
+						"/etc/cron.d/backup#0 4 * * *"),
+					resource.TestCheckResourceAttrWith("lastping_monitor.keep", "id", func(id string) error {
+						mon, err := testAccDirectClient(t).GetMonitor(t.Context(), id)
+						if err != nil {
+							return err
+						}
+						if mon.SourceKind != "crontab" || mon.SourceRef != "/etc/cron.d/backup#0 4 * * *" {
+							return fmt.Errorf(
+								"server lost the discovery identity: source_kind=%q source_ref=%q",
+								mon.SourceKind, mon.SourceRef)
+						}
+						return nil
+					}),
+				),
+			},
+		},
+	})
+}
+
+// TestAccMonitor_discoverySourceClearedOutOfBand exercises the clearing
+// mechanism this provider actually offers, and it is deliberately not a
+// Terraform-side one.
+//
+// Optional+Computed buys the guarantee above at a stated price: deleting the
+// attributes from a configuration keeps the stored identity rather than
+// clearing it, and Terraform cannot tell "I omitted this" from "I want this
+// gone". So the supported route to un-discovering a monitor is an explicit
+// PATCH with two nulls — the API, the MCP `update_monitor` tool or the
+// dashboard — which the next refresh adopts.
+//
+// That only works if two things hold, and both are asserted here: the refresh
+// must report the clear rather than echoing the prior state back, and the
+// following plan must be EMPTY. A configuration that never mentioned the source
+// must not put it back.
+func TestAccMonitor_discoverySourceClearedOutOfBand(t *testing.T) {
+	const cfg = `
+resource "lastping_monitor" "unsrc" {
+  name          = "acc-source-oob"
+  slug          = "acc-source-oob"
+  schedule_kind = "simple"
+  period_s      = 3600
+  grace_s       = 300
+}`
+	var monitorID string
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "lastping_monitor" "unsrc" {
+  name          = "acc-source-oob"
+  slug          = "acc-source-oob"
+  schedule_kind = "simple"
+  period_s      = 3600
+  grace_s       = 300
+  source_kind   = "systemd-timer"
+  source_ref    = "backup.timer"
+}`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("lastping_monitor.unsrc", "source_kind", "systemd-timer"),
+					resource.TestCheckResourceAttrWith("lastping_monitor.unsrc", "id", func(v string) error {
+						monitorID = v
+						return nil
+					}),
+				),
+			},
+			{
+				// Drop the attributes from the configuration first, so the
+				// clear below is genuinely out-of-band rather than something a
+				// still-configured value would immediately restore.
+				Config:   cfg,
+				PlanOnly: true,
+			},
+			{
+				PreConfig: func() {
+					c := testAccDirectClient(t)
+					mon, err := c.GetMonitor(context.Background(), monitorID)
+					require.NoError(t, err)
+					// Two explicit nulls, together. One alone is 400
+					// SOURCE_INCOMPLETE: half an identity is not an identity.
+					// "" would NOT clear — the API reads it as "leave it
+					// alone" — which is exactly why the provider never sends
+					// one.
+					_, err = c.UpdateMonitor(context.Background(), monitorID, client.MonitorPatch{
+						"name":          mon.Name,
+						"schedule_kind": mon.ScheduleKind,
+						"period_s":      mon.PeriodS,
+						"tz":            mon.TZ,
+						"grace_s":       mon.GraceS,
+						"source_kind":   nil,
+						"source_ref":    nil,
+					})
+					require.NoError(t, err)
+				},
+				// No Config: a RefreshState step reuses the previous step's,
+				// which is already the source-free one.
+				RefreshState: true,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr("lastping_monitor.unsrc", "source_kind"),
+					resource.TestCheckNoResourceAttr("lastping_monitor.unsrc", "source_ref"),
+				),
+			},
+			{
+				// And it stays cleared: an unwritten Optional+Computed
+				// attribute keeps its stored value, and the stored value is now
+				// null. Nothing puts the identity back.
+				Config:   cfg,
+				PlanOnly: true,
+			},
+		},
+	})
+}
+
+// TestAccMonitor_discoverySourceHalfRejected: exactly one half of the identity
+// is refused at plan time, before a round trip.
+//
+// The API answers 400 SOURCE_INCOMPLETE, and it is right to: a row carrying
+// source_kind with a NULL source_ref falls outside the partial unique index
+// entirely, so it could be created any number of times and would match no
+// reconcile lookup, while still reading as "discovered" everywhere it is
+// displayed.
+func TestAccMonitor_discoverySourceHalfRejected(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "lastping_monitor" "half" {
+  name          = "acc-source-half"
+  slug          = "acc-source-half"
+  schedule_kind = "simple"
+  period_s      = 3600
+  grace_s       = 300
+  source_kind   = "github-actions"
+}`,
+				ExpectError: regexp.MustCompile(`(?s)source_ref.*must all be specified|` +
+					`Invalid Attribute Combination`),
+				PlanOnly: true,
+			},
+		},
+	})
+}
+
+// TestAccMonitor_discoverySourceKindMustBeMachineName: a scanner name that is
+// not a lowercase machine identifier is refused at plan time.
+//
+// The reconcile key is compared byte-for-byte by a unique index, so "GitHub
+// Actions" and "github-actions" are two different identities for one scanner.
+// A scanner whose spelling drifted between releases would rediscover, and
+// re-create, every monitor it had already made.
+func TestAccMonitor_discoverySourceKindMustBeMachineName(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "lastping_monitor" "badkind" {
+  name          = "acc-source-badkind"
+  slug          = "acc-source-badkind"
+  schedule_kind = "simple"
+  period_s      = 3600
+  grace_s       = 300
+  source_kind   = "GitHub Actions"
+  source_ref    = ".github/workflows/nightly.yml#build"
+}`,
+				ExpectError: regexp.MustCompile(`(?s)source_kind|lowercase`),
+				PlanOnly:    true,
+			},
+		},
+	})
+}
+
+// TestAccMonitor_discoverySourceAlreadyMonitored pins the 409 a practitioner is
+// most likely to actually hit, and pins that the CODE reaches them.
+//
+// Two monitors claiming one source would make every later discovery run
+// ambiguous, so the API refuses the second — and that refusal is the feature,
+// not an obstacle: it is precisely what stops a re-run of a scan from
+// duplicating every monitor. A generic "409 conflict" would send someone
+// looking for a slug collision instead.
+func TestAccMonitor_discoverySourceAlreadyMonitored(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "lastping_monitor" "first" {
+  name          = "acc-source-dup-a"
+  slug          = "acc-source-dup-a"
+  schedule_kind = "simple"
+  period_s      = 3600
+  grace_s       = 300
+  source_kind   = "k8s-cronjob"
+  source_ref    = "default/nightly-etl"
+}`,
+			},
+			{
+				// A second monitor, a different slug, the same identity.
+				Config: `
+resource "lastping_monitor" "first" {
+  name          = "acc-source-dup-a"
+  slug          = "acc-source-dup-a"
+  schedule_kind = "simple"
+  period_s      = 3600
+  grace_s       = 300
+  source_kind   = "k8s-cronjob"
+  source_ref    = "default/nightly-etl"
+}
+
+resource "lastping_monitor" "second" {
+  name          = "acc-source-dup-b"
+  slug          = "acc-source-dup-b"
+  schedule_kind = "simple"
+  period_s      = 3600
+  grace_s       = 300
+  source_kind   = "k8s-cronjob"
+  source_ref    = "default/nightly-etl"
+}`,
+				ExpectError: regexp.MustCompile(`SOURCE_ALREADY_MONITORED`),
+			},
+		},
+	})
+}
+
+// TestAccMonitor_discoverySourceDataSource pins the read-only surfaces: a
+// discovered monitor reports both halves, and a hand-made one reports null on
+// both rather than an empty string.
+//
+// The null half is the one worth an acceptance test of its own. `source_kind ==
+// ""` versus `source_kind == null` is the difference between a configuration
+// that can ask "was this discovered?" and one that cannot.
+func TestAccMonitor_discoverySourceDataSource(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "lastping_monitor" "discovered" {
+  name          = "acc-source-ds"
+  slug          = "acc-source-ds"
+  schedule_kind = "simple"
+  period_s      = 3600
+  grace_s       = 300
+  source_kind   = "github-actions"
+  source_ref    = ".github/workflows/release.yml#publish"
+}
+
+resource "lastping_monitor" "handmade" {
+  name          = "acc-source-ds-hand"
+  slug          = "acc-source-ds-hand"
+  schedule_kind = "simple"
+  period_s      = 3600
+  grace_s       = 300
+}
+
+data "lastping_monitor" "discovered" {
+  slug       = lastping_monitor.discovered.slug
+  depends_on = [lastping_monitor.discovered]
+}
+
+data "lastping_monitor" "handmade" {
+  slug       = lastping_monitor.handmade.slug
+  depends_on = [lastping_monitor.handmade]
+}`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("data.lastping_monitor.discovered",
+						"source_kind", "github-actions"),
+					resource.TestCheckResourceAttr("data.lastping_monitor.discovered",
+						"source_ref", ".github/workflows/release.yml#publish"),
+					resource.TestCheckNoResourceAttr("data.lastping_monitor.handmade", "source_kind"),
+					resource.TestCheckNoResourceAttr("data.lastping_monitor.handmade", "source_ref"),
+				),
+			},
+		},
+	})
+}

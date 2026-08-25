@@ -102,6 +102,12 @@ The binding's `ci_workflow` and `ci_branch` filters have no attribute here, and 
 - `runaway_ceiling` (Number) Cap on pings per rolling 1-hour window, above which a `runaway` incident opens. Null when disabled.
 - `schedule_kind` (String) `simple` (fixed `period_s`) or `cron` (`cron_expr` + `tz`).
 - `slug` (String) Stable, project-scoped identifier. Null for a monitor created without one.
+- `source_kind` (String) **Discovery source identity, part 1 of 2.** The scanner that discovered this monitor: `crontab`, `github-actions`, `k8s-cronjob`, `systemd-timer`. **Null when a human created the monitor**, which is the state of every monitor that predates discovery — and such a monitor is never reconciled, so a scan can neither adopt nor delete it.
+
+Use it to tell apart the monitors a scan owns from the ones you wrote by hand, without importing either.
+- `source_ref` (String) **Discovery source identity, part 2 of 2.** The stable path within `source_kind` that identifies exactly what was found, such as `.github/workflows/nightly.yml#build`. Together with `source_kind` and the project it is the discovery reconcile key.
+
+Always either both present or both null with `source_kind`: a database CHECK constraint makes a half-set identity unrepresentable.
 - `status` (String) Current status: `new`, `up`, `late`, or `down`.
 - `step_timeout_s` (Number) How long an armed run may go without reporting a step before a `stalled` incident opens, in seconds. Null when unset, in which case stall detection is off. Always strictly below the effective run budget (`max_runtime_s`, or `grace_s` when that is unset), and never set on an `http` monitor.
 - `tags` (Set of String) Labels attached to this monitor. Empty when it has none.

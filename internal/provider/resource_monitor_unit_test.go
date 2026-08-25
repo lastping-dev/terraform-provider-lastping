@@ -713,6 +713,15 @@ func TestMonitorOptionalOnlyAttributesAreNotComputed(t *testing.T) {
 			"%s is only ever supplied by the configuration, so Computed would make it impossible to unset", name)
 	}
 
+	// source_kind and source_ref are deliberately NOT in the list above, and
+	// this is the one place that fact is visible next to the rule it breaks.
+	// They are Optional+Computed, which is exactly the shape this test refuses
+	// everywhere else — and for once "pins the previous value" is the correct
+	// behaviour rather than the bug, because the value is a reconcile key and
+	// the alternative silently destroys it. See TestMonitorSourceIsOptionalComputed,
+	// which pins that from the other direction, and the source_kind schema
+	// description for the reasoning and the cost.
+
 	// The converse: these are genuinely server-supplied and must stay Computed.
 	for _, name := range []string{
 		"grace_s", "monitor_type", "schedule_kind", "period_s", "tz", "failure_threshold",
@@ -1171,6 +1180,8 @@ func TestResolveUnknownsFromState_CoversEveryAttribute(t *testing.T) {
 		CiBranch:             types.StringValue("release"),
 		CiWebhookURL:         types.StringValue("https://ingest.lastping.dev/ci/gitlab/3f7c1f5a-1a2b-4c3d-8e9f-0a1b2c3d4e5f"),
 		CiSecret:             types.StringValue("a3f8c2d1e4b7a9f0c3d2e1b4a7f8c0d3"),
+		SourceKind:           types.StringValue("github-actions"),
+		SourceRef:            types.StringValue(".github/workflows/nightly.yml#build"),
 		ProbeURL:             types.StringValue("https://example.com/health"),
 		ProbeMethod:          types.StringValue("HEAD"),
 		ProbeIntervalS:       types.Int64Value(120),
@@ -1333,5 +1344,478 @@ func TestMonitorOnDemandSchedule(t *testing.T) {
 			PeriodS:      types.Int64Value(3600),
 		})
 		require.False(t, diags.HasError(), "%v", diags)
+	})
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Discovery source identity (source_kind / source_ref)
+//
+// These are the reconcile key that makes a discovery scan re-runnable, and the
+// tests below are organised around the three ways it can be silently destroyed
+// rather than around the three functions that touch it. Each of the three was
+// found by review on the API side and each has a matching hazard here:
+//
+//  1. sending "" (which the API reads as "leave it alone", never as a clear);
+//  2. sending null because the CONFIGURATION does not mention the pair — the
+//     normal state after importing a discovered monitor, and the case that
+//     would clear the identity on the first unrelated apply;
+//  3. reading an absent field back as "" instead of null, which is a permanent
+//     diff on every hand-made monitor in a user's configuration.
+//
+// None of the three is loud. All three are only visible as a duplicate monitor
+// on somebody's next scan, or as a plan that never converges.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// TestMonitorSourceIsOptionalComputed pins the schema decision the other tests
+// in this section depend on, and it is the one guardrail here whose absence
+// would not fail anything else.
+//
+// Optional+Computed is the deliberate exception to
+// TestMonitorOptionalOnlyAttributesAreNotComputed's rule, and it looks exactly
+// like the mistake that test exists to prevent — so the temptation to "fix" it
+// into plain Optional is real and this is what refuses it. Plain Optional plans
+// null for an attribute the configuration does not mention, and null on this
+// pair means CLEAR: the identity would be destroyed on the first apply after an
+// import, and the next scan would create a second monitor for the same source.
+//
+// UseStateForUnknown is half of the same decision, not decoration. Without it
+// the unwritten attribute stays unknown through the plan, which is both a
+// permanent "known after apply" diff and a value monitorFromModel would render
+// as "".
+func TestMonitorSourceIsOptionalComputed(t *testing.T) {
+	s := monitorSchema(t)
+	for _, name := range []string{"source_kind", "source_ref"} {
+		attr, ok := s.Attributes[name].(schema.StringAttribute)
+		require.True(t, ok, "missing attribute %s", name)
+		require.True(t, attr.IsOptional(), "%s must be configurable", name)
+		require.True(t, attr.IsComputed(),
+			"%s must be Computed: a plain Optional attribute plans null when the configuration does "+
+				"not mention it, and null CLEARS a discovery identity", name)
+		require.Len(t, attr.PlanModifiers, 1, "%s needs UseStateForUnknown", name)
+
+		// Exercised rather than type-asserted: what matters is the BEHAVIOUR
+		// that an attribute left unknown by an omitted configuration plans as
+		// the stored value. A modifier of the right type that did something
+		// else would pass an identity check and still lose the identity.
+		//
+		// State.Raw and Plan.Raw have to be real: UseStateForUnknown returns
+		// early on a null state (a create, where there is nothing to carry
+		// forward) and on a null plan (a destroy), and a zero-value request
+		// looks exactly like the former.
+		s := monitorSchema(t)
+		raw := monitorRawValue(t, monitorResourceModel{
+			Name:         types.StringValue("acc"),
+			ScheduleKind: types.StringValue("simple"),
+			PeriodS:      types.Int64Value(3600),
+			SourceKind:   types.StringValue("github-actions"),
+			SourceRef:    types.StringValue(".github/workflows/nightly.yml#build"),
+		})
+		resp := &planmodifier.StringResponse{PlanValue: types.StringUnknown()}
+		attr.PlanModifiers[0].PlanModifyString(context.Background(), planmodifier.StringRequest{
+			State:       tfsdk.State{Raw: raw, Schema: s},
+			Plan:        tfsdk.Plan{Raw: raw, Schema: s},
+			StateValue:  types.StringValue("github-actions"),
+			PlanValue:   types.StringUnknown(),
+			ConfigValue: types.StringNull(),
+		}, resp)
+		require.Equal(t, types.StringValue("github-actions"), resp.PlanValue,
+			"%s must plan its STORED value when the configuration does not mention it; an unknown "+
+				"here is both a permanent \"known after apply\" diff and a value that serialises as \"\"",
+			name)
+	}
+}
+
+// TestMonitorSourceKindValidators mirrors api/check_source.go's sourceKindRe and
+// maxSourceKindLen at plan time.
+//
+// The pattern is load-bearing for re-runnability, not tidiness: the reconcile
+// key is compared byte-for-byte by a unique index, so "GitHub Actions" and
+// "github-actions" are two different identities for one scanner, and a scanner
+// whose spelling drifts between releases rediscovers and re-creates every
+// monitor it already made.
+func TestMonitorSourceKindValidators(t *testing.T) {
+	for _, ok := range []string{"crontab", "github-actions", "k8s-cronjob", "systemd-timer", "s3"} {
+		require.False(t, validateString(t, "source_kind", ok).Diagnostics.HasError(),
+			"%q is a legal scanner name", ok)
+	}
+	for _, bad := range []string{
+		"GitHub Actions", "github_actions", "github-", "-github", "github--actions", "",
+	} {
+		require.True(t, validateString(t, "source_kind", bad).Diagnostics.HasError(),
+			"%q must be refused at plan time: the reconcile key is compared byte-for-byte", bad)
+	}
+	long := ""
+	for range 65 {
+		long += "a"
+	}
+	require.True(t, validateString(t, "source_kind", long).Diagnostics.HasError(),
+		"source_kind is capped at 64 characters server-side")
+}
+
+// TestMonitorSourceRefValidators pins the 512-character cap and, more
+// interestingly, the FLOOR.
+//
+// The cap is a real server limit rather than a style rule: (project_id,
+// source_kind, source_ref) is a btree unique index, and an oversized tuple
+// fails the INSERT with an internal error rather than a usable 400.
+//
+// The floor is the plan-time half of hazard 1. A configured "" would be sent
+// verbatim by any faithful serializer, and the API reads "" on this pair as
+// "leave the stored value alone" — so it would apply with a 200, change
+// nothing, and leave a configuration claiming a ref the monitor does not have.
+// Refusing it here is what makes that state unreachable.
+func TestMonitorSourceRefValidators(t *testing.T) {
+	require.False(t,
+		validateString(t, "source_ref", ".github/workflows/nightly.yml#build").Diagnostics.HasError())
+	require.True(t, validateString(t, "source_ref", "").Diagnostics.HasError(),
+		"an empty source_ref must be refused: the API reads \"\" as \"leave it alone\", not as a clear")
+
+	long := ""
+	for range 513 {
+		long += "a"
+	}
+	require.True(t, validateString(t, "source_ref", long).Diagnostics.HasError(),
+		"source_ref is capped at 512 characters server-side")
+}
+
+// TestMonitorSourceRequiredTogether pins the set-together rule at plan time.
+//
+// The API answers 400 SOURCE_INCOMPLETE for exactly one of the pair, because
+// half an identity reconciles against nothing: a row carrying source_kind with
+// a NULL source_ref falls outside the partial unique index entirely, so it
+// could be created any number of times while still reading as "discovered"
+// everywhere it is displayed.
+func TestMonitorSourceRequiredTogether(t *testing.T) {
+	validators := (&monitorResource{}).ConfigValidators(context.Background())
+	require.Len(t, validators, 1)
+
+	run := func(m monitorResourceModel) diag.Diagnostics {
+		t.Helper()
+		req := resource.ValidateConfigRequest{
+			Config: tfsdk.Config{Raw: monitorRawValue(t, m), Schema: monitorSchema(t)},
+		}
+		resp := &resource.ValidateConfigResponse{}
+		validators[0].ValidateResource(context.Background(),
+			resource.ValidateConfigRequest{Config: req.Config}, resp)
+		return resp.Diagnostics
+	}
+
+	base := monitorResourceModel{
+		Name:         types.StringValue("acc"),
+		ScheduleKind: types.StringValue("simple"),
+		PeriodS:      types.Int64Value(3600),
+	}
+
+	neither := base
+	require.False(t, run(normaliseMonitorSets(context.Background(), neither)).HasError(),
+		"a configuration mentioning neither half is the normal state for a hand-made monitor, and "+
+			"for an imported discovered one")
+
+	both := base
+	both.SourceKind = types.StringValue("github-actions")
+	both.SourceRef = types.StringValue(".github/workflows/nightly.yml#build")
+	require.False(t, run(normaliseMonitorSets(context.Background(), both)).HasError())
+
+	kindOnly := base
+	kindOnly.SourceKind = types.StringValue("github-actions")
+	require.True(t, run(normaliseMonitorSets(context.Background(), kindOnly)).HasError(),
+		"source_kind alone is 400 SOURCE_INCOMPLETE server-side")
+
+	refOnly := base
+	refOnly.SourceRef = types.StringValue(".github/workflows/nightly.yml#build")
+	require.True(t, run(normaliseMonitorSets(context.Background(), refOnly)).HasError(),
+		"source_ref alone is 400 SOURCE_INCOMPLETE server-side")
+}
+
+// TestMonitorSourcePatchOmitsKeysWhenUnconfigured is THE test in this section.
+//
+// It is hazard 2, and it is the one that destroys data. `desired` holds the
+// stored identity — that is what UseStateForUnknown and resolveUnknownsFromState
+// leave behind for an attribute the configuration does not mention — while `cfg`
+// is null for both, because the practitioner wrote neither. That is not an
+// exotic state: it is what every configuration looks like after
+// `terraform import` of a discovered monitor, and after every `export_terraform`
+// whose source lines were deleted for an older provider.
+//
+// Every neighbouring clearable attribute in monitorPatchFromModel answers that
+// shape with an explicit null, and an explicit null here CLEARS the reconcile
+// key. The next scan would not recognise the monitor and would create a second
+// one for the same source — the exact duplicate the key exists to prevent,
+// produced by an apply that only renamed something.
+//
+// So the assertion is about absence, and it is deliberately not
+// `require.Nil(patch["source_kind"])`: a map lookup of a missing key returns nil
+// too, and this test would pass against the very bug it exists to catch.
+func TestMonitorSourcePatchOmitsKeysWhenUnconfigured(t *testing.T) {
+	ctx := context.Background()
+
+	desired := monitorResourceModel{
+		Name:         types.StringValue("acc-renamed"),
+		ScheduleKind: types.StringValue("simple"),
+		PeriodS:      types.Int64Value(3600),
+		Tags:         types.SetNull(types.StringType),
+		// The stored identity, carried into the plan by UseStateForUnknown.
+		SourceKind: types.StringValue("github-actions"),
+		SourceRef:  types.StringValue(".github/workflows/nightly.yml#build"),
+	}
+	// The configuration mentions neither half.
+	cfg := desired
+	cfg.SourceKind = types.StringNull()
+	cfg.SourceRef = types.StringNull()
+
+	patch, err := monitorPatchFromModel(ctx, desired, cfg)
+	require.NoError(t, err)
+
+	_, hasKind := patch["source_kind"]
+	_, hasRef := patch["source_ref"]
+	require.False(t, hasKind,
+		"source_kind must be ABSENT from the patch, not null: a null clears the reconcile key, and "+
+			"an unwritten attribute is the normal state after importing a discovered monitor")
+	require.False(t, hasRef, "source_ref must be absent for the same reason")
+
+	// And the document really did carry the rename, so this is not passing
+	// because nothing was built at all.
+	require.Equal(t, "acc-renamed", patch["name"])
+}
+
+// TestMonitorSourcePatchSendsBothWhenConfigured: a configured pair is sent, as
+// a pair, with no empty string anywhere.
+//
+// Both keys go even when only one changed. The API resolves the two together —
+// whatever the request and the stored row combine to must be both set or both
+// empty — so a lone key relies on the stored value to complete the identity,
+// and a lone `{"source_ref": ...}` against a monitor with no source is a 400.
+func TestMonitorSourcePatchSendsBothWhenConfigured(t *testing.T) {
+	ctx := context.Background()
+
+	cfg := monitorResourceModel{
+		Name:         types.StringValue("acc"),
+		ScheduleKind: types.StringValue("simple"),
+		PeriodS:      types.Int64Value(3600),
+		Tags:         types.SetNull(types.StringType),
+		SourceKind:   types.StringValue("crontab"),
+		SourceRef:    types.StringValue("/etc/cron.d/backup#0 4 * * *"),
+	}
+
+	patch, err := monitorPatchFromModel(ctx, cfg, cfg)
+	require.NoError(t, err)
+	require.Equal(t, "crontab", patch["source_kind"])
+	require.Equal(t, "/etc/cron.d/backup#0 4 * * *", patch["source_ref"])
+}
+
+// TestMonitorSourcePatchNeverSendsEmptyString is hazard 1 at the serializer,
+// behind the plan-time validators that already make a configured "" unreachable.
+//
+// It is defence in depth on purpose. "" is the single most dangerous value this
+// pair can carry, because it is the one the API reads as the OPPOSITE of what a
+// caller means: not "clear this", but "leave it alone". A serializer that ever
+// emitted it would produce applies that report success and change nothing,
+// forever.
+func TestMonitorSourcePatchNeverSendsEmptyString(t *testing.T) {
+	ctx := context.Background()
+
+	cfg := monitorResourceModel{
+		Name:         types.StringValue("acc"),
+		ScheduleKind: types.StringValue("simple"),
+		PeriodS:      types.Int64Value(3600),
+		Tags:         types.SetNull(types.StringType),
+		SourceKind:   types.StringValue(""),
+		SourceRef:    types.StringValue(""),
+	}
+
+	patch, err := monitorPatchFromModel(ctx, cfg, cfg)
+	require.NoError(t, err)
+	_, hasKind := patch["source_kind"]
+	_, hasRef := patch["source_ref"]
+	require.False(t, hasKind, "an empty source_kind must never reach the wire")
+	require.False(t, hasRef, "an empty source_ref must never reach the wire")
+
+	// Nor may it appear anywhere in the encoded document, which is the form the
+	// API actually reads.
+	encoded, err := json.Marshal(patch)
+	require.NoError(t, err)
+	require.NotContains(t, string(encoded), `"source_kind"`)
+	require.NotContains(t, string(encoded), `"source_ref"`)
+}
+
+// TestMonitorSourceCreatePayloadOmitsUnset: the create half of hazard 1.
+//
+// On create, an Optional+Computed attribute the configuration does not mention
+// is UNKNOWN, and ValueString() renders an unknown as "". client.Monitor's
+// `omitempty` is what turns that into an absent key rather than the
+// leave-it-alone empty string, and this pins it on the encoded bytes rather
+// than on the struct, because `omitempty` is the only thing standing between
+// the two.
+func TestMonitorSourceCreatePayloadOmitsUnset(t *testing.T) {
+	ctx := context.Background()
+
+	unset := monitorResourceModel{
+		Name:         types.StringValue("acc"),
+		ScheduleKind: types.StringValue("simple"),
+		PeriodS:      types.Int64Value(3600),
+		Tags:         types.SetNull(types.StringType),
+		SourceKind:   types.StringUnknown(),
+		SourceRef:    types.StringUnknown(),
+	}
+	payload, err := monitorFromModel(ctx, unset)
+	require.NoError(t, err)
+	encoded, err := json.Marshal(payload)
+	require.NoError(t, err)
+	require.NotContains(t, string(encoded), "source_kind")
+	require.NotContains(t, string(encoded), "source_ref")
+
+	set := unset
+	set.SourceKind = types.StringValue("k8s-cronjob")
+	set.SourceRef = types.StringValue("default/nightly-etl")
+	payload, err = monitorFromModel(ctx, set)
+	require.NoError(t, err)
+	require.Equal(t, "k8s-cronjob", payload.SourceKind)
+	require.Equal(t, "default/nightly-etl", payload.SourceRef)
+}
+
+// TestMonitorSourceReadsAbsentAsNull is hazard 3.
+//
+// The API's checkResponse carries both fields with `omitempty`, so a monitor a
+// human created — every monitor that predates discovery, and the overwhelming
+// majority of monitors in any real configuration — omits both keys, which
+// decode as "". Mapping that to StringValue("") would put an empty string into
+// state where the configuration says null, which is a diff on every plan
+// forever and is never resolvable, because no configuration can produce a "".
+//
+// The second half is the mirror: a real value must survive, or an imported
+// discovered monitor would arrive with no identity at all.
+func TestMonitorSourceReadsAbsentAsNull(t *testing.T) {
+	ctx := context.Background()
+	prior := monitorResourceModel{Tags: types.SetNull(types.StringType)}
+
+	handMade := &client.Monitor{
+		ID: "3f7c1f5a-1a2b-4c3d-8e9f-0a1b2c3d4e5f", Name: "acc",
+		MonitorType: "heartbeat", ScheduleKind: "simple", PeriodS: 3600, TZ: "UTC", GraceS: 1800,
+	}
+	got, err := modelFromMonitor(ctx, handMade, prior)
+	require.NoError(t, err)
+	require.True(t, got.SourceKind.IsNull(),
+		"a monitor with no source must read as null, not as an empty string")
+	require.True(t, got.SourceRef.IsNull(), "likewise for source_ref")
+
+	discovered := *handMade
+	discovered.SourceKind = "github-actions"
+	discovered.SourceRef = ".github/workflows/nightly.yml#build"
+	got, err = modelFromMonitor(ctx, &discovered, prior)
+	require.NoError(t, err)
+	require.Equal(t, types.StringValue("github-actions"), got.SourceKind)
+	require.Equal(t, types.StringValue(".github/workflows/nightly.yml#build"), got.SourceRef)
+}
+
+// TestMonitorSourceClearedOutOfBandReadsAsNull pins the read behaviour that
+// makes the documented clearing route work at all.
+//
+// Clearing an identity is deliberately not something deleting the attributes
+// from a configuration does — that is the whole point of Optional+Computed —
+// so the supported route is an out-of-band clear (PATCH with two nulls, the MCP
+// tool, or the dashboard) that the next refresh adopts. That only converges if
+// the read reports the clear rather than echoing the prior state back, which is
+// exactly why this pair does NOT use writeOnlyString despite superficially
+// resembling ci_workflow/ci_branch: here "" is a real answer ("this monitor has
+// no source"), not the API declining to report a value it holds.
+func TestMonitorSourceClearedOutOfBandReadsAsNull(t *testing.T) {
+	ctx := context.Background()
+
+	// Prior state says the monitor is discovered; the server now says it is not.
+	prior := monitorResourceModel{
+		Tags:       types.SetNull(types.StringType),
+		SourceKind: types.StringValue("github-actions"),
+		SourceRef:  types.StringValue(".github/workflows/nightly.yml#build"),
+	}
+	cleared := &client.Monitor{
+		ID: "3f7c1f5a-1a2b-4c3d-8e9f-0a1b2c3d4e5f", Name: "acc",
+		MonitorType: "heartbeat", ScheduleKind: "simple", PeriodS: 3600, TZ: "UTC", GraceS: 1800,
+	}
+
+	got, err := modelFromMonitor(ctx, cleared, prior)
+	require.NoError(t, err)
+	require.True(t, got.SourceKind.IsNull(),
+		"a source cleared outside Terraform must surface, not be masked by the prior state")
+	require.True(t, got.SourceRef.IsNull(), "likewise for source_ref")
+}
+
+// TestMonitorSourcePatchNeededSeesASourceChange: a source change is a real
+// diff, not a no-op apply.
+//
+// monitorPatchNeeded gates the PATCH entirely, comparing two models through
+// monitorFromModel. An attribute monitorFromModel does not carry is invisible
+// to it, so a configuration that changed only the source would issue a GET and
+// report success without writing anything.
+func TestMonitorSourcePatchNeededSeesASourceChange(t *testing.T) {
+	ctx := context.Background()
+
+	state := monitorResourceModel{
+		Name:         types.StringValue("acc"),
+		ScheduleKind: types.StringValue("simple"),
+		PeriodS:      types.Int64Value(3600),
+		Tags:         types.SetNull(types.StringType),
+		SourceKind:   types.StringValue("github-actions"),
+		SourceRef:    types.StringValue(".github/workflows/nightly.yml#build"),
+	}
+
+	same, err := monitorPatchNeeded(ctx, state, state)
+	require.NoError(t, err)
+	require.False(t, same, "an unchanged source must not force a write")
+
+	moved := state
+	moved.SourceRef = types.StringValue(".github/workflows/nightly.yml#publish")
+	changed, err := monitorPatchNeeded(ctx, moved, state)
+	require.NoError(t, err)
+	require.True(t, changed, "a moved source_ref is a real change and must reach PATCH")
+}
+
+// TestAddSourceConflictDiag: both 409s are surfaced with their code, and
+// nothing else is swallowed.
+//
+// The two conflicts are about the same pair of fields and mean entirely
+// different things — "somebody else already holds this identity" versus "you
+// asked the wrong endpoint to change one" — so a shared "conflict" diagnostic
+// would leave a practitioner with no way to tell which happened. The code is
+// the searchable part of the answer, so it goes in the title.
+func TestAddSourceConflictDiag(t *testing.T) {
+	const (
+		kind = "github-actions"
+		ref  = ".github/workflows/nightly.yml#build"
+	)
+
+	t.Run("already monitored", func(t *testing.T) {
+		var diags diag.Diagnostics
+		err := &client.Problem{
+			Status: 409,
+			Detail: "a monitor already exists for source github-actions .github/workflows/nightly.yml#build",
+			Code:   "SOURCE_ALREADY_MONITORED",
+		}
+		require.True(t, addSourceConflictDiag(&diags, err, kind, ref))
+		require.True(t, diags.HasError())
+		require.Contains(t, diags.Errors()[0].Summary(), "SOURCE_ALREADY_MONITORED")
+		require.Contains(t, diags.Errors()[0].Detail(), ref)
+	})
+
+	t.Run("immutable on upsert", func(t *testing.T) {
+		var diags diag.Diagnostics
+		err := &client.Problem{
+			Status: 409,
+			Detail: "source_kind/source_ref cannot be changed through a slug upsert",
+			Code:   "SOURCE_IMMUTABLE_ON_UPSERT",
+		}
+		require.True(t, addSourceConflictDiag(&diags, err, kind, ref))
+		require.True(t, diags.HasError())
+		require.Contains(t, diags.Errors()[0].Summary(), "SOURCE_IMMUTABLE_ON_UPSERT")
+	})
+
+	t.Run("anything else is left to the caller", func(t *testing.T) {
+		var diags diag.Diagnostics
+		err := &client.Problem{Status: 409, Detail: "some other conflict", Code: "SLUG_TAKEN"}
+		require.False(t, addSourceConflictDiag(&diags, err, kind, ref))
+		require.False(t, diags.HasError(),
+			"an unrelated error must fall through to the generic diagnostic, not be relabelled")
+
+		require.False(t, addSourceConflictDiag(&diags, fmt.Errorf("dial tcp: timeout"), kind, ref),
+			"a transport error carries no problem code at all")
 	})
 }
