@@ -71,7 +71,13 @@ output "ci_api_key_prefix" {
 
 ### Optional
 
-- `expires_at` (String) RFC 3339 timestamp after which the key stops authenticating, for example `2027-01-01T00:00:00Z`. Must be in the future. Omit for a key that never expires. The API cannot change a key's expiry, so changing this replaces the key.
+- `expires_at` (String) RFC 3339 timestamp after which the key stops authenticating, for example `2027-01-01T00:00:00Z`. Must be in the future.
+
+Omit it for a key that never expires — unless the credential running Terraform expires itself, in which case the server gives the new key its creator's expiry, because a key may never outlive the key that minted it. That server-assigned value is read back into state, so an omitted `expires_at` can come back populated; it is not drift and no later plan proposes a change for it.
+
+A configured value beyond the creating key's own expiry is refused by the API, with the ceiling reported as `max_expires_at` — it is never quietly lowered.
+
+The API cannot change a key's expiry, so changing this replaces the key. REMOVING it does not: with nothing configured Terraform keeps whatever expiry the key already has, so minting a never-expiring replacement takes `terraform apply -replace`.
 
 ### Read-Only
 

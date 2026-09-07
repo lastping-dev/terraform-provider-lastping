@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
@@ -112,13 +113,45 @@ func (r *apiKeyResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 					"prefix. The API has no rename path, so changing this replaces the key.",
 				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
 			},
+			// Optional AND Computed: the server has the last word on a key's
+			// expiry. A key may not outlive the key that minted it
+			// (api/apikeys_api.go: handleCreateAPIKey), so an apply
+			// authenticated with an expiring key can be handed an expires_at it
+			// never asked for. Optional alone fails that apply outright with
+			// "Provider produced inconsistent result after apply".
+			//
+			// UseStateForUnknown is what stops the perpetual diff Optional+Computed
+			// otherwise creates: with nothing configured the attribute plans as
+			// unknown on every run — including the ordinary never-expires case,
+			// where state is null — and each plan then proposes a change to a
+			// resource that must never be replaced casually, because replacing a
+			// key revokes a live credential.
+			//
+			// RequiresReplaceIfConfigured, not RequiresReplace: replacement is for
+			// a practitioner CHANGING a configured expiry. A server-assigned value
+			// arriving in state for a config that says nothing is not a config
+			// change and must not revoke the key.
 			"expires_at": schema.StringAttribute{
 				Optional: true,
+				Computed: true,
 				MarkdownDescription: "RFC 3339 timestamp after which the key stops authenticating, for " +
-					"example `2027-01-01T00:00:00Z`. Must be in the future. Omit for a key that never " +
-					"expires. The API cannot change a key's expiry, so changing this replaces the key.",
-				Validators:    []validator.String{rfc3339Validator{}, futureTimestampValidator{}},
-				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
+					"example `2027-01-01T00:00:00Z`. Must be in the future.\n\n" +
+					"Omit it for a key that never expires — unless the credential running Terraform " +
+					"expires itself, in which case the server gives the new key its creator's expiry, " +
+					"because a key may never outlive the key that minted it. That server-assigned " +
+					"value is read back into state, so an omitted `expires_at` can come back " +
+					"populated; it is not drift and no later plan proposes a change for it.\n\n" +
+					"A configured value beyond the creating key's own expiry is refused by the API, " +
+					"with the ceiling reported as `max_expires_at` — it is never quietly lowered.\n\n" +
+					"The API cannot change a key's expiry, so changing this replaces the key. " +
+					"REMOVING it does not: with nothing configured Terraform keeps whatever expiry " +
+					"the key already has, so minting a never-expiring replacement takes " +
+					"`terraform apply -replace`.",
+				Validators: []validator.String{rfc3339Validator{}, futureTimestampValidator{}},
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+					stringplanmodifier.RequiresReplaceIfConfigured(),
+				},
 			},
 
 			"prefix": schema.StringAttribute{
@@ -188,6 +221,40 @@ func expiresAtValue(apiVal *time.Time, prior types.String) types.String {
 	return types.StringValue(apiVal.UTC().Format(time.RFC3339))
 }
 
+// expiresAtConflict reports whether the server's answer contradicts an expiry
+// the practitioner actually configured, and returns the API's own value for the
+// diagnostic.
+//
+// It never fires for a configuration that omitted expires_at: there the server's
+// value IS the answer, which is the whole point of the attribute being Computed.
+// It fires only when a configured value was not honoured — either a different
+// instant, or no expiry at all for a key that was asked to have one.
+//
+// Today the API refuses such a request outright (a 400 carrying max_expires_at),
+// so this cannot be reached from the hosted backend; it exists because the
+// alternative to reporting it is far worse than an unreachable branch. Writing a
+// server value over a configured one would either be swallowed by the Computed
+// attribute or surface as Terraform's own "Provider produced inconsistent result
+// after apply", which reads as a provider bug and names neither the ceiling nor
+// the fix. A key whose expiry is not the one that was requested is a credential
+// with the wrong lifetime, which is exactly the kind of thing a practitioner has
+// to be told about rather than left to notice.
+func expiresAtConflict(configured types.String, apiVal *time.Time) (*time.Time, bool) {
+	if configured.IsNull() || configured.IsUnknown() {
+		return nil, false
+	}
+	want, err := time.Parse(time.RFC3339, configured.ValueString())
+	if err != nil {
+		// Not this function's error to report: Create already rejects an
+		// unparseable value before it ever reaches the API.
+		return nil, false
+	}
+	if apiVal == nil {
+		return nil, true
+	}
+	return apiVal, !apiVal.Equal(want)
+}
+
 // modelFromAPIKey builds Terraform state from an API response.
 //
 // SECURITY / CORRECTNESS: the plaintext key is absent from every response except
@@ -229,15 +296,25 @@ func (r *apiKeyResource) Create(ctx context.Context, req resource.CreateRequest,
 		return
 	}
 
+	// The CONFIG, not the plan, decides what is sent: expires_at is Computed, so
+	// a plan value can be the server's own answer carried forward rather than
+	// anything the practitioner wrote. Only a configured value may be requested,
+	// and only a configured value can be contradicted afterwards.
+	var config apiKeyResourceModel
+	resp.Diagnostics.Append(req.Config.Get(ctx, &config)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
 	var expiresAt *time.Time
-	if !plan.ExpiresAt.IsNull() && !plan.ExpiresAt.IsUnknown() {
-		t, err := time.Parse(time.RFC3339, plan.ExpiresAt.ValueString())
+	if !config.ExpiresAt.IsNull() && !config.ExpiresAt.IsUnknown() {
+		t, err := time.Parse(time.RFC3339, config.ExpiresAt.ValueString())
 		if err != nil {
 			// Unreachable via configuration — rfc3339Validator rejects this at
 			// plan time — but a bad value must not be silently sent as "never
 			// expires", which is the failure mode that matters here.
 			resp.Diagnostics.AddError("Invalid expires_at",
-				fmt.Sprintf("%q is not an RFC 3339 timestamp: %s", plan.ExpiresAt.ValueString(), err))
+				fmt.Sprintf("%q is not an RFC 3339 timestamp: %s", config.ExpiresAt.ValueString(), err))
 			return
 		}
 		expiresAt = &t
@@ -256,8 +333,36 @@ func (r *apiKeyResource) Create(ctx context.Context, req resource.CreateRequest,
 		return
 	}
 
+	// State is written BEFORE any expiry complaint below, and deliberately: the
+	// key exists on the server now, and a Create that errors without saving
+	// state leaves a live credential nothing in Terraform knows about. With
+	// state saved, the error is a normal failed apply the practitioner can fix
+	// and re-plan, and the stray key is destroyed rather than orphaned.
 	state := modelFromAPIKey(out, plan)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	if got, conflict := expiresAtConflict(config.ExpiresAt, out.ExpiresAt); conflict {
+		served := "never expires"
+		advice := "Remove expires_at, or report this as a bug: a key that was asked to expire and " +
+			"does not is a credential with the wrong lifetime."
+		if got != nil {
+			served = "expires " + got.UTC().Format(time.RFC3339)
+			advice = "Set expires_at to " + got.UTC().Format(time.RFC3339) + " or earlier, or run " +
+				"Terraform with a credential that lives at least as long as the key it mints."
+		}
+		resp.Diagnostics.AddAttributeError(path.Root("expires_at"),
+			"Server did not honour the configured expiry",
+			fmt.Sprintf("The key %q (id %s) was created, but it %s rather than at the configured "+
+				"%s.\n\n"+
+				"A key may not outlive the key that created it, so an expiry beyond the creating "+
+				"key's own is refused or capped. %s\n\n"+
+				"The minted key is recorded in state, so it is not orphaned; the next apply "+
+				"replaces it.",
+				out.Name, out.ID, served, config.ExpiresAt.ValueString(), advice))
+	}
 }
 
 // Read refreshes metadata only. The plaintext key can never be retrieved again,
