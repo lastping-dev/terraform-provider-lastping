@@ -54,6 +54,89 @@ func testAccKeyIsRejected(key string) error {
 	return nil
 }
 
+// testAccCreatingKeyExpiry returns the expiry of the key the provider itself
+// authenticates with — the parent of every key this suite mints — or nil when
+// that key never expires. It is matched by prefix, which is the non-secret
+// handle for a key; the plaintext goes nowhere.
+//
+// It reports failure as an error rather than calling t.Fatal, because its caller
+// is a TestCheckFunc: t.Fatal there runs on the test framework's own goroutine
+// handling and skips the rest of the check chain, where a returned error is
+// reported as the step failure it actually is.
+func testAccCreatingKeyExpiry(t *testing.T) (*time.Time, error) {
+	t.Helper()
+	plaintext := os.Getenv("LASTPING_API_KEY")
+	keys, err := testAccDirectClient(t).ListAPIKeys(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("listing keys to find the creating key: %w", err)
+	}
+	for i := range keys {
+		if keys[i].Prefix != "" && strings.HasPrefix(plaintext, keys[i].Prefix) {
+			return keys[i].ExpiresAt, nil
+		}
+	}
+	return nil, errors.New("the configured LASTPING_API_KEY does not appear in its own project's key list")
+}
+
+// testAccCheckExpiryInheritedFromCreator asserts what an OMITTED expires_at may
+// read back as, and it is the assertion the monorepo's provider-acceptance job
+// pins LASTPING_SEED_KEY_EXPIRY=never to avoid (see .github/workflows/ci.yml
+// there): it replaces a flat TestCheckNoResourceAttr, which could only ever hold
+// for a permanent creating key.
+//
+// A key may not outlive the key that minted it, so with an expiring creating key
+// the server may hand back its expiry for a config that asked for nothing. Two
+// values are therefore legitimate and NOTHING else is:
+//
+//   - absent — the creating key never expires, or LP_API_KEY_INHERIT_EXPIRY is
+//     off on the backend, which is how the flag ships until this behaviour is
+//     released;
+//   - exactly the creating key's own expiry — inheritance, on.
+//
+// An arbitrary other timestamp fails, so this does not degrade into "any value
+// is fine": the inherited value must be the parent's, to the second.
+func testAccCheckExpiryInheritedFromCreator(t *testing.T, name string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		rs, ok := s.RootModule().Resources[name]
+		if !ok {
+			return fmt.Errorf("%s not found in state", name)
+		}
+		got := rs.Primary.Attributes["expires_at"]
+		parent, err := testAccCreatingKeyExpiry(t)
+		if err != nil {
+			return err
+		}
+		if got == "" {
+			if parent == nil {
+				return nil
+			}
+			// Inheritance disabled server-side. Legitimate, and worth saying out
+			// loud: the interesting half of this test did not run.
+			t.Logf("expires_at absent while the creating key expires at %s: "+
+				"LP_API_KEY_INHERIT_EXPIRY is off on this backend",
+				parent.UTC().Format(time.RFC3339))
+			return nil
+		}
+		if parent == nil {
+			return fmt.Errorf("expires_at is %q for a config that omitted it, "+
+				"and the creating key never expires — nothing could have set it", got)
+		}
+		gotTime, err := time.Parse(time.RFC3339, got)
+		if err != nil {
+			return fmt.Errorf("expires_at %q is not an RFC 3339 timestamp: %w", got, err)
+		}
+		// To the second, because that is the precision state can hold: the
+		// column keeps microseconds, and the provider writes timestamps with
+		// time.RFC3339, which drops the fraction. Comparing instants would fail
+		// on a sub-second tail that no plan can ever see.
+		if want := parent.UTC().Format(time.RFC3339); gotTime.UTC().Format(time.RFC3339) != want {
+			return fmt.Errorf("inherited expires_at is %s, but the creating key expires at %s",
+				gotTime.UTC().Format(time.RFC3339), want)
+		}
+		return nil
+	}
+}
+
 // TestAccAPIKey_lifecycle is the managed resource's core contract: the server
 // mints a key, the plaintext comes back exactly once and lands in state, that
 // plaintext really authenticates, a rename replaces the key (the API has no
@@ -79,9 +162,9 @@ resource "lastping_api_key" "k" {
 					resource.TestCheckResourceAttr("lastping_api_key.k", "name", "acc-managed-key"),
 					resource.TestCheckResourceAttrSet("lastping_api_key.k", "id"),
 					resource.TestCheckResourceAttrSet("lastping_api_key.k", "created_at"),
-					// expires_at was not configured, so it must read back absent
-					// rather than as an empty string.
-					resource.TestCheckNoResourceAttr("lastping_api_key.k", "expires_at"),
+					// expires_at was not configured, so it reads back absent — or,
+					// under an expiring creating key, as that key's own expiry.
+					testAccCheckExpiryInheritedFromCreator(t, "lastping_api_key.k"),
 					// Nothing has authenticated with this key yet — Create mints it
 					// but never uses it — so last_used_at must read back absent too.
 					resource.TestCheckNoResourceAttr("lastping_api_key.k", "last_used_at"),
@@ -120,6 +203,19 @@ resource "lastping_api_key" "k" {
 					// and last_used_at must have flipped from absent to set.
 					resource.TestCheckResourceAttrSet("lastping_api_key.k", "last_used_at"),
 				),
+			},
+			{
+				// The apply-then-plan property, against the real backend: whatever
+				// the server decided about expires_at for a config that omits it
+				// must produce an EMPTY plan. Both halves can break this — a
+				// server-assigned value read into a non-Computed attribute, and a
+				// Computed attribute planning as unknown every run — and either
+				// one proposes replacing a live credential on every apply.
+				Config: `
+resource "lastping_api_key" "k" {
+  name = "acc-managed-key"
+}`,
+				PlanOnly: true,
 			},
 			{
 				// Renaming replaces: the API cannot rename a key.

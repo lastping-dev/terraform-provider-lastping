@@ -5,7 +5,7 @@ subcategory: ""
 description: |-
   A LastPing API key, for automation that needs a credential outliving the Terraform run that created it.
   ~> The plaintext key is stored in Terraform state. sensitive only obscures CLI output; it does not affect storage. Use a remote backend with encryption at rest and restricted access, and treat state as a credential store. For a key that only needs to exist during a run, prefer the ephemeral lastping_api_key, which is never persisted and is revoked when the run ends.
-  The API mints a key once and never lets it be read again or changed, so every configurable attribute forces replacement and there is no import: an imported key could never populate key. Replacing a key revokes the old one, so anything still presenting it stops authenticating — plan rotations with create_before_destroy if that matters.
+  The API mints a key once and never lets it be read again or changed, so there is no update path and no import: an imported key could never populate key. Changing name, or changing a configured expires_at, replaces the key; REMOVING expires_at from configuration changes nothing, because the expiry the key already has is kept — mint a never-expiring key with terraform apply -replace instead. Replacing a key revokes the old one, so anything still presenting it stops authenticating — plan rotations with create_before_destroy if that matters.
 ---
 
 # lastping_api_key (Resource)
@@ -14,7 +14,7 @@ A LastPing API key, for automation that needs a credential outliving the Terrafo
 
 ~> **The plaintext key is stored in Terraform state.** `sensitive` only obscures CLI output; it does not affect storage. Use a remote backend with encryption at rest and restricted access, and treat state as a credential store. For a key that only needs to exist during a run, prefer the **ephemeral** `lastping_api_key`, which is never persisted and is revoked when the run ends.
 
-The API mints a key once and never lets it be read again or changed, so every configurable attribute forces replacement and there is no import: an imported key could never populate `key`. Replacing a key revokes the old one, so anything still presenting it stops authenticating — plan rotations with `create_before_destroy` if that matters.
+The API mints a key once and never lets it be read again or changed, so there is no update path and no import: an imported key could never populate `key`. Changing `name`, or changing a configured `expires_at`, replaces the key; REMOVING `expires_at` from configuration changes nothing, because the expiry the key already has is kept — mint a never-expiring key with `terraform apply -replace` instead. Replacing a key revokes the old one, so anything still presenting it stops authenticating — plan rotations with `create_before_destroy` if that matters.
 
 ## Example Usage
 
@@ -71,7 +71,13 @@ output "ci_api_key_prefix" {
 
 ### Optional
 
-- `expires_at` (String) RFC 3339 timestamp after which the key stops authenticating, for example `2027-01-01T00:00:00Z`. Must be in the future. Omit for a key that never expires. The API cannot change a key's expiry, so changing this replaces the key.
+- `expires_at` (String) RFC 3339 timestamp after which the key stops authenticating, for example `2027-01-01T00:00:00Z`. Must be in the future.
+
+Omit it for a key that never expires — unless the credential running Terraform expires itself, in which case the server gives the new key its creator's expiry, because a key may never outlive the key that minted it. That server-assigned value is read back into state, so an omitted `expires_at` can come back populated; it is not drift and no later plan proposes a change for it.
+
+A configured value beyond the creating key's own expiry is refused by the API, with the ceiling reported as `max_expires_at` — it is never quietly lowered.
+
+The API cannot change a key's expiry, so changing this replaces the key. REMOVING it does not: with nothing configured Terraform keeps whatever expiry the key already has, so minting a never-expiring replacement takes `terraform apply -replace`.
 
 ### Read-Only
 
