@@ -58,20 +58,24 @@ func testAccKeyIsRejected(key string) error {
 // authenticates with — the parent of every key this suite mints — or nil when
 // that key never expires. It is matched by prefix, which is the non-secret
 // handle for a key; the plaintext goes nowhere.
-func testAccCreatingKeyExpiry(t *testing.T) *time.Time {
+//
+// It reports failure as an error rather than calling t.Fatal, because its caller
+// is a TestCheckFunc: t.Fatal there runs on the test framework's own goroutine
+// handling and skips the rest of the check chain, where a returned error is
+// reported as the step failure it actually is.
+func testAccCreatingKeyExpiry(t *testing.T) (*time.Time, error) {
 	t.Helper()
 	plaintext := os.Getenv("LASTPING_API_KEY")
 	keys, err := testAccDirectClient(t).ListAPIKeys(context.Background())
 	if err != nil {
-		t.Fatalf("listing keys to find the creating key: %v", err)
+		return nil, fmt.Errorf("listing keys to find the creating key: %w", err)
 	}
 	for i := range keys {
 		if keys[i].Prefix != "" && strings.HasPrefix(plaintext, keys[i].Prefix) {
-			return keys[i].ExpiresAt
+			return keys[i].ExpiresAt, nil
 		}
 	}
-	t.Fatal("the configured LASTPING_API_KEY does not appear in its own project's key list")
-	return nil
+	return nil, errors.New("the configured LASTPING_API_KEY does not appear in its own project's key list")
 }
 
 // testAccCheckExpiryInheritedFromCreator asserts what an OMITTED expires_at may
@@ -98,7 +102,10 @@ func testAccCheckExpiryInheritedFromCreator(t *testing.T, name string) resource.
 			return fmt.Errorf("%s not found in state", name)
 		}
 		got := rs.Primary.Attributes["expires_at"]
-		parent := testAccCreatingKeyExpiry(t)
+		parent, err := testAccCreatingKeyExpiry(t)
+		if err != nil {
+			return err
+		}
 		if got == "" {
 			if parent == nil {
 				return nil

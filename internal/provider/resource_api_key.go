@@ -97,10 +97,13 @@ func (r *apiKeyResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 			"restricted access, and treat state as a credential store. For a key that only needs to " +
 			"exist during a run, prefer the **ephemeral** `lastping_api_key`, which is never " +
 			"persisted and is revoked when the run ends.\n\n" +
-			"The API mints a key once and never lets it be read again or changed, so every " +
-			"configurable attribute forces replacement and there is no import: an imported key could " +
-			"never populate `key`. Replacing a key revokes the old one, so anything still presenting " +
-			"it stops authenticating — plan rotations with `create_before_destroy` if that matters.",
+			"The API mints a key once and never lets it be read again or changed, so there is no " +
+			"update path and no import: an imported key could never populate `key`. Changing `name`, " +
+			"or changing a configured `expires_at`, replaces the key; REMOVING `expires_at` from " +
+			"configuration changes nothing, because the expiry the key already has is kept — mint a " +
+			"never-expiring key with `terraform apply -replace` instead. Replacing a key revokes the " +
+			"old one, so anything still presenting it stops authenticating — plan rotations with " +
+			"`create_before_destroy` if that matters.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				Computed:            true,
@@ -390,12 +393,17 @@ func (r *apiKeyResource) Read(ctx context.Context, req resource.ReadRequest, res
 	resp.Diagnostics.Append(resp.State.Set(ctx, &newState)...)
 }
 
-// Update is unreachable: every configurable attribute is RequiresReplace,
-// because the API has no key-update endpoint at all.
+// Update is unreachable, and stays unreachable now that expires_at is
+// Optional+Computed. The API has no key-update endpoint at all, so nothing here
+// can change in place: a changed name or a changed configured expires_at is a
+// replacement, and an expires_at REMOVED from configuration plans as no change
+// whatsoever, because Terraform carries the prior value forward for an
+// Optional+Computed attribute with a null config.
 func (r *apiKeyResource) Update(_ context.Context, _ resource.UpdateRequest, resp *resource.UpdateResponse) {
 	resp.Diagnostics.AddError("API keys cannot be updated in place",
-		"Every configurable attribute of lastping_api_key forces replacement, so this should not "+
-			"be reachable. Report this as a provider bug.")
+		"lastping_api_key has no in-place change: every configured attribute that can change "+
+			"forces replacement, and an attribute dropped from configuration keeps its current "+
+			"value. Reaching this is a provider bug — please report it.")
 }
 
 func (r *apiKeyResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {

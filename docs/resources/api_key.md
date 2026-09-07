@@ -5,7 +5,7 @@ subcategory: ""
 description: |-
   A LastPing API key, for automation that needs a credential outliving the Terraform run that created it.
   ~> The plaintext key is stored in Terraform state. sensitive only obscures CLI output; it does not affect storage. Use a remote backend with encryption at rest and restricted access, and treat state as a credential store. For a key that only needs to exist during a run, prefer the ephemeral lastping_api_key, which is never persisted and is revoked when the run ends.
-  The API mints a key once and never lets it be read again or changed, so every configurable attribute forces replacement and there is no import: an imported key could never populate key. Replacing a key revokes the old one, so anything still presenting it stops authenticating — plan rotations with create_before_destroy if that matters.
+  The API mints a key once and never lets it be read again or changed, so there is no update path and no import: an imported key could never populate key. Changing name, or changing a configured expires_at, replaces the key; REMOVING expires_at from configuration changes nothing, because the expiry the key already has is kept — mint a never-expiring key with terraform apply -replace instead. Replacing a key revokes the old one, so anything still presenting it stops authenticating — plan rotations with create_before_destroy if that matters.
 ---
 
 # lastping_api_key (Resource)
@@ -14,7 +14,7 @@ A LastPing API key, for automation that needs a credential outliving the Terrafo
 
 ~> **The plaintext key is stored in Terraform state.** `sensitive` only obscures CLI output; it does not affect storage. Use a remote backend with encryption at rest and restricted access, and treat state as a credential store. For a key that only needs to exist during a run, prefer the **ephemeral** `lastping_api_key`, which is never persisted and is revoked when the run ends.
 
-The API mints a key once and never lets it be read again or changed, so every configurable attribute forces replacement and there is no import: an imported key could never populate `key`. Replacing a key revokes the old one, so anything still presenting it stops authenticating — plan rotations with `create_before_destroy` if that matters.
+The API mints a key once and never lets it be read again or changed, so there is no update path and no import: an imported key could never populate `key`. Changing `name`, or changing a configured `expires_at`, replaces the key; REMOVING `expires_at` from configuration changes nothing, because the expiry the key already has is kept — mint a never-expiring key with `terraform apply -replace` instead. Replacing a key revokes the old one, so anything still presenting it stops authenticating — plan rotations with `create_before_destroy` if that matters.
 
 ## Example Usage
 
