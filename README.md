@@ -71,6 +71,18 @@ supply it either:
   sensitive, but present in configuration and state — prefer the
   environment variable).
 
+**Key scopes.** Every LastPing key carries a scope: `read` (every GET), `write`
+(everything except API key management) or `admin` (everything, key management
+included). A new key gets `write` unless it asks for something else — that
+default is the API's, not the provider's, so omitting `scope` on a
+`lastping_api_key` means "let the API decide for a new key, and leave an
+existing key's scope alone". `write` is enough for every resource here
+**except** `lastping_api_key` — managing keys is precisely what `write` excludes
+— so a configuration that creates API keys must be run with an `admin` key. A run that only needs key-management power for its own duration can mint a
+short-lived one with the ephemeral resource's `scope = "admin"`; keys minted
+that way are revoked with it, so anything that must outlive the run has to be
+created by a credential that does.
+
 ### Provider configuration
 
 | Attribute  | Env var             | Required | Description                                                  |
@@ -107,6 +119,15 @@ docker compose exec -T postgres psql -U lastping -d lastping -c \
 Because this is checked once, centrally, in `testAccPreCheck`, every acceptance
 test fails with those instructions rather than skipping — there is no longer a
 code path where the suite passes against a project missing this seed.
+
+**The scope tests need no extra seeding.** `TestAccAPIKey_scopeCapIsEnforcedByTheServer`
+mints its own `write` key with the configured key and authenticates a second,
+aliased provider with it, because the seeded acceptance key is always `admin`
+(the monorepo's `scripts/seed-acc-key.sh` inserts the row without a scope, so it
+takes the column default). The test accepts either refusal — the create-time
+scope cap (400, `max_scope`) or, once `LP_API_KEY_SCOPES_ENFORCE` is on, the
+route's own 403 (`required_scope`) — since which one arrives is a server-side
+flag this repository does not control.
 
 **`TestAccStatusPage_importOfForeignSlugIsNotFound` additionally wants a SECOND,
 distinct project's API key**, in `LASTPING_ACC_FOREIGN_API_KEY`, to prove

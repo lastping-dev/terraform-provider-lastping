@@ -5,7 +5,8 @@ subcategory: ""
 description: |-
   A LastPing API key, for automation that needs a credential outliving the Terraform run that created it.
   ~> The plaintext key is stored in Terraform state. sensitive only obscures CLI output; it does not affect storage. Use a remote backend with encryption at rest and restricted access, and treat state as a credential store. For a key that only needs to exist during a run, prefer the ephemeral lastping_api_key, which is never persisted and is revoked when the run ends.
-  The API mints a key once and never lets it be read again or changed, so there is no update path and no import: an imported key could never populate key. Changing name, or changing a configured expires_at, replaces the key; REMOVING expires_at from configuration changes nothing, because the expiry the key already has is kept — mint a never-expiring key with terraform apply -replace instead. Replacing a key revokes the old one, so anything still presenting it stops authenticating — plan rotations with create_before_destroy if that matters.
+  The API mints a key once and never lets it be read again or changed, so there is no update path and no import: an imported key could never populate key. Changing name, or changing a configured expires_at or scope, replaces the key; REMOVING either of those from configuration changes nothing, because the expiry and the scope the key already has are kept — mint a never-expiring or lower-scoped key with terraform apply -replace instead. Replacing a key revokes the old one, so anything still presenting it stops authenticating — plan rotations with create_before_destroy if that matters.
+  ~> Destroying this resource revokes every key this key created, recursively. The API cascades revocation down the created_by_key_id chain in one transaction, so a key minted by this key — including one minted by a lastping_api_key resource that used it, or by an agent through the MCP server — stops authenticating at the same moment. That is what stops a compromised credential outliving its own revocation, and it makes terraform destroy (or any change that replaces this key) reach further than the one resource in the plan.
 ---
 
 # lastping_api_key (Resource)
@@ -14,7 +15,9 @@ A LastPing API key, for automation that needs a credential outliving the Terrafo
 
 ~> **The plaintext key is stored in Terraform state.** `sensitive` only obscures CLI output; it does not affect storage. Use a remote backend with encryption at rest and restricted access, and treat state as a credential store. For a key that only needs to exist during a run, prefer the **ephemeral** `lastping_api_key`, which is never persisted and is revoked when the run ends.
 
-The API mints a key once and never lets it be read again or changed, so there is no update path and no import: an imported key could never populate `key`. Changing `name`, or changing a configured `expires_at`, replaces the key; REMOVING `expires_at` from configuration changes nothing, because the expiry the key already has is kept — mint a never-expiring key with `terraform apply -replace` instead. Replacing a key revokes the old one, so anything still presenting it stops authenticating — plan rotations with `create_before_destroy` if that matters.
+The API mints a key once and never lets it be read again or changed, so there is no update path and no import: an imported key could never populate `key`. Changing `name`, or changing a configured `expires_at` or `scope`, replaces the key; REMOVING either of those from configuration changes nothing, because the expiry and the scope the key already has are kept — mint a never-expiring or lower-scoped key with `terraform apply -replace` instead. Replacing a key revokes the old one, so anything still presenting it stops authenticating — plan rotations with `create_before_destroy` if that matters.
+
+~> **Destroying this resource revokes every key this key created, recursively.** The API cascades revocation down the `created_by_key_id` chain in one transaction, so a key minted *by* this key — including one minted by a `lastping_api_key` resource that used it, or by an agent through the MCP server — stops authenticating at the same moment. That is what stops a compromised credential outliving its own revocation, and it makes `terraform destroy` (or any change that replaces this key) reach further than the one resource in the plan.
 
 ## Example Usage
 
@@ -32,6 +35,51 @@ resource "lastping_api_key" "ci" {
   # Optional, and strongly recommended: a key that expires is a leak with an
   # end date. Must be RFC 3339 and in the future.
   expires_at = "2027-01-01T00:00:00Z"
+
+  # Optional. Omit it and the API chooses: a new key gets the API's own default
+  # of "write", which is what a CI job wants — it can report pings and manage
+  # monitors, and it cannot mint itself a replacement key that would survive
+  # this one's revocation. Written out here because it is worth being explicit
+  # about what a credential may do.
+  scope = "write"
+}
+
+# A read-only key, for a dashboard, a scraper or an agent that only ever looks.
+resource "lastping_api_key" "grafana" {
+  name  = "grafana"
+  scope = "read"
+}
+
+# An admin key can manage API keys — including creating and revoking them — so
+# it is the only scope that can run Terraform configurations like this one.
+#
+# A key may never be given a higher scope than the key that mints it, so this
+# apply only succeeds when the credential the provider is configured with is
+# itself admin; otherwise the API refuses with the ceiling in `max_scope`.
+resource "lastping_api_key" "platform" {
+  name       = "platform-team"
+  scope      = "admin"
+  expires_at = "2027-01-01T00:00:00Z"
+}
+
+# Removing `scope` from a configuration changes NOTHING: the key keeps the scope
+# it already has, the same way `expires_at` behaves. That matters for keys that
+# predate scopes — every one of them is "admin" on the server — because the
+# alternative would be a provider upgrade proposing to revoke them. Demote a key
+# deliberately with `terraform apply -replace`, remembering that replacing a key
+# revokes the old one and everything below it.
+
+# Destroying an API key resource REVOKES EVERY KEY IT CREATED, recursively: the
+# API walks the created_by_key_id chain in one transaction. So destroying
+# `platform` above also revokes anything minted with it — by another Terraform
+# run, by an agent over MCP, or by hand — and those consumers stop
+# authenticating at the same moment.
+#
+# `created_by_key_id` is the other half of that chain, and it is read back into
+# state: it names the key this one was minted by, or is null for a key created
+# from the dashboard.
+output "ci_api_key_parent" {
+  value = lastping_api_key.ci.created_by_key_id
 }
 
 # Rotation. `name` and `expires_at` both force replacement, and Terraform
@@ -78,10 +126,20 @@ Omit it for a key that never expires — unless the credential running Terraform
 A configured value beyond the creating key's own expiry is refused by the API, with the ceiling reported as `max_expires_at` — it is never quietly lowered.
 
 The API cannot change a key's expiry, so changing this replaces the key. REMOVING it does not: with nothing configured Terraform keeps whatever expiry the key already has, so minting a never-expiring replacement takes `terraform apply -replace`.
+- `scope` (String) What the key may do: `read` (every GET), `write` (everything except API key management) or `admin` (everything, key management included).
+
+Omit it and the API chooses: a new key gets the API's own default, which is `write` — the tier a credential handed to CI or to an agent should have, since it can do the work and cannot mint itself a replacement that survives its own revocation. That server-assigned value is read back into state, so an omitted `scope` can come back populated; it is not drift and no later plan proposes a change for it.
+
+**A key may not be given a higher scope than the key that mints it.** Asking for one is refused by the API with the ceiling reported as `max_scope` — so a Terraform run authenticating with a `write` key cannot create an `admin` key, whatever the configuration says.
+
+The API cannot change a key's scope, so changing a configured `scope` replaces the key — which revokes the old one, and every key that old key created. REMOVING it does not: with nothing configured Terraform keeps whatever scope the key already has, so demoting a key takes `terraform apply -replace`. Keys that predate scopes are `admin`, and that is why the removal case must never replace on its own.
 
 ### Read-Only
 
 - `created_at` (String) RFC 3339 UTC timestamp when the key was created.
+- `created_by_key_id` (String) UUID of the API key that minted this one — the key the provider was configured with. Null for a key created from a dashboard session, which has no parent key, and for one whose parent has since been deleted.
+
+It is the lineage the API's cascading revocation walks: revoking a key revokes every key whose `created_by_key_id` chain leads back to it.
 - `id` (String) API key UUID, assigned by the server. Not a credential.
 - `key` (String, Sensitive) The plaintext API key (`lp_…`). **Stored in Terraform state** — see the warning above. The API returns it exactly once, on creation, so it is held in state rather than refreshed; a key whose state entry is lost cannot be recovered and must be replaced.
 - `last_used_at` (String) RFC 3339 UTC timestamp of the most recent request this key authenticated. Null until the key is used for the first time. The API records this on every authenticated request, so it can change between one `terraform apply` and the next with nothing in configuration to compare it against — Terraform's refresh absorbs that silently, the same way it already does for a monitor's `due_at` and `next_probe_at`; it surfaces only under the opt-in `terraform plan -refresh-only`.

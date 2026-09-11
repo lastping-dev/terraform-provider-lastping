@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/ephemeral"
 	"github.com/hashicorp/terraform-plugin-framework/ephemeral/schema"
@@ -88,8 +89,9 @@ type apiKeyEphemeralResource struct {
 // ephemeral.lastping_api_key. Unlike the managed resource's model, none of this
 // is ever written to plan or state.
 type apiKeyEphemeralModel struct {
-	Name types.String `tfsdk:"name"`
-	TTL  types.String `tfsdk:"ttl"`
+	Name  types.String `tfsdk:"name"`
+	TTL   types.String `tfsdk:"ttl"`
+	Scope types.String `tfsdk:"scope"`
 
 	ID     types.String `tfsdk:"id"`
 	Prefix types.String `tfsdk:"prefix"`
@@ -131,6 +133,10 @@ func (e *apiKeyEphemeralResource) Schema(_ context.Context, _ ephemeral.SchemaRe
 			"in place — Terraform is asked to check in shortly before expiry and warns if a run is " +
 			"about to outlive its credential. Set `ttl` to comfortably exceed the longest apply you " +
 			"expect.\n\n" +
+			"Set `scope` when the run needs more than the API's default of `write` — in particular " +
+			"`scope = \"admin\"` for an aliased provider that has to manage API keys, since key " +
+			"management is exactly what `write` excludes. Note that keys minted through such a " +
+			"provider are revoked with it: see `scope`.\n\n" +
 			"Requires Terraform 1.10 or later. For a key that must outlive the run, use the " +
 			"`lastping_api_key` **managed resource** — and read its warning about state first.",
 		Attributes: map[string]schema.Attribute{
@@ -145,6 +151,35 @@ func (e *apiKeyEphemeralResource) Schema(_ context.Context, _ ephemeral.SchemaRe
 					"Defaults to `\"1h\"`. This becomes the key's server-side `expires_at`, so it bounds " +
 					"the damage of a run that dies before revoking its key.",
 				Validators: []validator.String{durationValidator{}},
+			},
+			// No Default, unlike the managed resource: an ephemeral schema has
+			// no Computed-with-Default shape to hang one on, so an omitted scope
+			// sends no scope at all and the SERVER applies its default — which
+			// is `write`, the same value. The difference is invisible from
+			// configuration and stated in the description rather than encoded
+			// twice.
+			"scope": schema.StringAttribute{
+				Optional: true,
+				MarkdownDescription: "What the key may do: `read` (every GET), `write` (everything " +
+					"except API key management) or `admin` (everything, key management included). " +
+					"Omitted, the API applies its own default of `write`.\n\n" +
+					"`admin` is the reason to set this. A run whose ephemeral key has to manage API " +
+					"keys — list, mint or revoke them — needs key-management power, and `write` is " +
+					"precisely everything except that, so an aliased provider fed by this resource " +
+					"must ask for `admin` explicitly:\n\n" +
+					"```terraform\n" +
+					"ephemeral \"lastping_api_key\" \"admin\" {\n" +
+					"  name  = \"terraform-run\"\n" +
+					"  scope = \"admin\"\n" +
+					"}\n" +
+					"```\n\n" +
+					"**A key may not be given a higher scope than the key that mints it**, so this " +
+					"can only reach `admin` when the provider's own credential is already `admin`.\n\n" +
+					"~> A key minted THROUGH this one does not outlive the run either: revocation " +
+					"cascades down the lineage, so when this key is revoked at the end of the run, " +
+					"every key it created goes with it. Mint keys that must survive the run with a " +
+					"credential that survives the run.",
+				Validators: []validator.String{stringvalidator.OneOf(apiKeyScopes...)},
 			},
 
 			"id": schema.StringAttribute{
@@ -230,10 +265,16 @@ func (e *apiKeyEphemeralResource) Open(ctx context.Context, req ephemeral.OpenRe
 	}
 
 	expiresAt := time.Now().Add(ttl)
-	key, err := e.client.CreateAPIKey(ctx, cfg.Name.ValueString(), &expiresAt)
+	scope := configuredScope(cfg.Scope)
+	key, err := e.client.CreateAPIKey(ctx, client.CreateAPIKeyInput{
+		Name:      cfg.Name.ValueString(),
+		ExpiresAt: &expiresAt,
+		Scope:     scope,
+	})
 	if err != nil {
 		// err never contains key material: the plaintext exists only in a 2xx body.
-		resp.Diagnostics.AddError("Unable to create ephemeral API key", err.Error())
+		summary, detail := apiKeyCreateDiagnostic(scope, err, "Unable to create ephemeral API key")
+		resp.Diagnostics.AddError(summary, detail)
 		return
 	}
 	if key.Key == "" {

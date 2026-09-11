@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
@@ -77,11 +78,13 @@ type apiKeyResourceModel struct {
 	ID        types.String `tfsdk:"id"`
 	Name      types.String `tfsdk:"name"`
 	ExpiresAt types.String `tfsdk:"expires_at"`
+	Scope     types.String `tfsdk:"scope"`
 
-	Prefix     types.String `tfsdk:"prefix"`
-	CreatedAt  types.String `tfsdk:"created_at"`
-	LastUsedAt types.String `tfsdk:"last_used_at"`
-	Key        types.String `tfsdk:"key"`
+	Prefix         types.String `tfsdk:"prefix"`
+	CreatedAt      types.String `tfsdk:"created_at"`
+	LastUsedAt     types.String `tfsdk:"last_used_at"`
+	CreatedByKeyID types.String `tfsdk:"created_by_key_id"`
+	Key            types.String `tfsdk:"key"`
 }
 
 func (r *apiKeyResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -99,11 +102,19 @@ func (r *apiKeyResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 			"persisted and is revoked when the run ends.\n\n" +
 			"The API mints a key once and never lets it be read again or changed, so there is no " +
 			"update path and no import: an imported key could never populate `key`. Changing `name`, " +
-			"or changing a configured `expires_at`, replaces the key; REMOVING `expires_at` from " +
-			"configuration changes nothing, because the expiry the key already has is kept — mint a " +
-			"never-expiring key with `terraform apply -replace` instead. Replacing a key revokes the " +
+			"or changing a configured `expires_at` or `scope`, replaces the key; REMOVING either of " +
+			"those from configuration changes nothing, because the expiry and the scope the key " +
+			"already has are kept — mint a never-expiring or lower-scoped key with " +
+			"`terraform apply -replace` instead. Replacing a key revokes the " +
 			"old one, so anything still presenting it stops authenticating — plan rotations with " +
-			"`create_before_destroy` if that matters.",
+			"`create_before_destroy` if that matters.\n\n" +
+			"~> **Destroying this resource revokes every key this key created, recursively.** The API " +
+			"cascades revocation down the `created_by_key_id` chain in one transaction, so a key " +
+			"minted *by* this key — including one minted by a `lastping_api_key` resource that used " +
+			"it, or by an agent through the MCP server — stops authenticating at the same moment. " +
+			"That is what stops a compromised credential outliving its own revocation, and it makes " +
+			"`terraform destroy` (or any change that replaces this key) reach further than the one " +
+			"resource in the plan.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				Computed:            true,
@@ -157,6 +168,57 @@ func (r *apiKeyResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				},
 			},
 
+			// Optional AND Computed with NO Default, exactly like expires_at
+			// above, and for the same reason: the server decides for a
+			// configuration that says nothing, and a value already on the key
+			// must survive a plan untouched.
+			//
+			// A Default here was a REVOCATION HAZARD, which is worth writing
+			// down because it is not obvious from the framework's docs. A
+			// Default is re-applied on EVERY plan (fwserver's
+			// TransformDefaults, not only on create) wherever the CONFIG is
+			// null — it never looks at the value carried forward from prior
+			// state. So `Default: "write"` + RequiresReplace meant that a key
+			// which is `admin` on the server (every key minted before the
+			// scope column existed is, by that migration's grandfathering
+			// clause) and whose configuration predates this attribute would be
+			// planned down to `write` and REPLACED — revoking a live
+			// credential, and cascading to every key it ever minted, on a bare
+			// provider upgrade with no user action at all.
+			//
+			// RequiresReplaceIfConfigured, therefore: replacement is for a
+			// practitioner CHANGING a scope they wrote down. An omitted scope
+			// means "whatever this key already has", and demoting a key is
+			// `terraform apply -replace`, the same deliberate act expires_at
+			// asks for.
+			"scope": schema.StringAttribute{
+				Optional: true,
+				Computed: true,
+				MarkdownDescription: "What the key may do: `read` (every GET), `write` (everything " +
+					"except API key management) or `admin` (everything, key management included).\n\n" +
+					"Omit it and the API chooses: a new key gets the API's own default, which is " +
+					"`write` — the tier a credential handed to CI or to an agent should have, since " +
+					"it can do the work and cannot mint itself a replacement that survives its own " +
+					"revocation. That server-assigned value is read back into state, so an omitted " +
+					"`scope` can come back populated; it is not drift and no later plan proposes a " +
+					"change for it.\n\n" +
+					"**A key may not be given a higher scope than the key that mints it.** Asking for " +
+					"one is refused by the API with the ceiling reported as `max_scope` — so a " +
+					"Terraform run authenticating with a `write` key cannot create an `admin` key, " +
+					"whatever the configuration says.\n\n" +
+					"The API cannot change a key's scope, so changing a configured `scope` replaces " +
+					"the key — which revokes the old one, and every key that old key created. " +
+					"REMOVING it does not: with nothing configured Terraform keeps whatever scope the " +
+					"key already has, so demoting a key takes `terraform apply -replace`. Keys that " +
+					"predate scopes are `admin`, and that is why the removal case must never replace " +
+					"on its own.",
+				Validators: []validator.String{stringvalidator.OneOf(apiKeyScopes...)},
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+					stringplanmodifier.RequiresReplaceIfConfigured(),
+				},
+			},
+
 			"prefix": schema.StringAttribute{
 				Computed: true,
 				MarkdownDescription: "First 10 characters of the key (`lp_…`). Deliberately non-secret: " +
@@ -176,6 +238,15 @@ func (r *apiKeyResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 					"the next with nothing in configuration to compare it against — Terraform's refresh " +
 					"absorbs that silently, the same way it already does for a monitor's `due_at` and " +
 					"`next_probe_at`; it surfaces only under the opt-in `terraform plan -refresh-only`.",
+				PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
+			},
+			"created_by_key_id": schema.StringAttribute{
+				Computed: true,
+				MarkdownDescription: "UUID of the API key that minted this one — the key the provider " +
+					"was configured with. Null for a key created from a dashboard session, which has " +
+					"no parent key, and for one whose parent has since been deleted.\n\n" +
+					"It is the lineage the API's cascading revocation walks: revoking a key revokes " +
+					"every key whose `created_by_key_id` chain leads back to it.",
 				PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
 			},
 			"key": schema.StringAttribute{
@@ -266,13 +337,15 @@ func expiresAtConflict(configured types.String, apiVal *time.Time) (*time.Time, 
 // refresh would destroy the one copy that exists.
 func modelFromAPIKey(k *client.APIKey, prior apiKeyResourceModel) apiKeyResourceModel {
 	m := apiKeyResourceModel{
-		ID:         types.StringValue(k.ID),
-		Name:       types.StringValue(k.Name),
-		ExpiresAt:  expiresAtValue(k.ExpiresAt, prior.ExpiresAt),
-		Prefix:     types.StringValue(k.Prefix),
-		CreatedAt:  types.StringValue(k.CreatedAt.UTC().Format(time.RFC3339)),
-		LastUsedAt: lastUsedAtValue(k.LastUsedAt),
-		Key:        prior.Key,
+		ID:             types.StringValue(k.ID),
+		Name:           types.StringValue(k.Name),
+		ExpiresAt:      expiresAtValue(k.ExpiresAt, prior.ExpiresAt),
+		Scope:          scopeValue(k.Scope, prior.Scope),
+		Prefix:         types.StringValue(k.Prefix),
+		CreatedAt:      types.StringValue(k.CreatedAt.UTC().Format(time.RFC3339)),
+		LastUsedAt:     lastUsedAtValue(k.LastUsedAt),
+		CreatedByKeyID: createdByKeyIDValue(k.CreatedByKeyID),
+		Key:            prior.Key,
 	}
 	if k.Key != "" {
 		m.Key = types.StringValue(k.Key)
@@ -290,6 +363,30 @@ func lastUsedAtValue(v *time.Time) types.String {
 		return types.StringNull()
 	}
 	return types.StringValue(v.UTC().Format(time.RFC3339))
+}
+
+// scopeValue maps the API's scope onto state. The API always sends one — every
+// row has a scope and there is no such thing as an unscoped key — so an EMPTY
+// value means the backend predates scopes, not that this key has none. Writing
+// "" into state there would contradict the planned value and fail the apply
+// with Terraform's own "Provider produced inconsistent result after apply",
+// which names neither the cause nor the fix; carrying the prior value forward
+// keeps such a backend working exactly as it did before this attribute existed.
+func scopeValue(apiVal string, prior types.String) types.String {
+	if apiVal == "" {
+		return prior
+	}
+	return types.StringValue(apiVal)
+}
+
+// createdByKeyIDValue maps the API's optional created_by_key_id onto state:
+// null for a key with no parent — one minted from a dashboard session, or one
+// whose parent has since been revoked — otherwise the parent key's UUID.
+func createdByKeyIDValue(v *string) types.String {
+	if v == nil {
+		return types.StringNull()
+	}
+	return types.StringValue(*v)
 }
 
 func (r *apiKeyResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -323,10 +420,22 @@ func (r *apiKeyResource) Create(ctx context.Context, req resource.CreateRequest,
 		expiresAt = &t
 	}
 
-	out, err := r.client.CreateAPIKey(ctx, plan.Name.ValueString(), expiresAt)
+	// The CONFIG decides the scope sent, the same way it decides expires_at
+	// above and for the same reason: scope is Computed, so a plan value can be
+	// the server's own earlier answer carried forward rather than anything the
+	// practitioner wrote. An unset scope sends no `scope` member at all (the
+	// client's omitempty), which is what lets the API apply its own default —
+	// and it is also the only value that can be contradicted afterwards.
+	requestedScope := configuredScope(config.Scope)
+	out, err := r.client.CreateAPIKey(ctx, client.CreateAPIKeyInput{
+		Name:      plan.Name.ValueString(),
+		ExpiresAt: expiresAt,
+		Scope:     requestedScope,
+	})
 	if err != nil {
 		// err never contains key material: the plaintext exists only in a 2xx body.
-		resp.Diagnostics.AddError("Unable to create API key", err.Error())
+		summary, detail := apiKeyCreateDiagnostic(requestedScope, err, "Unable to create API key")
+		resp.Diagnostics.AddError(summary, detail)
 		return
 	}
 	if out.Key == "" {
@@ -345,6 +454,29 @@ func (r *apiKeyResource) Create(ctx context.Context, req resource.CreateRequest,
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
 		return
+	}
+
+	// Compared against what was REQUESTED, never against the plan: for a
+	// configuration that omits scope the server's answer IS the answer, which
+	// is the whole point of the attribute being Computed, and complaining about
+	// it would fire on every such apply.
+	//
+	// The API refuses a scope it will not grant rather than lowering it, so a
+	// mismatch here cannot happen against today's backend. It is reported
+	// anyway, and as an error: a key minted with a scope nobody asked for is a
+	// credential with the wrong power, which is the same class of problem as one
+	// with the wrong lifetime — and the alternative to saying so is Terraform's
+	// own inconsistent-result error, which reads as a provider bug and names
+	// neither value.
+	if requestedScope != "" && out.Scope != "" && out.Scope != requestedScope {
+		resp.Diagnostics.AddAttributeError(path.Root("scope"),
+			"Server did not honour the requested scope",
+			fmt.Sprintf("The key %q (id %s) was created with the %s scope rather than the requested "+
+				"%s.\n\nA key may not be given a higher scope than the key that mints it, and the API "+
+				"refuses such a request instead of lowering it — so this is unexpected and worth "+
+				"reporting as a bug. The minted key is recorded in state, so it is not orphaned; the "+
+				"next apply replaces it.",
+				out.Name, out.ID, out.Scope, requestedScope))
 	}
 
 	if got, conflict := expiresAtConflict(config.ExpiresAt, out.ExpiresAt); conflict {

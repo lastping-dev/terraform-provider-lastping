@@ -145,3 +145,78 @@ ephemeral "lastping_api_key" "bad" {
 		},
 	})
 }
+
+// TestAccEphemeralAPIKey_adminScopeManagesKeys is the reason the scope
+// attribute exists on this resource: key management is exactly what the API's
+// default `write` excludes, so an aliased provider fed by an ephemeral key can
+// only manage keys when the ephemeral key asked for `admin`.
+//
+// It also pins the consequence, which is not obvious and is documented on the
+// attribute: the key this run mints THROUGH that provider does not survive the
+// run. Revocation cascades down the lineage, so Close revoking the ephemeral
+// key revokes its child in the same transaction — which is why the step expects
+// a non-empty plan afterwards, and why a key that must outlive a run has to be
+// minted by a credential that outlives it.
+func TestAccEphemeralAPIKey_adminScopeManagesKeys(t *testing.T) {
+	const (
+		parentName = "acc-ephemeral-admin-key"
+		childName  = "acc-ephemeral-admin-child"
+	)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		TerraformVersionChecks: []tfversion.TerraformVersionCheck{
+			tfversion.SkipBelow(tfversion.Version1_10_0),
+		},
+		CheckDestroy: func(*terraform.State) error {
+			if err := testAccNoKeyNamed(t, parentName); err != nil {
+				return err
+			}
+			return testAccNoKeyNamed(t, childName)
+		},
+		Steps: []resource.TestStep{
+			{
+				Config: `
+ephemeral "lastping_api_key" "admin_run" {
+  name  = "` + parentName + `"
+  ttl   = "15m"
+  scope = "admin"
+}
+
+provider "lastping" {
+  alias   = "admin_run"
+  api_key = ephemeral.lastping_api_key.admin_run.key
+}
+
+resource "lastping_api_key" "child" {
+  provider = lastping.admin_run
+
+  name  = "` + childName + `"
+  scope = "read"
+}`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					// The child exists, therefore the ephemeral key was granted
+					// admin: a write key could not have created it at all once
+					// scope enforcement is on, and could not have created a key
+					// it does not outrank in any case.
+					resource.TestCheckResourceAttr("lastping_api_key.child", "scope", "read"),
+					resource.TestCheckResourceAttrSet("lastping_api_key.child", "created_by_key_id"),
+					// testAccNoEphemeralInState is deliberately NOT used here: it
+					// fails any state value that looks like a key, and the managed
+					// child resource legitimately holds one. The ephemeral block's
+					// absence from state is the other test's property; this one is
+					// about what an admin-scoped run-scoped key can do.
+					// Close has already run: the ephemeral key is revoked, and
+					// the cascade took its child with it.
+					func(*terraform.State) error { return testAccNoKeyNamed(t, parentName) },
+					func(*terraform.State) error { return testAccNoKeyNamed(t, childName) },
+				),
+				// The child was revoked by the cascade the moment the run ended,
+				// so the follow-up plan proposes creating it again. That is the
+				// documented consequence, not a provider defect.
+				ExpectNonEmptyPlan: true,
+			},
+		},
+	})
+}
