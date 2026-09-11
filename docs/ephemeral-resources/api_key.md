@@ -17,6 +17,7 @@ description: |-
   }
   
   The server-side expiry is the safety net: if a run is interrupted before the key can be revoked, the key still stops working on its own at ttl. LastPing mints keys with a fixed lifetime and has no endpoint to extend one, so a key cannot actually be renewed in place — Terraform is asked to check in shortly before expiry and warns if a run is about to outlive its credential. Set ttl to comfortably exceed the longest apply you expect.
+  Set scope when the run needs more than the API's default of write — in particular scope = "admin" for an aliased provider that has to manage API keys, since key management is exactly what write excludes. Note that keys minted through such a provider are revoked with it: see scope.
   Requires Terraform 1.10 or later. For a key that must outlive the run, use the lastping_api_key managed resource — and read its warning about state first.
 ---
 
@@ -40,6 +41,8 @@ provider "lastping" {
 
 The server-side expiry is the safety net: if a run is interrupted before the key can be revoked, the key still stops working on its own at `ttl`. LastPing mints keys with a fixed lifetime and has no endpoint to extend one, so a key cannot actually be renewed in place — Terraform is asked to check in shortly before expiry and warns if a run is about to outlive its credential. Set `ttl` to comfortably exceed the longest apply you expect.
 
+Set `scope` when the run needs more than the API's default of `write` — in particular `scope = "admin"` for an aliased provider that has to manage API keys, since key management is exactly what `write` excludes. Note that keys minted through such a provider are revoked with it: see `scope`.
+
 Requires Terraform 1.10 or later. For a key that must outlive the run, use the `lastping_api_key` **managed resource** — and read its warning about state first.
 
 ## Example Usage
@@ -60,23 +63,44 @@ ephemeral "lastping_api_key" "run" {
   ttl = "30m"
 }
 
-# The intended consumer: another provider instance. An ephemeral value can be
-# used anywhere Terraform does not persist it, which rules out resource
-# arguments and non-ephemeral outputs.
-provider "lastping" {
-  alias   = "run"
-  api_key = ephemeral.lastping_api_key.run.key
+# The aliased-provider pattern this resource exists for, with one addition: a
+# run that goes on to manage API KEYS needs key-management power, and the API's
+# default scope of "write" is precisely everything except that. Ask for admin
+# explicitly.
+#
+# A key may never be given a higher scope than the key that mints it, so this
+# only works when the provider's own credential is already admin.
+ephemeral "lastping_api_key" "admin_run" {
+  name  = "terraform-run-admin"
+  ttl   = "30m"
+  scope = "admin"
 }
 
-resource "lastping_monitor" "nightly_backup" {
-  provider = lastping.run
+provider "lastping" {
+  alias   = "admin_run"
+  api_key = ephemeral.lastping_api_key.admin_run.key
+}
 
-  name          = "Nightly backup"
-  slug          = "nightly-backup"
-  schedule_kind = "cron"
-  cron_expr     = "0 3 * * *"
-  tz            = "UTC"
-  grace_s       = 1800
+# WHAT THIS CANNOT DO, and it is not obvious: anything minted THROUGH this
+# provider dies with the run. Revocation cascades down the created_by_key_id
+# chain, so when the ephemeral key is revoked at the end of the run, every key
+# it created is revoked in the same transaction — including a
+# `lastping_api_key` resource applied through `provider = lastping.admin_run`,
+# which would then be missing on the next plan and proposed for creation again,
+# forever.
+#
+# So: use a run-scoped admin key for key management whose EFFECT is meant to
+# outlive it (revoking keys, or auditing them), and mint keys that must survive
+# the run with a credential that survives the run — configure the default
+# provider with an admin key instead.
+
+# On Terraform 1.11 and later an ephemeral value can be handed to a calling
+# module, which is how a run-scoped admin credential reaches code that does its
+# own key management. It is still never persisted.
+output "admin_run_key" {
+  value     = ephemeral.lastping_api_key.admin_run.key
+  ephemeral = true
+  sensitive = true
 }
 
 # Note what you cannot do: every attribute here is ephemeral, `prefix` and `id`
@@ -94,6 +118,20 @@ resource "lastping_monitor" "nightly_backup" {
 
 ### Optional
 
+- `scope` (String) What the key may do: `read` (every GET), `write` (everything except API key management) or `admin` (everything, key management included). Omitted, the API applies its own default of `write`.
+
+`admin` is the reason to set this. A run whose ephemeral key has to manage API keys — list, mint or revoke them — needs key-management power, and `write` is precisely everything except that, so an aliased provider fed by this resource must ask for `admin` explicitly:
+
+```terraform
+ephemeral "lastping_api_key" "admin" {
+  name  = "terraform-run"
+  scope = "admin"
+}
+```
+
+**A key may not be given a higher scope than the key that mints it**, so this can only reach `admin` when the provider's own credential is already `admin`.
+
+~> A key minted THROUGH this one does not outlive the run either: revocation cascades down the lineage, so when this key is revoked at the end of the run, every key it created goes with it. Mint keys that must survive the run with a credential that survives the run.
 - `ttl` (String) How long the key is valid, as a Go duration (`"45m"`, `"2h"`). Defaults to `"1h"`. This becomes the key's server-side `expires_at`, so it bounds the damage of a run that dies before revoking its key.
 
 ### Read-Only

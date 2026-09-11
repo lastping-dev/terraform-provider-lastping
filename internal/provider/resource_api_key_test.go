@@ -376,3 +376,234 @@ resource "lastping_api_key" "bad" {
 		},
 	})
 }
+
+// testAccCheckServerScope asserts what the SERVER stored, not merely what state
+// says. State can be right about a value the request never carried — the whole
+// failure mode this suite exists to catch — so the scope is read back through a
+// second, out-of-band client.
+func testAccCheckServerScope(t *testing.T, name, want string) resource.TestCheckFunc {
+	t.Helper()
+	return resource.TestCheckResourceAttrWith(name, "id", func(id string) error {
+		key, err := testAccDirectClient(t).GetAPIKey(context.Background(), id)
+		if err != nil {
+			return err
+		}
+		if key.Scope != want {
+			return fmt.Errorf("server stored scope %q, configuration asked for %q", key.Scope, want)
+		}
+		return nil
+	})
+}
+
+// TestAccAPIKey_scopes covers the tier on a real backend: each of the three
+// values is accepted and actually stored, an omitted scope really is `write`,
+// and changing the scope replaces the key — because the API has no way to move
+// one.
+func TestAccAPIKey_scopes(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "lastping_api_key" "read" {
+  name  = "acc-scope-read"
+  scope = "read"
+}
+
+resource "lastping_api_key" "write" {
+  name  = "acc-scope-write"
+  scope = "write"
+}
+
+resource "lastping_api_key" "admin" {
+  name  = "acc-scope-admin"
+  scope = "admin"
+}
+
+resource "lastping_api_key" "defaulted" {
+  name = "acc-scope-defaulted"
+}`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("lastping_api_key.read", "scope", "read"),
+					testAccCheckServerScope(t, "lastping_api_key.read", "read"),
+					resource.TestCheckResourceAttr("lastping_api_key.write", "scope", "write"),
+					testAccCheckServerScope(t, "lastping_api_key.write", "write"),
+					resource.TestCheckResourceAttr("lastping_api_key.admin", "scope", "admin"),
+					testAccCheckServerScope(t, "lastping_api_key.admin", "admin"),
+					// The default is the point of this one: nothing configured,
+					// and the key must still come out as write rather than
+					// inheriting the creating key's admin.
+					resource.TestCheckResourceAttr("lastping_api_key.defaulted", "scope", "write"),
+					testAccCheckServerScope(t, "lastping_api_key.defaulted", "write"),
+					// Lineage: these keys were minted BY the key the provider is
+					// configured with, so every one of them names a parent.
+					resource.TestCheckResourceAttrSet("lastping_api_key.defaulted", "created_by_key_id"),
+					resource.TestCheckResourceAttrWith("lastping_api_key.read", "created_by_key_id",
+						func(parent string) error {
+							keys, err := testAccDirectClient(t).ListAPIKeys(context.Background())
+							if err != nil {
+								return err
+							}
+							for _, k := range keys {
+								if k.ID == parent {
+									return nil
+								}
+							}
+							return fmt.Errorf("created_by_key_id %s is not a key in this project", parent)
+						}),
+				),
+			},
+			{
+				// Nothing configured must not drift: the default has to survive
+				// the round trip, or every plan proposes replacing live keys.
+				Config: `
+resource "lastping_api_key" "read" {
+  name  = "acc-scope-read"
+  scope = "read"
+}
+
+resource "lastping_api_key" "write" {
+  name  = "acc-scope-write"
+  scope = "write"
+}
+
+resource "lastping_api_key" "admin" {
+  name  = "acc-scope-admin"
+  scope = "admin"
+}
+
+resource "lastping_api_key" "defaulted" {
+  name = "acc-scope-defaulted"
+}`,
+				PlanOnly: true,
+			},
+			{
+				// Raising a scope replaces the key. The API cannot change one,
+				// so anything else would be a state lie.
+				Config: `
+resource "lastping_api_key" "read" {
+  name  = "acc-scope-read"
+  scope = "write"
+}
+
+resource "lastping_api_key" "write" {
+  name  = "acc-scope-write"
+  scope = "write"
+}
+
+resource "lastping_api_key" "admin" {
+  name  = "acc-scope-admin"
+  scope = "admin"
+}
+
+resource "lastping_api_key" "defaulted" {
+  name = "acc-scope-defaulted"
+}`,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("lastping_api_key.read", plancheck.ResourceActionReplace),
+					},
+				},
+				Check: testAccCheckServerScope(t, "lastping_api_key.read", "write"),
+			},
+		},
+	})
+}
+
+// TestAccAPIKey_invalidScope: a tier the API does not store is a plan-time
+// error naming the attribute, not a 400 partway through an apply.
+func TestAccAPIKey_invalidScope(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "lastping_api_key" "bad" {
+  name  = "acc-bad-scope"
+  scope = "owner"
+}`,
+				PlanOnly:    true,
+				ExpectError: regexp.MustCompile(`(?s)Invalid Attribute Value Match`),
+			},
+		},
+	})
+}
+
+// TestAccAPIKey_scopeCapIsEnforcedByTheServer is the half no unit test can
+// prove: a Terraform run authenticating with a WRITE key cannot mint an admin
+// key, whatever the configuration says.
+//
+// The write key is minted in-test, by the suite's own admin key, because the
+// seeded acceptance key is always admin (the monorepo's scripts/seed-acc-key.sh
+// inserts the row without a scope, taking the column default). It is revoked
+// again at the end.
+//
+// TWO refusals are acceptable, and which one arrives depends on a server flag
+// this repository does not control:
+//
+//   - LP_API_KEY_SCOPES_ENFORCE off (today): the write key reaches the endpoint
+//     and the create-time scope CAP refuses it — 400, max_scope.
+//   - enforcement on: the key never reaches the handler at all, and scoped()
+//     refuses it — 403, required_scope.
+//
+// Both are the provider's scope diagnostics, and pinning only one would make
+// this test fail the day the flag flips, which is precisely when it matters.
+func TestAccAPIKey_scopeCapIsEnforcedByTheServer(t *testing.T) {
+	if os.Getenv("LASTPING_API_KEY") == "" {
+		t.Skip("LASTPING_API_KEY not set; skipping acceptance test")
+	}
+
+	ctx := context.Background()
+	admin := testAccDirectClient(t)
+	writer, err := admin.CreateAPIKey(ctx, client.CreateAPIKeyInput{
+		Name:  "acc-scope-cap-writer",
+		Scope: "write",
+	})
+	if err != nil {
+		t.Fatalf("minting the write key this test authenticates with: %v", err)
+	}
+	if writer.Scope != "write" {
+		t.Fatalf("the key this test relies on has scope %q, not write; the test would prove nothing",
+			writer.Scope)
+	}
+	t.Cleanup(func() {
+		if err := admin.RevokeAPIKey(context.Background(), writer.ID); err != nil &&
+			!client.IsNotFound(err) {
+			t.Logf("could not revoke the test's write key %s: %v", writer.ID, err)
+		}
+	})
+
+	endpoint := os.Getenv("LASTPING_ENDPOINT")
+	if endpoint == "" {
+		endpoint = defaultEndpoint
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				// The plaintext appears in this configuration and nowhere else:
+				// the apply fails, so nothing reaches state, and the key is
+				// revoked in the cleanup above.
+				Config: fmt.Sprintf(`
+provider "lastping" {
+  alias    = "writer"
+  endpoint = %q
+  api_key  = %q
+}
+
+resource "lastping_api_key" "escalate" {
+  provider = lastping.writer
+
+  name  = "acc-scope-cap-child"
+  scope = "admin"
+}`, endpoint, writer.Key),
+				ExpectError: regexp.MustCompile(
+					`(?s)(exceeds the creating key's own scope|cannot manage API keys)`),
+			},
+		},
+	})
+}

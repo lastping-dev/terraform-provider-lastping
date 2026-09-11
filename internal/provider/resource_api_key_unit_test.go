@@ -13,6 +13,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/defaults"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
@@ -302,13 +303,23 @@ func apiKeyCreateServer(t *testing.T, expires *time.Time, requested *map[string]
 		if requested != nil {
 			*requested = body
 		}
+		// The real API echoes the scope it granted and names the key that
+		// minted this one; a stub that omitted both would let a provider that
+		// never reads them pass.
+		scope, _ := body["scope"].(string)
+		if scope == "" {
+			scope = "write"
+		}
+		parent := "22222222-2222-4222-a222-222222222222"
 		out := client.APIKey{
-			ID:        "11111111-1111-4111-a111-111111111111",
-			Name:      "k",
-			Prefix:    "lp_abcdefg",
-			CreatedAt: time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC),
-			ExpiresAt: expires,
-			Key:       "lp_abcdefg_secret",
+			ID:             "11111111-1111-4111-a111-111111111111",
+			Name:           "k",
+			Prefix:         "lp_abcdefg",
+			CreatedAt:      time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC),
+			ExpiresAt:      expires,
+			Scope:          scope,
+			CreatedByKeyID: &parent,
+			Key:            "lp_abcdefg_secret",
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
@@ -332,9 +343,16 @@ func apiKeyCreate(t *testing.T, c *client.Client, config apiKeyResourceModel) (a
 	plan.Prefix = types.StringUnknown()
 	plan.CreatedAt = types.StringUnknown()
 	plan.LastUsedAt = types.StringUnknown()
+	plan.CreatedByKeyID = types.StringUnknown()
 	plan.Key = types.StringUnknown()
 	if plan.ExpiresAt.IsNull() {
 		plan.ExpiresAt = types.StringUnknown()
+	}
+	// scope has a Default, so the framework hands Create a KNOWN plan value
+	// even for a configuration that omits it — modelling it as unknown here
+	// would test a plan Terraform never produces.
+	if plan.Scope.IsNull() {
+		plan.Scope = types.StringValue(apiKeyScopeWrite)
 	}
 
 	r := &apiKeyResource{client: c}
@@ -398,4 +416,182 @@ func TestAPIKeyCreateTakesServerExpiry(t *testing.T) {
 		require.Equal(t, "11111111-1111-4111-a111-111111111111", got.ID.ValueString(),
 			"state must still hold the minted key, or it is orphaned on the server")
 	})
+}
+
+// apiKeyScopePlan runs the plan modifiers the SCHEMA declares for scope — not a
+// copy of them — over one plan, and reports whether a replacement was demanded.
+// Mirrors apiKeyExpiresAtPlan; the two attributes deliberately carry different
+// modifiers, and asserting on the declared ones is what keeps that deliberate.
+func apiKeyScopePlan(t *testing.T, state, config, plan types.String) (types.String, bool) {
+	t.Helper()
+	ctx := context.Background()
+
+	attr, ok := apiKeySchema(t).Attributes["scope"].(schema.StringAttribute)
+	require.True(t, ok, "scope must be a string attribute")
+
+	model := func(v types.String) apiKeyResourceModel {
+		return apiKeyResourceModel{Name: types.StringValue("k"), Scope: v}
+	}
+	resp := &planmodifier.StringResponse{PlanValue: plan}
+	for _, mod := range attr.PlanModifiers {
+		mod.PlanModifyString(ctx, planmodifier.StringRequest{
+			Path:        path.Root("scope"),
+			State:       tfsdk.State{Schema: apiKeySchema(t), Raw: apiKeyRawValue(t, model(state))},
+			Plan:        tfsdk.Plan{Schema: apiKeySchema(t), Raw: apiKeyRawValue(t, model(plan))},
+			Config:      tfsdk.Config{Schema: apiKeySchema(t), Raw: apiKeyRawValue(t, model(config))},
+			StateValue:  state,
+			PlanValue:   resp.PlanValue,
+			ConfigValue: config,
+		}, resp)
+	}
+	return resp.PlanValue, resp.RequiresReplace
+}
+
+// TestAPIKeyScopeSchema pins the shape: a default of write applied by the
+// framework rather than by the server, the three storable values and nothing
+// else, and a change that replaces the key — the API has no way to move a
+// key's scope, so an in-place update could only ever be a lie.
+func TestAPIKeyScopeSchema(t *testing.T) {
+	attr, ok := apiKeySchema(t).Attributes["scope"].(schema.StringAttribute)
+	require.True(t, ok)
+	require.True(t, attr.Optional, "a practitioner must be able to choose a tier")
+	require.True(t, attr.Computed, "the framework requires Computed for an attribute with a Default")
+	require.NotNil(t, attr.Default, "an omitted scope must plan as a known write, not as unknown")
+
+	resp := defaults.StringResponse{}
+	attr.Default.DefaultString(context.Background(), defaults.StringRequest{}, &resp)
+	require.Equal(t, apiKeyScopeWrite, resp.PlanValue.ValueString(),
+		"the default is the tier that cannot mint itself a replacement")
+
+	t.Run("only the three storable values are accepted", func(t *testing.T) {
+		for _, ok := range apiKeyScopes {
+			r := validator.StringResponse{}
+			for _, v := range attr.Validators {
+				v.ValidateString(context.Background(),
+					validator.StringRequest{Path: path.Root("scope"), ConfigValue: types.StringValue(ok)}, &r)
+			}
+			require.False(t, r.Diagnostics.HasError(), "%q is a scope the API stores", ok)
+		}
+		for _, bad := range []string{"owner", "Write", "readwrite", ""} {
+			r := validator.StringResponse{}
+			for _, v := range attr.Validators {
+				v.ValidateString(context.Background(),
+					validator.StringRequest{Path: path.Root("scope"), ConfigValue: types.StringValue(bad)}, &r)
+			}
+			require.True(t, r.Diagnostics.HasError(),
+				"%q is not a scope the API stores, and a 400 mid-apply is the alternative", bad)
+		}
+	})
+}
+
+// TestAPIKeyScopePlan: an unchanged scope proposes nothing, and every change —
+// including dropping the attribute back to its default — replaces the key.
+//
+// The last case is why the modifier is RequiresReplace and not
+// RequiresReplaceIfConfigured: with a default, removing `scope = "admin"` from
+// a configuration really does mean "make it write", which is a different
+// credential, not an absence of intent.
+func TestAPIKeyScopePlan(t *testing.T) {
+	write := types.StringValue(apiKeyScopeWrite)
+	admin := types.StringValue(apiKeyScopeAdmin)
+
+	t.Run("unchanged proposes nothing", func(t *testing.T) {
+		got, replace := apiKeyScopePlan(t, admin, admin, admin)
+		require.Equal(t, admin, got)
+		require.False(t, replace)
+	})
+
+	t.Run("a changed scope replaces the key", func(t *testing.T) {
+		_, replace := apiKeyScopePlan(t, write, admin, admin)
+		require.True(t, replace, "the API cannot move a key's scope, so this must replace")
+	})
+
+	t.Run("dropping the attribute falls back to the default, and that replaces too", func(t *testing.T) {
+		// Terraform applies the default when config is null, so the plan value
+		// is write against a state of admin.
+		_, replace := apiKeyScopePlan(t, admin, types.StringNull(), write)
+		require.True(t, replace, "an admin key becoming a write key is a different credential")
+	})
+}
+
+// TestAPIKeyCreateSendsScopeAndRecordsLineage drives the real Create entry
+// point, because a schema attribute nothing sends and nothing reads back is
+// inert: the request has to carry the scope, and the response's scope and
+// created_by_key_id have to reach state.
+func TestAPIKeyCreateSendsScopeAndRecordsLineage(t *testing.T) {
+	t.Run("the default is requested explicitly and lands in state", func(t *testing.T) {
+		var sent map[string]any
+		got, diags := apiKeyCreate(t, apiKeyCreateServer(t, nil, &sent),
+			apiKeyResourceModel{Name: types.StringValue("k")})
+		require.False(t, diags.HasError(), "%v", diags)
+		require.Equal(t, apiKeyScopeWrite, sent["scope"],
+			"the plan carries the default, so the request names it rather than relying on the server's")
+		require.Equal(t, apiKeyScopeWrite, got.Scope.ValueString())
+		require.Equal(t, "22222222-2222-4222-a222-222222222222", got.CreatedByKeyID.ValueString(),
+			"the key that minted this one is what a cascading revocation follows")
+	})
+
+	t.Run("a configured scope is what gets requested", func(t *testing.T) {
+		var sent map[string]any
+		got, diags := apiKeyCreate(t, apiKeyCreateServer(t, nil, &sent), apiKeyResourceModel{
+			Name:  types.StringValue("k"),
+			Scope: types.StringValue(apiKeyScopeAdmin),
+		})
+		require.False(t, diags.HasError(), "%v", diags)
+		require.Equal(t, apiKeyScopeAdmin, sent["scope"])
+		require.Equal(t, apiKeyScopeAdmin, got.Scope.ValueString())
+	})
+
+	t.Run("a refused scope names both scopes and creates nothing", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/problem+json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"title":"Bad Request","status":400,
+				"detail":"scope may not exceed the creating key's own scope","max_scope":"write"}`))
+		}))
+		t.Cleanup(srv.Close)
+
+		got, diags := apiKeyCreate(t, client.New(srv.URL, "lp_test", "unit"), apiKeyResourceModel{
+			Name:  types.StringValue("k"),
+			Scope: types.StringValue(apiKeyScopeAdmin),
+		})
+		require.True(t, diags.HasError())
+		require.Contains(t, diags.Errors()[0].Summary(), "exceeds the creating key's own scope")
+		require.Contains(t, diags.Errors()[0].Detail(), "admin")
+		require.Contains(t, diags.Errors()[0].Detail(), "write")
+		require.True(t, got.ID.IsNull(), "a refused create must leave nothing in state")
+	})
+}
+
+// TestAPIKeyScopeValue covers the one response the API does not send: a backend
+// that predates scopes. Writing "" into state there would contradict the planned
+// value and fail the apply with Terraform's own inconsistent-result error, which
+// names neither the cause nor the fix.
+func TestAPIKeyScopeValue(t *testing.T) {
+	prior := types.StringValue(apiKeyScopeAdmin)
+	require.Equal(t, prior, scopeValue("", prior),
+		"an absent scope means an older backend, not a key without one")
+	require.Equal(t, apiKeyScopeRead, scopeValue(apiKeyScopeRead, prior).ValueString(),
+		"a scope the server reports is the truth, prior state or not")
+
+	// Through the mapping Read actually uses, not just the helper: a scope
+	// changed out of band has to surface as drift, and a model that quietly
+	// keeps prior state would hide it forever.
+	got := modelFromAPIKey(&client.APIKey{
+		ID: "id", Name: "n", Prefix: "lp_abcdefg",
+		CreatedAt: time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC),
+		Scope:     apiKeyScopeRead,
+	}, apiKeyResourceModel{Scope: prior, Key: types.StringValue("lp_abcdefg_secret")})
+	require.Equal(t, apiKeyScopeRead, got.Scope.ValueString(),
+		"a refresh must report the server's scope, not the one state remembers")
+}
+
+// TestAPIKeyCreatedByKeyIDValue: a key with no parent — minted from a dashboard
+// session, or one whose parent has been revoked — must read as null, never as
+// the zero UUID, which would look like a real key that happens to be all zeros.
+func TestAPIKeyCreatedByKeyIDValue(t *testing.T) {
+	require.True(t, createdByKeyIDValue(nil).IsNull())
+
+	parent := "e1d2c3b4-0000-0000-0000-000000000002"
+	require.Equal(t, parent, createdByKeyIDValue(&parent).ValueString())
 }

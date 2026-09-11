@@ -8,8 +8,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework/ephemeral"
+	eschema "github.com/hashicorp/terraform-plugin-framework/ephemeral/schema"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
+	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/stretchr/testify/require"
 
@@ -198,4 +201,113 @@ func keysOf(m map[string]any) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// ephemeralAPIKeySchema is the ephemeral resource's own schema, read from the
+// resource rather than restated, so a test cannot drift from what is served.
+func ephemeralAPIKeySchema(t *testing.T) eschema.Schema {
+	t.Helper()
+	resp := &ephemeral.SchemaResponse{}
+	NewAPIKeyEphemeralResource().Schema(context.Background(), ephemeral.SchemaRequest{}, resp)
+	require.False(t, resp.Diagnostics.HasError(), "%v", resp.Diagnostics)
+	return resp.Schema
+}
+
+// ephemeralOpen drives the real Open entry point against a stub API and hands
+// back the POST body it sent and the paths it called.
+//
+// It deliberately leaves OpenResponse.Private nil, because the framework's
+// private-state type lives in an internal package and cannot be constructed
+// from here. Open therefore fails at the point it records what Close will need
+// — which is a real branch with real behaviour, and the reason the requests are
+// what this asserts on: the mint request has already gone by then, and Open's
+// answer to a private-state failure is to revoke the key rather than hand out a
+// credential nothing will clean up.
+func ephemeralOpen(t *testing.T, cfg apiKeyEphemeralModel) (map[string]any, []string) {
+	t.Helper()
+	ctx := context.Background()
+
+	var sent map[string]any
+	var called []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = append(called, r.Method+" "+r.URL.Path)
+		if r.Method == http.MethodPost {
+			body := map[string]any{}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			sent = body
+			scope, _ := body["scope"].(string)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(client.APIKey{
+				ID: "11111111-1111-4111-a111-111111111111", Name: "k",
+				Prefix: "lp_abcdefg", Scope: scope, Key: "lp_abcdefg_secret",
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(srv.Close)
+
+	s := ephemeralAPIKeySchema(t)
+	objType, ok := s.Type().(types.ObjectType)
+	require.True(t, ok)
+	obj, diags := types.ObjectValueFrom(ctx, objType.AttributeTypes(), cfg)
+	require.False(t, diags.HasError(), "%v", diags)
+	raw, err := obj.ToTerraformValue(ctx)
+	require.NoError(t, err)
+
+	e := &apiKeyEphemeralResource{client: client.New(srv.URL, "lp_test", "unit")}
+	resp := &ephemeral.OpenResponse{Result: tfsdk.EphemeralResultData{Schema: s, Raw: raw}}
+	e.Open(ctx, ephemeral.OpenRequest{Config: tfsdk.Config{Schema: s, Raw: raw}}, resp)
+
+	return sent, called
+}
+
+// TestEphemeralScopeSchema: the same three values as the managed resource, and
+// no Default — an ephemeral schema has nowhere to hang one, so an omitted scope
+// sends nothing and the server applies its own.
+func TestEphemeralScopeSchema(t *testing.T) {
+	attr, ok := ephemeralAPIKeySchema(t).Attributes["scope"].(eschema.StringAttribute)
+	require.True(t, ok, "scope must be a string attribute")
+	require.True(t, attr.Optional)
+	require.False(t, attr.Computed, "nothing here is read back; the caller chooses or the server does")
+
+	for _, good := range apiKeyScopes {
+		r := validator.StringResponse{}
+		for _, v := range attr.Validators {
+			v.ValidateString(context.Background(),
+				validator.StringRequest{Path: path.Root("scope"), ConfigValue: types.StringValue(good)}, &r)
+		}
+		require.False(t, r.Diagnostics.HasError(), "%q is a scope the API stores", good)
+	}
+	for _, bad := range []string{"owner", "Admin", ""} {
+		r := validator.StringResponse{}
+		for _, v := range attr.Validators {
+			v.ValidateString(context.Background(),
+				validator.StringRequest{Path: path.Root("scope"), ConfigValue: types.StringValue(bad)}, &r)
+		}
+		require.True(t, r.Diagnostics.HasError(), "%q is not a scope the API stores", bad)
+	}
+}
+
+// TestEphemeralOpenRequestsTheConfiguredScope is the reason this release
+// exists: an aliased provider fed by this resource needs `admin` to manage
+// lastping_api_key resources, and it can only get it if Open actually asks.
+func TestEphemeralOpenRequestsTheConfiguredScope(t *testing.T) {
+	t.Run("admin is requested", func(t *testing.T) {
+		sent, called := ephemeralOpen(t, apiKeyEphemeralModel{
+			Name:  types.StringValue("terraform-run"),
+			Scope: types.StringValue(apiKeyScopeAdmin),
+		})
+		require.Equal(t, apiKeyScopeAdmin, sent["scope"])
+		require.Contains(t, sent, "expires_at", "the ttl safety net still has to be requested")
+		require.Contains(t, called, "DELETE /api/v1/api-keys/11111111-1111-4111-a111-111111111111",
+			"a key Open cannot record is revoked rather than left running loose")
+	})
+
+	t.Run("an omitted scope sends none, so the server's default applies", func(t *testing.T) {
+		sent, _ := ephemeralOpen(t, apiKeyEphemeralModel{Name: types.StringValue("terraform-run")})
+		require.NotContains(t, sent, "scope",
+			"sending \"\" would be a caller error the API refuses, not a request for the default")
+	})
 }

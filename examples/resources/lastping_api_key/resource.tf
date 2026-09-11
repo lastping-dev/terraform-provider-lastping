@@ -11,6 +11,42 @@ resource "lastping_api_key" "ci" {
   # Optional, and strongly recommended: a key that expires is a leak with an
   # end date. Must be RFC 3339 and in the future.
   expires_at = "2027-01-01T00:00:00Z"
+
+  # Optional. "write" is the default and what a CI job wants: it can report
+  # pings and manage monitors, and it cannot mint itself a replacement key that
+  # would survive this one's revocation.
+  scope = "write"
+}
+
+# A read-only key, for a dashboard, a scraper or an agent that only ever looks.
+resource "lastping_api_key" "grafana" {
+  name  = "grafana"
+  scope = "read"
+}
+
+# An admin key can manage API keys — including creating and revoking them — so
+# it is the only scope that can run Terraform configurations like this one.
+#
+# A key may never be given a higher scope than the key that mints it, so this
+# apply only succeeds when the credential the provider is configured with is
+# itself admin; otherwise the API refuses with the ceiling in `max_scope`.
+resource "lastping_api_key" "platform" {
+  name       = "platform-team"
+  scope      = "admin"
+  expires_at = "2027-01-01T00:00:00Z"
+}
+
+# Destroying an API key resource REVOKES EVERY KEY IT CREATED, recursively: the
+# API walks the created_by_key_id chain in one transaction. So destroying
+# `platform` above also revokes anything minted with it — by another Terraform
+# run, by an agent over MCP, or by hand — and those consumers stop
+# authenticating at the same moment.
+#
+# `created_by_key_id` is the other half of that chain, and it is read back into
+# state: it names the key this one was minted by, or is null for a key created
+# from the dashboard.
+output "ci_api_key_parent" {
+  value = lastping_api_key.ci.created_by_key_id
 }
 
 # Rotation. `name` and `expires_at` both force replacement, and Terraform

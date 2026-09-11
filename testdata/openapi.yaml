@@ -28,7 +28,27 @@ components:
       type: apiKey
       in: header
       name: X-Api-Key
-      description: Project API key.  Obtain from your LastPing project settings.
+      description: |
+        Project API key.  Obtain from your LastPing project settings.
+
+        **Every key carries a scope**, which is what it is permitted to do:
+
+        | Scope | Reaches |
+        | --- | --- |
+        | `read` | Every `GET`. |
+        | `write` | Everything except API key management — the default for a new key. |
+        | `admin` | Everything, including `/api/v1/api-keys`. |
+
+        A request whose key ranks below an operation's requirement is refused
+        with `403` and a problem body carrying `required_scope`, the tier the
+        operation needed. The rule is uniform: `GET` needs `read`, every other
+        method needs `write`, and the three `/api/v1/api-keys` operations need
+        `admin` — the list included, since key names, prefixes and lineage are
+        what a caller needs in order to choose which key to revoke.
+
+        Keys created before scopes existed are `admin`, so nothing that worked
+        before this was introduced stops working. Enforcement of this refusal
+        is switched on separately from the scope existing on a key.
     BearerAuth:
       type: http
       scheme: bearer
@@ -53,6 +73,27 @@ components:
           schema:
             $ref: "#/components/schemas/Problem"
 
+    InsufficientScope:
+      description: |
+        The API key authenticated, but its scope does not reach this
+        operation. The problem body carries `required_scope`: the tier the
+        operation needs. Re-mint the key at that scope (Settings, `POST
+        /api/v1/api-keys`, or the `create_api_key` MCP tool) rather than
+        retrying — the refusal is deterministic and a retry will be refused
+        identically.
+      content:
+        application/problem+json:
+          schema:
+            allOf:
+              - $ref: "#/components/schemas/Problem"
+              - type: object
+                properties:
+                  required_scope:
+                    type: string
+                    enum: ["read", "write", "admin"]
+                    description: The minimum scope this operation requires.
+                    example: "admin"
+
   schemas:
     CheckCreate:
       type: object
@@ -64,11 +105,30 @@ components:
         - `heartbeat` (default) — expects your service to ping the `ping_url` on schedule.
         - `ci` — like heartbeat but semantically used for CI/CD pipeline pings.
         - `http` — LastPing actively probes the `probe_url` on the given interval.
-          When `monitor_type` is `http` the `probe_*` fields configure the probe;
-          `schedule_kind`/`period_s`/`cron_expr` are ignored (schedule is driven by `probe_interval_s`).
+          When `monitor_type` is `http` the `probe_*` fields configure the probe
+          and the schedule is driven by `probe_interval_s`.
+
+        **Every field is validated against the monitor's SHAPE.**  A field the
+        chosen `monitor_type` (and `schedule_kind`) has no place for is rejected
+        with 400 (`FIELD_NOT_IN_SHAPE`) instead of being accepted and silently
+        discarded.  Examples: `schedule_kind`/`period_s`/`cron_expr`/`tz` or any
+        `ci_*` field on an `http` monitor; any `probe_*` field on a `heartbeat`;
+        `ci_workflow`/`ci_branch` with no `ci_provider`; `period_s`/`cron_expr`/`tz`
+        on an `on_demand` schedule.
+
+        `null`, `""`, `0`, `false` and empty collections are treated as "no
+        value" and never trigger this rejection, so a client that serialises a
+        full document with zero values for the fields it does not use is
+        unaffected.
+
+        An unrecognised `monitor_type` is rejected with 400
+        (`UNKNOWN_MONITOR_TYPE`); it used to create a `heartbeat`.
 
         **Upsert:** if `slug` is non-empty and a check with that slug already
         exists in the project, the config is updated and 200 is returned instead of 201.
+        That branch does **not** write `ci_workflow`/`ci_branch` — see those two
+        properties for the full statement, and use `PATCH /api/v1/checks/{id}`
+        to set them.
       required:
         - name
       properties:
@@ -101,9 +161,16 @@ components:
           type: string
           enum: [heartbeat, ci, http]
           description: |
-            Monitor mode.  Defaults to `heartbeat` when omitted.
+            Monitor mode.  Defaults to `heartbeat` when omitted.  Any other
+            value is rejected with 400 (`UNKNOWN_MONITOR_TYPE`).
             Use `http` to have LastPing actively probe a URL instead of waiting
             for an inbound ping.
+
+            `ci` is a label, not a binding.  A CI monitor is stored as a
+            `heartbeat` row with a CI binding attached, so it is `ci_provider`
+            that makes a monitor a CI monitor — `monitor_type: ci` on its own
+            creates an ordinary heartbeat, and its `ci_workflow`/`ci_branch`
+            are then rejected with 400 (`FIELD_NOT_IN_SHAPE`).
           example: "heartbeat"
         schedule_kind:
           type: string
@@ -117,7 +184,11 @@ components:
             run starts, and `expect_every_s` — the silence floor — is the only
             way to detect absence between runs.
             Required for `heartbeat` and `ci` monitor types.
-            Ignored when `monitor_type` is `http` (schedule is driven by `probe_interval_s`).
+
+            **Rejected with 400 (`FIELD_NOT_IN_SHAPE`) when `monitor_type` is
+            `http`**, together with `period_s`, `cron_expr` and `tz`: an http
+            monitor's schedule is derived from `probe_interval_s`, so all four
+            were previously accepted and discarded.
           example: "simple"
         period_s:
           type: integer
@@ -372,18 +443,42 @@ components:
             a webhook secret and binds it.  The secret is returned ONCE in the `201`
             response (`ci_secret`) and is NEVER returned again — use the
             `POST /api/v1/checks/{id}/ci/regenerate` endpoint to rotate it.
+
+            **Rejected with 400 (`FIELD_NOT_IN_SHAPE`) when `monitor_type` is
+            `http`.**  An http monitor is never bound to CI; the request used
+            to be accepted, create no binding, and report success.
           example: "github"
         ci_workflow:
           type: string
           description: |
             Optional CI workflow name to filter inbound webhooks by (provider-specific).
-            Has no effect when `ci_provider` is not set.
+
+            **Requires `ci_provider`, and this is enforced:** with no CI
+            binding the filter is stored nowhere and matches nothing, so the
+            request is rejected with 400 (`FIELD_NOT_IN_SHAPE`).  It was
+            previously accepted and discarded — a Terraform configuration
+            setting `ci_workflow` without `ci_provider` applied clean and
+            filtered nothing.
+
+            **Exception — the slug upsert.**  When `slug` names a check that
+            already exists, this POST updates it and returns 200, and that
+            branch never writes `ci_workflow`/`ci_branch`.  So with a
+            `ci_provider` in the same body the filter is accepted and silently
+            discarded, and without one the request is rejected — which means
+            following the rejection's advice lands on the discarding path.  Set
+            these two through `PATCH /api/v1/checks/{id}`, which does persist
+            them.  Tracked as a handler gap, not a shape one: the shape is
+            right, a handler branch does not honour it.
           example: "ci.yml"
         ci_branch:
           type: string
           description: |
             Optional branch name to filter inbound webhooks by.
-            Has no effect when `ci_provider` is not set.
+
+            **Requires `ci_provider`, and this is enforced** — see
+            `ci_workflow`.  Rejected with 400 (`FIELD_NOT_IN_SHAPE`) when the
+            monitor has no CI binding, and subject to the same slug-upsert
+            exception.
           example: "main"
         runaway_ceiling:
           type: [integer, "null"]
@@ -494,8 +589,49 @@ components:
           against nothing.
         - **Any other value** — replaces the stored value.
 
-        `slug`, `monitor_type`, `ci_provider` and `ci_secret` are immutable on
-        update and are ignored if present.
+        `slug`, `monitor_type` and `ci_secret` are immutable on update and are
+        ignored if present.
+
+        `ci_provider` is immutable too, but it is **not** ignored: it is not a
+        member of this schema, so shape validation sees it.  On a monitor that
+        already has a CI binding it is part of the shape and accepted as a
+        no-op; on a monitor with **no** binding the shape is `heartbeat`, which
+        does not declare it, so `{"ci_provider":"github"}` is rejected with 400
+        (`FIELD_NOT_IN_SHAPE`).  Rebinding a monitor to a CI system means
+        deleting and recreating it; PATCH was never able to do it, and now
+        says so instead of returning 200 as though it had.
+
+        **Every field you send is validated against the monitor's SHAPE**, the
+        same way it is on create: a field the stored `monitor_type` and the
+        resulting `schedule_kind` have no place for is rejected with 400
+        (`FIELD_NOT_IN_SHAPE`) rather than merged and discarded.  So
+        `schedule_kind`/`period_s`/`cron_expr`/`tz` are refused on an `http`
+        monitor (its schedule is re-derived from `probe_interval_s` on every
+        PATCH) and `ci_workflow`/`ci_branch` are refused on a monitor with no
+        `ci_provider` bound.
+
+        This is keyed off **what you send**, never off the stored row: `null`,
+        `""`, `0`, `false` and empty collections carry no intent and are
+        ignored, so a client that PATCHes a full document — an explicit `null`
+        for every clearable field, `""` for every unset string — keeps applying
+        cleanly, and no stored value can strand a monitor on a later rename.
+
+        **A value equal to the one `GET` already reports is also ignored.**  A
+        monitor whose `probe_timeout_s` is 10 accepts `{"probe_timeout_s": 10}`
+        whatever its type: the request asks for no change, so nothing can be
+        accepted and discarded.  This matters because every `checks` row carries
+        NOT NULL probe defaults (`probe_method` `"GET"`, `probe_expected_status`
+        200, `probe_timeout_s` 10, `probe_follow_redirects` `true`) that a `GET`
+        returns for **every** monitor type, and a client that round-trips a `GET`
+        into a `PATCH` — Terraform does exactly this, carrying prior state into
+        the plan for every attribute the configuration leaves unset — would
+        otherwise be refused over keys it never chose.  A value that **differs**
+        from the stored one is still rejected, and `POST /api/v1/checks` has no
+        such tolerance: on create there is nothing to echo.
+
+        The schedule kind is the **merged** one, so a PATCH that switches a
+        monitor from `simple` to `cron` is validated against `cron` and may
+        carry `cron_expr`.
       properties:
         name:
           type: string
@@ -1692,21 +1828,43 @@ components:
 
         The `config` object carries kind-specific fields:
 
-        | kind | required config fields | write-only (never returned) |
-        |------|------------------------|----------------------------|
-        | `webhook` | `url`, `secret` | `secret` |
-        | `telegram` | `bot_token`, `chat_id` | `bot_token` |
-        | `discord` | `webhook_url` | `webhook_url` |
-        | `slack` | `webhook_url` | `webhook_url` |
-        | `ntfy` | `topic_url` | — |
-        | `pushover` | `token`, `user_key` | `token`, `user_key` |
-        | `msteams` | `webhook_url` | `webhook_url` |
-        | `googlechat` | `webhook_url` | `webhook_url` |
-        | `email` | `address` | — |
+        | kind | required config fields | optional config fields | write-only (never returned) |
+        |------|------------------------|------------------------|----------------------------|
+        | `webhook` | `url`, `secret` | — | `secret` |
+        | `telegram` | `bot_token`, `chat_id` | — | `bot_token` |
+        | `discord` | `webhook_url` | — | `webhook_url` |
+        | `slack` | `webhook_url` | — | `webhook_url` |
+        | `ntfy` | `topic_url` | `token` | `token` |
+        | `pushover` | `token`, `user_key` | — | `token`, `user_key` |
+        | `msteams` | `webhook_url` | — | `webhook_url` |
+        | `googlechat` | `webhook_url` | — | `webhook_url` |
+        | `email` | `address` | — | — |
+
+        `config` must name only the fields listed for its kind, each exactly once — an
+        unrecognised or repeated key is refused with `code` `DESTINATION_CONFIG_INVALID`
+        rather than ignored.
 
         **Write-only fields** (`secret`, `bot_token`, `webhook_url` for discord/slack/msteams/
-        googlechat, and `token`/`user_key` for pushover) are stored server-side but are
-        **never returned** in any API response.
+        googlechat, `token`/`user_key` for pushover and the optional ntfy `token`) are stored
+        server-side but are **never returned** in any API response.
+
+        **Branded kinds are host-pinned:** `slack` must point at `hooks.slack.com`, `discord` at
+        `discord.com` or `discordapp.com`, `msteams` at `webhook.office.com`,
+        `outlook.office.com`, `logic.azure.com`, `logic.azure.us` or
+        `environment.api.powerplatform.com`, `googlechat` at `chat.googleapis.com`. Subdomains of
+        those hosts are accepted; the port and path are not constrained. Use `webhook` for any
+        other endpoint — it accepts any host. Every destination URL must use `https`. A refused
+        URL comes back as a 400 with `code` `DESTINATION_HOST_NOT_ALLOWED`.
+
+        A pin narrows a branded destination to the vendor's own platform. It does **not** prove
+        the endpoint belongs to whoever created the destination: every pinned domain is
+        multi-tenant and self-service.
+
+        `webhook` and `ntfy` are deliberately unpinned — `webhook` is the generic escape hatch,
+        and self-hosted ntfy is a supported configuration. Both still require `https`.
+
+        A project holds at most **25** destinations; the 26th create is refused with a 403 and
+        `code` `DESTINATION_CAP_REACHED`.
 
         **Email channels** are created **unverified** — a verification email is sent to `address`;
         the channel will not send alerts until the recipient clicks the verification link.
@@ -1756,6 +1914,15 @@ components:
 
             **email** — `{"address": "alerts@example.com"}`.
             Channel is created unverified; a verification email is sent to the address.
+
+            Only the fields listed above for the kind are accepted, each exactly once; an
+            unrecognised or repeated key is a 400 with `code` `DESTINATION_CONFIG_INVALID`.
+            Every URL must use `https`, and the branded kinds are pinned to their vendor's
+            hosts (`slack` → `hooks.slack.com`, `discord` → `discord.com`/`discordapp.com`,
+            `msteams` → `webhook.office.com`/`outlook.office.com`/`logic.azure.com`/
+            `logic.azure.us`/`environment.api.powerplatform.com`, `googlechat` →
+            `chat.googleapis.com`). Anything else belongs on kind `webhook`, which accepts
+            any host.
           additionalProperties: true
           example: {"url": "https://example.com/hook", "secret": "s3cr3t"}
 
@@ -1776,13 +1943,22 @@ components:
         requires `topic_url`, `pushover` requires `token`+`user_key`, `email`
         requires `address`).
 
+        `config` must name only the fields listed for its kind, each exactly once — an
+        unrecognised or repeated key is refused with `code` `DESTINATION_CONFIG_INVALID`
+        rather than ignored.
+
+        A `config` you supply is re-validated against the host-pin and `https` rules
+        documented on `ChannelCreate`. A destination stored before those rules existed keeps
+        delivering, and a request that omits `config` does not re-check it.
+
         **Email re-verification:** changing an email channel's `address` resets
         `verified` to `false` and sends a fresh verification email to the new
         address.  Any other change (including a name-only PATCH) preserves the
         existing verification state.
 
-        Write-only fields (`secret`, `bot_token`, and the discord/slack/msteams/
-        googlechat `webhook_url`) are stored but never returned in the response.
+        Write-only fields (`secret`, `bot_token`, the discord/slack/msteams/googlechat
+        `webhook_url`, `token`/`user_key` for pushover and the optional ntfy `token`) are
+        stored but never returned in the response.
       properties:
         kind:
           type: string
@@ -1802,8 +1978,21 @@ components:
       type: object
       description: |
         A notification channel returned by the API.  Secrets (`secret`, `bot_token`,
-        `webhook_url` for discord/slack/msteams/googlechat, and `token`/`user_key` for
-        pushover) are NEVER included — only a non-secret `target` hint is provided.
+        `webhook_url` for discord/slack/msteams/googlechat, the optional ntfy `token`, and
+        `token`/`user_key` for pushover) are NEVER included — only a non-secret `target` hint
+        is provided.
+
+        A destination of a branded kind is host-pinned: `slack` points at `hooks.slack.com`,
+        `discord` at `discord.com` or `discordapp.com`, `msteams` at `webhook.office.com`,
+        `outlook.office.com`, `logic.azure.com`, `logic.azure.us` or
+        `environment.api.powerplatform.com`, and `googlechat` at `chat.googleapis.com` — so a
+        destination labelled `slack` reaches Slack and not some arbitrary collector. The pin
+        narrows the target to the vendor's platform; it does **not** prove the endpoint belongs
+        to whoever created the destination, because every pinned domain is multi-tenant and
+        self-service. `webhook` and `ntfy` are unpinned by design.
+
+        Destinations created before the pin shipped are grandfathered and may still carry an
+        off-host URL; they keep delivering until their `config` is next written.
       properties:
         id:
           type: string
@@ -1872,7 +2061,38 @@ components:
             Optional RFC 3339 expiry. Must be in the future — a past `expires_at`
             is rejected with 400, since minting an already-dead key is always a
             caller error. Omit for a key that never expires.
+
+            **Exception — key-authenticated callers only:** if the request is
+            authenticated with an API key that itself has an expiry, the new
+            key can never outlive it. Omitting `expires_at` then inherits the
+            authenticating key's own expiry instead of "never", and supplying
+            a later `expires_at` is rejected with 400. A session-authenticated
+            caller (the dashboard) and a key with no expiry of its own impose
+            no such cap.
           example: "2026-12-31T00:00:00Z"
+        scope:
+          type: string
+          enum: ["read", "write", "admin"]
+          default: "write"
+          description: |
+            What the new key may do. `read` is every `GET`; `write` is
+            everything except API key management; `admin` is everything,
+            key management included.
+
+            **Omitted means `write`**, on every surface. That is the right
+            tier for a credential handed to a CI job or an agent: it can do
+            the work and cannot mint itself a replacement that survives the
+            original's revocation.
+
+            **A key may not be given a HIGHER scope than the key that creates
+            it.** Asking for one is rejected with 400
+            (`scope may not exceed the creating key's own scope`), and the
+            problem body carries `max_scope` — the highest tier this caller
+            may ask for — so a client can retry correctly on its first
+            attempt. As with the `expires_at` cap, this does not apply to
+            session-authenticated (dashboard) requests: the session is the
+            account owner.
+          example: "write"
 
     ApiKey:
       type: object
@@ -1923,6 +2143,28 @@ components:
             my client ever successfully authenticate?" indicator — never use
             it for authorization or access control.
           example: "mcp"
+        scope:
+          type: string
+          enum: ["read", "write", "admin"]
+          description: |
+            What this key is permitted to do. Always present. Unlike
+            `last_used_surface` above — which is a spoofable hint derived from
+            a caller-supplied header — this is the value the server actually
+            checks.
+          example: "write"
+        created_by_key_id:
+          type: string
+          format: uuid
+          description: |
+            The API key that minted this one, omitted for a key created from
+            the dashboard (which has no parent key) or whose parent has since
+            been deleted.
+
+            **Revoking a key revokes every key below it in this chain.** A key
+            minted by a key minted by the key you delete goes with it, in one
+            transaction. A key created from the dashboard is never below
+            anything and is unaffected.
+          example: "e1d2c3b4-0000-0000-0000-000000000002"
 
     ApiKeyCreated:
       type: object
@@ -2989,8 +3231,10 @@ paths:
         already at or above the new threshold alerts on its next failure.
 
         `tags` is replaced wholesale, not merged; send `[]` or `null` to remove
-        all tags. `slug`, `monitor_type`, `ci_provider` and `ci_secret` are
-        immutable and are ignored if present.
+        all tags. `slug`, `monitor_type` and `ci_secret` are immutable and are
+        ignored if present.  `ci_provider` is immutable too, but on a monitor
+        with no CI binding it is now rejected with 400 (`FIELD_NOT_IN_SHAPE`)
+        rather than accepted and ignored — see the `CheckPatch` schema.
 
         `ci_workflow`, `ci_branch`, `source_kind` and `source_ref` deliberately
         deviate from strict RFC 7396: an explicit empty string `""` preserves
@@ -4487,6 +4731,10 @@ paths:
         server-side but are **never returned** in any API response.
         Email channels are created unverified; a verification email is sent to the address
         and the channel will not alert until verified.
+
+        `config` must name only the fields its kind accepts, each exactly once, every URL must
+        use `https`, and the branded kinds are pinned to their vendor's hosts — see
+        `ChannelCreate` for the per-kind rules and the `webhook` escape hatch.
       tags: [Channels]
       security:
         - ApiKeyAuth: []
@@ -4571,13 +4819,27 @@ paths:
               schema:
                 $ref: "#/components/schemas/Channel"
         "400":
-          description: Invalid request body, unknown kind, or missing required config fields.
+          description: |
+            Invalid request body, unknown kind, or missing required config fields.
+            Also: a `config` naming a field the kind does not accept, or naming one twice
+            (`code` `DESTINATION_CONFIG_INVALID`), and a target URL that is not `https` or is
+            off its kind's pinned hosts (`code` `DESTINATION_HOST_NOT_ALLOWED`).
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
         "401":
           description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "403":
+          description: |
+            Project is at its destination limit (25). `code` is `DESTINATION_CAP_REACHED`.
+            The request is well-formed and would succeed on a project with room, which is why
+            this is a 403 rather than a 400. Delete a destination you no longer route to, or
+            ask support to raise the limit.
           content:
             application/problem+json:
               schema:
@@ -5445,6 +5707,38 @@ paths:
 
         `expires_at`, when supplied, must be in the future; a past value is
         rejected with 400 rather than silently minting an already-dead key.
+
+        **A key minted by a key can never outlive its creator.** If this
+        request is authenticated with an API key that itself has an expiry, an
+        explicit `expires_at` later than that key's own is rejected with 400
+        (`expires_at may not exceed the creating key's own expiry`). The
+        problem body carries `max_expires_at`, the latest value this caller
+        may ask for, so a client can retry correctly on its first attempt
+        rather than guessing. This cap does not apply to session-authenticated
+        (dashboard) requests, or when the authenticating key itself never
+        expires.
+
+        An **omitted** `expires_at` follows the same rule, and it is in force:
+        under a creating key that itself expires, omitting the field inherits
+        that key's own expiry rather than meaning "never". A short-lived key
+        therefore cannot mint a permanent one, whether it omits the field or
+        asks for too much.
+
+        Nothing here changes for the other callers: under a creating key with
+        no expiry of its own, and for session-authenticated (dashboard)
+        requests, an omitted `expires_at` still means "never".
+
+        A client that wants to choose a lifetime rather than inherit one should
+        send an explicit `expires_at` and retry at `max_expires_at` if refused,
+        which is what the MCP `create_api_key` tool does.
+
+        **A key may not be given a higher scope than its creator either.**
+        The same shape as the expiry cap above: an explicit `scope` that
+        outranks the authenticating key's own is rejected with 400
+        (`scope may not exceed the creating key's own scope`), and the
+        problem body carries `max_scope`. An omitted `scope` is always
+        `write`, which no key can fail to grant except a `read` key — and a
+        `read` key cannot reach this operation at all.
       tags: [ApiKeys]
       security:
         - ApiKeyAuth: []
@@ -5455,8 +5749,8 @@ paths:
             schema:
               $ref: "#/components/schemas/ApiKeyCreate"
             examples:
-              never_expires:
-                summary: A key with no expiry
+              inherits_expiry:
+                summary: No expiry requested (inherits the creating key's, if it has one)
                 value:
                   name: "ci"
               short_lived:
@@ -5464,6 +5758,11 @@ paths:
                 value:
                   name: "short"
                   expires_at: "2026-12-31T00:00:00Z"
+              read_only:
+                summary: A read-only key for a dashboard or a scraper
+                value:
+                  name: "grafana"
+                  scope: "read"
       responses:
         "201":
           description: API key created. `key` is the plaintext credential — shown exactly once.
@@ -5472,17 +5771,61 @@ paths:
               schema:
                 $ref: "#/components/schemas/ApiKeyCreated"
         "400":
-          description: Missing `name`, or `expires_at` is not in the future.
+          description: |
+            Missing `name`, `expires_at` is not in the future, or (when
+            authenticated with a key that itself expires) `expires_at`
+            exceeds that key's own expiry
+            (`expires_at may not exceed the creating key's own expiry`).
+
+            That last case, and only that case, adds a `max_expires_at`
+            member to the problem body: the latest `expires_at` this caller
+            may ask for, as an RFC 3339 timestamp. It is the authenticating
+            key's own expiry, and it is always itself an acceptable value, so
+            a client may resend the request with it verbatim.
+
+            A fourth case has no `expires_at` in the request at all, and
+            arises only where an omitted expiry is inherited: if the
+            authenticating key's own expiry has passed between authentication
+            and this handler, the expiry it would hand down is already dead,
+            and the request is refused with
+            `the creating key has expired` rather than minting a key that
+            could never be used.
+
+            A fifth case is an unrecognised `scope`, or an explicit `scope`
+            that outranks the authenticating key's own
+            (`scope may not exceed the creating key's own scope`) — that last
+            case, and only that case, adds a `max_scope` member instead.
           content:
             application/problem+json:
               schema:
-                $ref: "#/components/schemas/Problem"
+                allOf:
+                  - $ref: "#/components/schemas/Problem"
+                  - type: object
+                    properties:
+                      max_expires_at:
+                        type: string
+                        format: date-time
+                        description: |
+                          Present only on the creating-key expiry cap. The
+                          latest `expires_at` this caller may request.
+                        example: "2026-12-01T09:30:00Z"
+                      max_scope:
+                        type: string
+                        enum: ["read", "write", "admin"]
+                        description: |
+                          Present only on the creating-key scope cap. The
+                          highest scope this caller may request. It is the
+                          authenticating key's own scope, and is always
+                          itself an acceptable value.
+                        example: "write"
         "401":
           description: Missing or invalid API key.
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+        "403":
+          $ref: "#/components/responses/InsufficientScope"
         "429":
           $ref: "#/components/responses/RateLimited"
 
@@ -5511,6 +5854,8 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+        "403":
+          $ref: "#/components/responses/InsufficientScope"
         "429":
           $ref: "#/components/responses/RateLimited"
 
@@ -5532,12 +5877,39 @@ paths:
         Permanently deletes the API key from the project. Returns 204 No
         Content on success. A key belonging to another project is
         indistinguishable from a missing one — both return 404.
+
+        **Revoking CASCADES.** The key is deleted, and so is every key
+        descended from it: keys it created, keys those keys created, and so
+        on. A key that can mint keys would otherwise outlive its own
+        revocation — revoke the compromised credential and the key it quietly
+        created keeps working. The whole subtree goes in one statement, so
+        there is no moment at which the parent is gone and a descendant still
+        authenticates.
+
+        The number of keys actually deleted (this one plus its descendants)
+        is returned in the `X-Revoked-Count` response header. The cascade
+        cannot leave the project: a key in another project is never reached,
+        whatever it claims as its creator.
+
+        Regenerating a key from the dashboard is deliberately NOT a cascade.
+        Rotating a credential is not a request to destroy everything it made,
+        so the descendants survive and their `created_by_key_id` becomes null.
       tags: [ApiKeys]
       security:
         - ApiKeyAuth: []
       responses:
         "204":
           description: API key revoked.
+          headers:
+            X-Revoked-Count:
+              description: |
+                How many keys this revoke deleted: the key named in the path
+                plus every key descended from it. `1` means the key created
+                nothing.
+              schema:
+                type: integer
+                minimum: 1
+                example: 3
         "400":
           description: id is not a valid UUID.
           content:
@@ -5550,6 +5922,8 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+        "403":
+          $ref: "#/components/responses/InsufficientScope"
         "404":
           description: API key not found in this project.
           content:
@@ -6049,12 +6423,28 @@ paths:
         in: path
         required: true
         description: |
-          Check UUID.  Acts as a capability token — no additional authentication
-          is required.  Keep this UUID confidential.
+          Check UUID.  Identifies the check whose open incident is annotated, and
+          — while the X-LastPing-Token header remains optional — also acts as a
+          capability token.  Keep this UUID confidential.
         schema:
           type: string
           format: uuid
         example: "550e8400-e29b-41d4-a716-446655440000"
+      - name: X-LastPing-Token
+        in: header
+        required: false
+        description: |
+          The check's CI secret — the same value the provider webhook signs with,
+          revealed (password-gated) under the monitor's CI settings.  Compared in
+          constant time.
+
+          Sending it is currently optional so that workflows written before this
+          header existed keep working, but it WILL become mandatory: a call that
+          does not authenticate is rate limited and logged today, and rejected
+          with 401 once enforcement is switched on.  Send it.
+        schema:
+          type: string
+        example: "s3cr3t-from-the-monitor-ci-settings"
 
     post:
       operationId: attachCIFailureDetail
@@ -6065,8 +6455,12 @@ paths:
         step so the failure reason is visible inside LastPing without needing to
         follow a link to the CI provider.
 
-        Authentication: the check UUID in the path is the capability token (same
-        model as ping ingest URLs).  No X-Api-Key header is required or checked.
+        Authentication: present the check's CI secret in the X-LastPing-Token
+        header; it is compared in constant time.  No X-Api-Key header is required
+        or checked.  A request that does not authenticate is rate limited per
+        check (10 per 15 minutes) and falls back to the check UUID in the path as
+        a capability token — until enforcement is switched on, after which it is
+        rejected with 401.
 
         Idempotency / race: if there is no open incident when this request arrives
         the request is accepted as a no-op and 200 OK is returned.
@@ -6088,8 +6482,24 @@ paths:
           description: |
             Detail accepted.  Returns 200 OK whether or not an open incident
             existed (no open incident = accepted no-op).
+        "401":
+          description: |
+            The CI secret was missing or wrong, and enforcement is switched on.
+          content:
+            text/plain:
+              schema:
+                type: string
         "404":
-          description: The id path segment is not a valid UUID.
+          description: |
+            The id path segment is not a valid UUID, or no such check exists.
+          content:
+            text/plain:
+              schema:
+                type: string
+        "429":
+          description: |
+            Too many unauthenticated calls for this check (10 per 15 minutes).
+            Authenticated calls are not counted against this window.
           content:
             text/plain:
               schema:

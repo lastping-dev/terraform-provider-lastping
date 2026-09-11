@@ -52,6 +52,18 @@ type Problem struct {
 	Detail string `json:"detail"`
 	Code   string `json:"code"`
 	Fix    string `json:"fix"`
+
+	// MaxScope is the extension member POST /api/v1/api-keys sets when the
+	// requested scope outranks the scope of the key making the request: the
+	// highest tier this caller may ask for. "You asked for too much" without
+	// "and this is the most you may have" leaves the practitioner guessing,
+	// which is the same reasoning that put max_expires_at on the wire.
+	MaxScope string `json:"max_scope"`
+
+	// RequiredScope is the extension member a 403 INSUFFICIENT_SCOPE sets: the
+	// minimum scope the route needed. It names a key to re-mint, where a bare
+	// "forbidden" is indistinguishable from a bug.
+	RequiredScope string `json:"required_scope"`
 }
 
 func (p *Problem) Error() string {
@@ -66,6 +78,14 @@ func (p *Problem) Error() string {
 	}
 	if p.Code != "" {
 		fmt.Fprintf(&b, " [%s]", p.Code)
+	}
+	// Only one of these is ever set, and only on the two refusals that carry
+	// it, so this appends a single parenthetical rather than a list.
+	switch {
+	case p.MaxScope != "":
+		fmt.Fprintf(&b, " (max_scope: %s)", p.MaxScope)
+	case p.RequiredScope != "":
+		fmt.Fprintf(&b, " (required_scope: %s)", p.RequiredScope)
 	}
 	if p.Fix != "" {
 		fmt.Fprintf(&b, "\n\nSuggested fix: %s", p.Fix)
@@ -96,6 +116,39 @@ func ProblemCode(err error) string {
 	}
 	return ""
 }
+
+// ProblemMaxScope returns the `max_scope` a refused key-create came back with —
+// the highest scope the credential running Terraform may ask for — or "" when
+// err is not that refusal.
+//
+// Like ProblemCode, this exists for the case where the member selects a
+// DIFFERENT diagnostic rather than merely being visible: a scope refused
+// because the creating key outranks it needs a practitioner to name a lower
+// scope or re-run with a stronger credential, and neither is obvious from the
+// detail sentence alone.
+func ProblemMaxScope(err error) string {
+	var p *Problem
+	if errors.As(err, &p) {
+		return p.MaxScope
+	}
+	return ""
+}
+
+// ProblemRequiredScope returns the `required_scope` a 403 INSUFFICIENT_SCOPE
+// names — the minimum scope the operation needs — or "" when err is not that
+// refusal.
+func ProblemRequiredScope(err error) string {
+	var p *Problem
+	if errors.As(err, &p) {
+		return p.RequiredScope
+	}
+	return ""
+}
+
+// IsForbidden reports whether err is a 403. The provider uses it to tell a
+// scope refusal (the credential is too weak for this operation, and stays too
+// weak on a retry) apart from every other failure.
+func IsForbidden(err error) bool { return statusIs(err, http.StatusForbidden) }
 
 func statusIs(err error, code int) bool {
 	var p *Problem

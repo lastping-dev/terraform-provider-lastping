@@ -145,6 +145,17 @@ var deliberatelyUnmodelled = map[string]string{
 		"persisted-looking fields — see the resource's own schema description. created_at describes " +
 		"a record that is never refreshed or diffed here, so exposing it would suggest state this " +
 		"resource explicitly does not keep.",
+	// created_by_key_id is the API key that minted this one, and for an
+	// ephemeral key that is ALWAYS the credential the provider itself is
+	// configured with — the caller already knows it, and no configuration
+	// could ever ask for a different answer. The managed resource models it
+	// because there the lineage outlives the run and decides what a later
+	// revocation takes with it; here the key is revoked at the end of the same
+	// apply, so there is nothing downstream for the chain to reach and nothing
+	// to reconcile across runs.
+	"ephemeral.lastping_api_key.created_by_key_id": "always the provider's own configured key, by " +
+		"construction, and the ephemeral key is revoked before anything could be minted beneath it — " +
+		"so the lineage has no consumer here. The managed resource models it, where it does.",
 	"ephemeral.lastping_api_key.expires_at": "ephemeral.lastping_api_key models its lifetime as the " +
 		"caller-supplied ttl (a duration), not the server's absolute expires_at — the same asymmetry " +
 		"ttl's sendExempt/readExempt entries already document. The resource is consumed and gone " +
