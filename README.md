@@ -73,10 +73,12 @@ supply it either:
 
 **Key scopes.** Every LastPing key carries a scope: `read` (every GET), `write`
 (everything except API key management) or `admin` (everything, key management
-included). `write` is the default for a new key and is enough for every resource
-here **except** `lastping_api_key` — managing keys is precisely what `write`
-excludes — so a configuration that creates API keys must be run with an `admin`
-key. A run that only needs key-management power for its own duration can mint a
+included). A new key gets `write` unless it asks for something else — that
+default is the API's, not the provider's, so omitting `scope` on a
+`lastping_api_key` means "let the API decide for a new key, and leave an
+existing key's scope alone". `write` is enough for every resource here
+**except** `lastping_api_key` — managing keys is precisely what `write` excludes
+— so a configuration that creates API keys must be run with an `admin` key. A run that only needs key-management power for its own duration can mint a
 short-lived one with the ephemeral resource's `scope = "admin"`; keys minted
 that way are revoked with it, so anything that must outlive the run has to be
 created by a credential that does.

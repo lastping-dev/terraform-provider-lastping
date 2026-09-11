@@ -65,14 +65,19 @@ func apiKeyCreateDiagnostic(requested string, err error, otherwise string) (stri
 				"the key that mints it.\n\n"+
 				"Either set scope to %q (or lower), or run Terraform with an API key that itself has "+
 				"the %s scope.\n\nThe API refused the request, so no key was created.",
-				scopeForMessage(requested), maxScope, maxScope, scopeForMessage(requested))
+				scopeForMessage(requested), maxScope, maxScope, effectiveScope(requested))
 	}
 
-	if client.IsForbidden(err) {
-		required := client.ProblemRequiredScope(err)
+	// Gated on the problem MEMBERS, not on the bare status. A 403 that is not
+	// about scope — a cap refusal of the shape the API already uses on other
+	// routes, say — would otherwise be reported as "re-mint your key", which is
+	// both wrong and unactionable. Anything without these members falls through
+	// to the verbatim branch, which already renders detail, code and fix.
+	if required, code := client.ProblemRequiredScope(err), client.ProblemCode(err); required != "" ||
+		code == "INSUFFICIENT_SCOPE" {
 		if required == "" {
-			// The route needs admin; a 403 that does not say so is still a 403
-			// about scope, and naming the tier is the whole point of the message.
+			// The code said scope but the member is missing: this route needs
+			// admin, and naming a tier is the whole point of the message.
 			required = apiKeyScopeAdmin
 		}
 		return "The API key running Terraform cannot manage API keys",
@@ -87,13 +92,28 @@ func apiKeyCreateDiagnostic(requested string, err error, otherwise string) (stri
 	return otherwise, err.Error()
 }
 
-// scopeForMessage renders a requested scope for a diagnostic, spelling out the
-// case where nothing was configured — "the default" is the difference between a
-// practitioner looking for the line they wrote and a practitioner looking for
-// the line they did not.
+// scopeForMessage renders the requested scope for the clause that describes
+// what the CONFIGURATION asked for. A configuration that asked for nothing gets
+// the API's own default, and saying so is the difference between a practitioner
+// looking for the line they wrote and one looking for a line that is not there.
 func scopeForMessage(requested string) string {
 	if requested == "" {
-		return apiKeyScopeWrite + " (the default)"
+		return apiKeyScopeWrite + " (the API's default, since none is configured)"
+	}
+	return requested
+}
+
+// effectiveScope is the bare tier a request ends up asking for — the configured
+// value, or the API's default when none was configured.
+//
+// It exists because the two clauses of the scope-cap diagnostic need different
+// renderings of the same fact: one describes the configuration (and benefits
+// from the parenthetical), the other describes the CREATING KEY a practitioner
+// would have to run with instead, where a parenthetical about defaults would be
+// attached to the wrong key entirely.
+func effectiveScope(requested string) string {
+	if requested == "" {
+		return apiKeyScopeWrite
 	}
 	return requested
 }

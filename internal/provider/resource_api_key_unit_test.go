@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 
 	"context"
 	"testing"
@@ -13,7 +14,6 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/defaults"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
@@ -348,11 +348,10 @@ func apiKeyCreate(t *testing.T, c *client.Client, config apiKeyResourceModel) (a
 	if plan.ExpiresAt.IsNull() {
 		plan.ExpiresAt = types.StringUnknown()
 	}
-	// scope has a Default, so the framework hands Create a KNOWN plan value
-	// even for a configuration that omits it — modelling it as unknown here
-	// would test a plan Terraform never produces.
+	// scope has no Default, so an omitted one reaches Create as unknown, the
+	// same as expires_at — the server is what fills it in.
 	if plan.Scope.IsNull() {
-		plan.Scope = types.StringValue(apiKeyScopeWrite)
+		plan.Scope = types.StringUnknown()
 	}
 
 	r := &apiKeyResource{client: c}
@@ -422,7 +421,7 @@ func TestAPIKeyCreateTakesServerExpiry(t *testing.T) {
 // copy of them — over one plan, and reports whether a replacement was demanded.
 // Mirrors apiKeyExpiresAtPlan; the two attributes deliberately carry different
 // modifiers, and asserting on the declared ones is what keeps that deliberate.
-func apiKeyScopePlan(t *testing.T, state, config, plan types.String) (types.String, bool) {
+func apiKeyScopePlan(t *testing.T, state, config, plan types.String, creating bool) (types.String, bool) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -432,11 +431,15 @@ func apiKeyScopePlan(t *testing.T, state, config, plan types.String) (types.Stri
 	model := func(v types.String) apiKeyResourceModel {
 		return apiKeyResourceModel{Name: types.StringValue("k"), Scope: v}
 	}
+	stateRaw := apiKeyRawValue(t, model(state))
+	if creating {
+		stateRaw = tftypes.NewValue(stateRaw.Type(), nil)
+	}
 	resp := &planmodifier.StringResponse{PlanValue: plan}
 	for _, mod := range attr.PlanModifiers {
 		mod.PlanModifyString(ctx, planmodifier.StringRequest{
 			Path:        path.Root("scope"),
-			State:       tfsdk.State{Schema: apiKeySchema(t), Raw: apiKeyRawValue(t, model(state))},
+			State:       tfsdk.State{Schema: apiKeySchema(t), Raw: stateRaw},
 			Plan:        tfsdk.Plan{Schema: apiKeySchema(t), Raw: apiKeyRawValue(t, model(plan))},
 			Config:      tfsdk.Config{Schema: apiKeySchema(t), Raw: apiKeyRawValue(t, model(config))},
 			StateValue:  state,
@@ -447,21 +450,53 @@ func apiKeyScopePlan(t *testing.T, state, config, plan types.String) (types.Stri
 	return resp.PlanValue, resp.RequiresReplace
 }
 
-// TestAPIKeyScopeSchema pins the shape: a default of write applied by the
-// framework rather than by the server, the three storable values and nothing
-// else, and a change that replaces the key — the API has no way to move a
-// key's scope, so an in-place update could only ever be a lie.
+// TestAPIKeyScopeSchema pins the shape, and the absence of a Default is the
+// load-bearing half.
+//
+// A Default is re-applied on EVERY plan wherever the config is null — the
+// framework never looks at the value carried forward from prior state — so
+// `Default: "write"` next to a replacement modifier planned any key the server
+// says is `admin` (every key that predates the scope column) down to `write`
+// and proposed replacing it. Replacing an API key revokes it, and revocation
+// cascades to every key it minted, so a bare provider upgrade would have
+// proposed destroying a subtree of live credentials.
 func TestAPIKeyScopeSchema(t *testing.T) {
 	attr, ok := apiKeySchema(t).Attributes["scope"].(schema.StringAttribute)
 	require.True(t, ok)
 	require.True(t, attr.Optional, "a practitioner must be able to choose a tier")
-	require.True(t, attr.Computed, "the framework requires Computed for an attribute with a Default")
-	require.NotNil(t, attr.Default, "an omitted scope must plan as a known write, not as unknown")
+	require.True(t, attr.Computed, "the server assigns one for a configuration that omits it")
+	require.Nil(t, attr.Default,
+		"a Default is re-applied on every plan, which turns an omitted scope into a proposed "+
+			"replacement of a live credential")
 
-	resp := defaults.StringResponse{}
-	attr.Default.DefaultString(context.Background(), defaults.StringRequest{}, &resp)
-	require.Equal(t, apiKeyScopeWrite, resp.PlanValue.ValueString(),
-		"the default is the tier that cannot mint itself a replacement")
+	// The modifier PAIR, asserted structurally, because the two replacement
+	// modifiers are behaviourally identical while there is no Default: with a
+	// null config the planned value is the prior one, so neither fires. They
+	// diverge only once something re-introduces a Default — which is exactly
+	// the change this test exists to stop being silent. Pinning the safe
+	// modifier here means such a change has to walk past two failing
+	// assertions, not one.
+	var sawUseState, sawReplaceIfConfigured bool
+	for _, mod := range attr.PlanModifiers {
+		// The framework's modifier types are unexported, so they are named by
+		// the description they carry rather than by a type assertion.
+		switch d := mod.Description(context.Background()); {
+		case strings.Contains(d, "value of this attribute in state will not change"):
+			sawUseState = true
+		case strings.Contains(d, "is configured and changes"):
+			// "If the value of this attribute IS CONFIGURED and changes…" —
+			// the unconditional RequiresReplace describes itself without that
+			// clause, so this distinguishes the two.
+			sawReplaceIfConfigured = true
+		}
+	}
+	require.True(t, sawUseState,
+		"without UseStateForUnknown the attribute plans as unknown on every run, which is a diff "+
+			"on a resource whose replacement revokes a live credential")
+	require.True(t, sawReplaceIfConfigured,
+		"replacement is for a scope a practitioner wrote down; an omitted scope means "+
+			"\"whatever this key already has\"")
+	require.Len(t, attr.PlanModifiers, 2, "an unreviewed third modifier changes what a plan does")
 
 	t.Run("only the three storable values are accepted", func(t *testing.T) {
 		for _, ok := range apiKeyScopes {
@@ -484,33 +519,54 @@ func TestAPIKeyScopeSchema(t *testing.T) {
 	})
 }
 
-// TestAPIKeyScopePlan: an unchanged scope proposes nothing, and every change —
-// including dropping the attribute back to its default — replaces the key.
+// TestAPIKeyScopePlan is the regression for the revocation hazard above, plus
+// its positive companion so the absence assertion cannot degrade into
+// asserting nothing.
 //
-// The last case is why the modifier is RequiresReplace and not
-// RequiresReplaceIfConfigured: with a default, removing `scope = "admin"` from
-// a configuration really does mean "make it write", which is a different
-// credential, not an absence of intent.
+// The first case is the one that matters: a key the server says is `admin` —
+// which is what EVERY key minted before the scope column existed is, by that
+// migration's grandfathering clause — whose configuration says nothing about
+// scope, because it was written before the attribute existed. That must plan
+// as no change at all. The second and third prove a configured change still
+// replaces, which is the only way the API can change a key's scope.
 func TestAPIKeyScopePlan(t *testing.T) {
 	write := types.StringValue(apiKeyScopeWrite)
 	admin := types.StringValue(apiKeyScopeAdmin)
+	read := types.StringValue(apiKeyScopeRead)
 
-	t.Run("unchanged proposes nothing", func(t *testing.T) {
-		got, replace := apiKeyScopePlan(t, admin, admin, admin)
+	t.Run("a grandfathered admin key with nothing configured is left alone", func(t *testing.T) {
+		// Terraform offers unknown for a Computed attribute with a null config.
+		got, replace := apiKeyScopePlan(t, admin, types.StringNull(), types.StringUnknown(), false)
+		require.Equal(t, admin, got, "the scope the key already has must survive the plan")
+		require.False(t, got.IsUnknown(), "an unknown here is a diff on every plan")
+		require.False(t, replace,
+			"an omitted scope is not a demotion request, and replacing revokes a live credential "+
+				"along with every key it minted")
+	})
+
+	t.Run("unchanged configuration proposes nothing", func(t *testing.T) {
+		got, replace := apiKeyScopePlan(t, admin, admin, admin, false)
 		require.Equal(t, admin, got)
 		require.False(t, replace)
 	})
 
 	t.Run("a changed scope replaces the key", func(t *testing.T) {
-		_, replace := apiKeyScopePlan(t, write, admin, admin)
+		got, replace := apiKeyScopePlan(t, write, admin, admin, false)
+		require.Equal(t, admin, got)
 		require.True(t, replace, "the API cannot move a key's scope, so this must replace")
 	})
 
-	t.Run("dropping the attribute falls back to the default, and that replaces too", func(t *testing.T) {
-		// Terraform applies the default when config is null, so the plan value
-		// is write against a state of admin.
-		_, replace := apiKeyScopePlan(t, admin, types.StringNull(), write)
-		require.True(t, replace, "an admin key becoming a write key is a different credential")
+	t.Run("a demotion a practitioner actually wrote still replaces", func(t *testing.T) {
+		_, replace := apiKeyScopePlan(t, admin, read, read, false)
+		require.True(t, replace, "asking for less is still a different credential")
+	})
+
+	t.Run("create leaves it unknown so the server may decide", func(t *testing.T) {
+		got, replace := apiKeyScopePlan(t, types.StringNull(), types.StringNull(),
+			types.StringUnknown(), true)
+		require.True(t, got.IsUnknown(),
+			"pinning a value here would stop the API applying its own default")
+		require.False(t, replace)
 	})
 }
 
@@ -519,14 +575,16 @@ func TestAPIKeyScopePlan(t *testing.T) {
 // inert: the request has to carry the scope, and the response's scope and
 // created_by_key_id have to reach state.
 func TestAPIKeyCreateSendsScopeAndRecordsLineage(t *testing.T) {
-	t.Run("the default is requested explicitly and lands in state", func(t *testing.T) {
+	t.Run("an omitted scope asks for nothing and records the server's answer", func(t *testing.T) {
 		var sent map[string]any
 		got, diags := apiKeyCreate(t, apiKeyCreateServer(t, nil, &sent),
 			apiKeyResourceModel{Name: types.StringValue("k")})
 		require.False(t, diags.HasError(), "%v", diags)
-		require.Equal(t, apiKeyScopeWrite, sent["scope"],
-			"the plan carries the default, so the request names it rather than relying on the server's")
-		require.Equal(t, apiKeyScopeWrite, got.Scope.ValueString())
+		require.NotContains(t, sent, "scope",
+			"a configuration that chose no scope must let the API apply its own default, and an "+
+				"explicit empty scope is a caller error the API refuses")
+		require.Equal(t, apiKeyScopeWrite, got.Scope.ValueString(),
+			"whatever the server decided has to reach state, or the apply is inconsistent")
 		require.Equal(t, "22222222-2222-4222-a222-222222222222", got.CreatedByKeyID.ValueString(),
 			"the key that minted this one is what a cascading revocation follows")
 	})

@@ -93,8 +93,8 @@ func TestProblem_ScopeExtensionsAreSurfaced(t *testing.T) {
 		require.Error(t, err)
 		require.Equal(t, "write", ProblemMaxScope(err))
 		require.Contains(t, err.Error(), "max_scope: write")
-		require.Equal(t, "", ProblemRequiredScope(err))
-		require.False(t, IsForbidden(err))
+		require.Equal(t, "", ProblemRequiredScope(err),
+			"required_scope belongs to the 403 and must not appear on the cap refusal")
 	})
 
 	t.Run("403 required_scope", func(t *testing.T) {
@@ -110,8 +110,10 @@ func TestProblem_ScopeExtensionsAreSurfaced(t *testing.T) {
 		_, err := New(srv.URL, "lp_x", "test").
 			CreateAPIKey(context.Background(), CreateAPIKeyInput{Name: "k"})
 		require.Error(t, err)
-		require.True(t, IsForbidden(err))
 		require.Equal(t, "admin", ProblemRequiredScope(err))
+		require.Equal(t, "INSUFFICIENT_SCOPE", ProblemCode(err),
+			"the provider selects its diagnostic from these two members, never from the bare status")
+		require.Equal(t, "", ProblemMaxScope(err))
 		require.Contains(t, err.Error(), "required_scope: admin")
 	})
 

@@ -145,11 +145,6 @@ func ProblemRequiredScope(err error) string {
 	return ""
 }
 
-// IsForbidden reports whether err is a 403. The provider uses it to tell a
-// scope refusal (the credential is too weak for this operation, and stays too
-// weak on a retry) apart from every other failure.
-func IsForbidden(err error) bool { return statusIs(err, http.StatusForbidden) }
-
 func statusIs(err error, code int) bool {
 	var p *Problem
 	return errors.As(err, &p) && p.Status == code

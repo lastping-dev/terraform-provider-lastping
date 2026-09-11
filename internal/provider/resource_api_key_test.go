@@ -507,6 +507,48 @@ resource "lastping_api_key" "defaulted" {
 				},
 				Check: testAccCheckServerScope(t, "lastping_api_key.read", "write"),
 			},
+			{
+				// REMOVING scope from a configuration must propose NOTHING.
+				//
+				// This is the grandfathered-key hazard, in the only shape an
+				// acceptance test can build it: state holds a scope the
+				// configuration no longer mentions, exactly as it would for a
+				// key minted before the attribute existed (every such key is
+				// `admin` on the server, by that migration's grandfathering
+				// clause). A default applied on every plan would propose
+				// replacing these keys, and replacing an API key revokes it
+				// along with every key it ever minted — on a bare provider
+				// upgrade, with no user action at all.
+				//
+				// The plan check is the assertion, and PlanOnly is deliberately
+				// NOT set — the two are mutually exclusive in the test
+				// framework, and this way the step also runs the framework's
+				// own post-apply empty-plan check, so both "the plan proposes
+				// nothing" and "it still proposes nothing afterwards" are
+				// covered.
+				Config: `
+resource "lastping_api_key" "read" {
+  name = "acc-scope-read"
+}
+
+resource "lastping_api_key" "write" {
+  name = "acc-scope-write"
+}
+
+resource "lastping_api_key" "admin" {
+  name = "acc-scope-admin"
+}
+
+resource "lastping_api_key" "defaulted" {
+  name = "acc-scope-defaulted"
+}`,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("lastping_api_key.admin", plancheck.ResourceActionNoop),
+						plancheck.ExpectResourceAction("lastping_api_key.read", plancheck.ResourceActionNoop),
+					},
+				},
+			},
 		},
 	})
 }

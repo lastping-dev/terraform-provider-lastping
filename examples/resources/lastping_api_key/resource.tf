@@ -12,9 +12,11 @@ resource "lastping_api_key" "ci" {
   # end date. Must be RFC 3339 and in the future.
   expires_at = "2027-01-01T00:00:00Z"
 
-  # Optional. "write" is the default and what a CI job wants: it can report
-  # pings and manage monitors, and it cannot mint itself a replacement key that
-  # would survive this one's revocation.
+  # Optional. Omit it and the API chooses: a new key gets the API's own default
+  # of "write", which is what a CI job wants — it can report pings and manage
+  # monitors, and it cannot mint itself a replacement key that would survive
+  # this one's revocation. Written out here because it is worth being explicit
+  # about what a credential may do.
   scope = "write"
 }
 
@@ -35,6 +37,13 @@ resource "lastping_api_key" "platform" {
   scope      = "admin"
   expires_at = "2027-01-01T00:00:00Z"
 }
+
+# Removing `scope` from a configuration changes NOTHING: the key keeps the scope
+# it already has, the same way `expires_at` behaves. That matters for keys that
+# predate scopes — every one of them is "admin" on the server — because the
+# alternative would be a provider upgrade proposing to revoke them. Demote a key
+# deliberately with `terraform apply -replace`, remembering that replacing a key
+# revokes the old one and everything below it.
 
 # Destroying an API key resource REVOKES EVERY KEY IT CREATED, recursively: the
 # API walks the created_by_key_id chain in one transaction. So destroying
