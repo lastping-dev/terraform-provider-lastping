@@ -111,4 +111,5 @@ Always either both present or both null with `source_kind`: a database CHECK con
 - `status` (String) Current status: `new`, `up`, `late`, or `down`.
 - `step_timeout_s` (Number) How long an armed run may go without reporting a step before a `stalled` incident opens, in seconds. Null when unset, in which case stall detection is off. Always strictly below the effective run budget (`max_runtime_s`, or `grace_s` when that is unset), and never set on an `http` monitor.
 - `tags` (Set of String) Labels attached to this monitor. Empty when it has none.
+- `trace_content` (String) What this monitor's OpenTelemetry traces keep of prompt, command and tool content: `dropped` (the default) or `redacted` (kept, with secret-shaped values redacted at ingest).
 - `tz` (String) IANA timezone used to evaluate `cron_expr`.

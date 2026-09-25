@@ -1182,6 +1182,7 @@ func TestResolveUnknownsFromState_CoversEveryAttribute(t *testing.T) {
 		CiSecret:             types.StringValue("a3f8c2d1e4b7a9f0c3d2e1b4a7f8c0d3"),
 		SourceKind:           types.StringValue("github-actions"),
 		SourceRef:            types.StringValue(".github/workflows/nightly.yml#build"),
+		TraceContent:         types.StringValue("redacted"),
 		ProbeURL:             types.StringValue("https://example.com/health"),
 		ProbeMethod:          types.StringValue("HEAD"),
 		ProbeIntervalS:       types.Int64Value(120),

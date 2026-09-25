@@ -25,7 +25,8 @@ type APIKey struct {
 	// here — for a key that has never been used.
 	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
 
-	// Scope is what the key is permitted to do: "read", "write" or "admin".
+	// Scope is what the key is permitted to do: "read", "write" or "admin",
+	// or "ingest" (pings and telemetry only, never the management API).
 	// The API always sends it, so an empty string here means the response came
 	// from a backend that predates scopes rather than "unscoped" — there is no
 	// such key.
@@ -36,6 +37,10 @@ type APIKey struct {
 	// whose parent has since been deleted. Revoking a key revokes every key
 	// below it in this chain.
 	CreatedByKeyID *string `json:"created_by_key_id,omitempty"`
+
+	// CheckID is the one monitor an ingest key is bound to. Omitted — nil
+	// here — for an unbound key and for every key of another scope.
+	CheckID *string `json:"check_id,omitempty"`
 
 	// Key is the plaintext key. Non-empty only on the CreateAPIKey response.
 	Key string `json:"key,omitempty"`
@@ -48,10 +53,14 @@ type APIKey struct {
 // scope (apply the default) from an explicitly empty one (a caller error it
 // refuses rather than silently upgrading). Sending "" would turn a caller that
 // simply did not choose into a 400.
+//
+// CheckID is omitempty for the same reason: absent means "unbound", and the API
+// accepts it only alongside scope "ingest".
 type createAPIKeyRequest struct {
 	Name      string     `json:"name"`
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 	Scope     string     `json:"scope,omitempty"`
+	CheckID   string     `json:"check_id,omitempty"`
 }
 
 // CreateAPIKeyInput is what CreateAPIKey sends. It is a struct rather than a
@@ -63,15 +72,17 @@ type CreateAPIKeyInput struct {
 	Name string
 	// ExpiresAt is the absolute expiry, or nil to send none.
 	ExpiresAt *time.Time
-	// Scope is "read", "write" or "admin", or "" to send no scope at all and
-	// let the server apply its own default.
+	// Scope is "read", "write", "admin" or "ingest", or "" to send no scope at
+	// all and let the server apply its own default.
 	Scope string
+	// CheckID binds an ingest key to one monitor, or "" for an unbound key.
+	CheckID string
 }
 
 // CreateAPIKey mints an API key. The returned APIKey is the only time the
 // plaintext Key is ever available.
 func (c *Client) CreateAPIKey(ctx context.Context, in CreateAPIKeyInput) (*APIKey, error) {
-	body := createAPIKeyRequest{Name: in.Name, Scope: in.Scope}
+	body := createAPIKeyRequest{Name: in.Name, Scope: in.Scope, CheckID: in.CheckID}
 	if in.ExpiresAt != nil {
 		utc := in.ExpiresAt.UTC()
 		body.ExpiresAt = &utc

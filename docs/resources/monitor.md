@@ -122,6 +122,22 @@ resource "lastping_monitor" "etl_ingest" {
 # either resource — the monitor keeps its ping history and simply becomes
 # unowned, same as `terraform destroy` on the agent itself.
 
+# What the agent's OpenTelemetry traces keep of prompt, command and tool
+# content. "dropped" is the server's default and removes it at ingest; token
+# counts, cost and lengths are kept either way. "redacted" keeps the content,
+# with secret-shaped values redacted as it arrives: set it only when the people
+# whose prompts and commands the traces carry have agreed to that. Omitting the
+# attribute keeps whatever the monitor already has.
+resource "lastping_monitor" "etl_triage" {
+  name          = "ETL triage agent"
+  slug          = "etl-triage"
+  schedule_kind = "on_demand"
+  grace_s       = 300
+
+  agent_id      = lastping_agent.nightly_etl.id
+  trace_content = "redacted"
+}
+
 # Output assertions: the job runs on time, exits zero — and produced nothing.
 # A dead-man's-switch alone cannot tell that apart from a healthy run, because
 # nothing ever looks at what the run reported. An assertion does: it inspects
@@ -463,6 +479,11 @@ A step is a liveness marker the job posts inside a run it has already started (`
 
 ~> **Not supported on `monitor_type = "http"`.** A probe never arms a run and has no `/step` endpoint to call, so the stall rule is unreachable there. The API rejects it with 400 `STEP_TIMEOUT_NOT_SUPPORTED`, and this provider rejects it at plan time. Use `probe_timeout_s` to bound a single probe.
 - `tags` (Set of String) Labels attached to this monitor. Removing them from the configuration clears them.
+- `trace_content` (String) What this monitor's OpenTelemetry traces keep of prompt, command and tool content: `dropped` (the server's default) removes it at ingest; `redacted` keeps it, with every secret-shaped value redacted when it arrives. Token counts, cost and lengths are kept either way.
+
+~> **Omitting this attribute keeps whatever the monitor already has — it does not reset it to `dropped`.** The server supplies the value for a monitor that never set one, so the provider takes it from the API rather than imposing its own default, and an existing monitor brought under management (or a provider upgrade) never plans a change to it. To go back to dropping content, set `trace_content = "dropped"` explicitly.
+
+Changing it is an in-place update. Only choose `redacted` when the people whose prompts and commands these traces carry have agreed to their content being stored.
 - `tz` (String) IANA timezone for cron evaluation. Defaults to `UTC` when unset.
 
 ### Read-Only
