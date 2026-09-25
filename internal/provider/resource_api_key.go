@@ -240,7 +240,7 @@ func (r *apiKeyResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 					"Deleting the monitor deletes the key. The API cannot rebind a key, so changing or " +
 					"removing this replaces it.",
 				Validators: []validator.String{
-					stringvalidator.RegexMatches(checkIDPattern, "must be a monitor id (a UUID)"),
+					stringvalidator.RegexMatches(checkIDPattern, "must be a monitor id (a lowercase UUID)"),
 				},
 				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
 			},

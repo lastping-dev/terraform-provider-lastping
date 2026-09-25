@@ -190,7 +190,7 @@ func (e *apiKeyEphemeralResource) Schema(_ context.Context, _ ephemeral.SchemaRe
 					"telemetry for that monitor and nothing else. Only allowed with `scope = \"ingest\"`; " +
 					"this provider refuses any other combination before the key is minted.",
 				Validators: []validator.String{
-					stringvalidator.RegexMatches(checkIDPattern, "must be a monitor id (a UUID)"),
+					stringvalidator.RegexMatches(checkIDPattern, "must be a monitor id (a lowercase UUID)"),
 				},
 			},
 

@@ -177,6 +177,18 @@ func TestAccAPIKey_ingestBoundToMonitor(t *testing.T) {
 		PreCheck:                 func() { testAccPreCheck(t) },
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{
+			// The refusal first: the post-test destroy runs the LAST step's
+			// configuration, and this one cannot even validate.
+			{
+				ExpectError: regexp.MustCompile(`check_id needs scope`),
+				Config: `
+resource "lastping_api_key" "wrong" {
+  name     = "acc-ingest-wrong"
+  scope    = "write"
+  check_id = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+}`,
+				PlanOnly: true,
+			},
 			{
 				Config: `
 resource "lastping_monitor" "traced" {
@@ -197,27 +209,32 @@ resource "lastping_api_key" "tracing" {
 					resource.TestCheckResourceAttrPair("lastping_api_key.tracing", "check_id",
 						"lastping_monitor.traced", "id"),
 					testAccCheckServerScope(t, "lastping_api_key.tracing", "ingest"),
-					resource.TestCheckResourceAttrWith("lastping_api_key.tracing", "id", func(id string) error {
-						k, err := testAccDirectClient(t).GetAPIKey(context.Background(), id)
+					// The server's binding, read off the server rather than out
+					// of state, must be this monitor exactly: a key bound to
+					// any other monitor, or to none, fails here.
+					func(s *terraform.State) error {
+						key, ok := s.RootModule().Resources["lastping_api_key.tracing"]
+						if !ok {
+							return fmt.Errorf("lastping_api_key.tracing not in state")
+						}
+						mon, ok := s.RootModule().Resources["lastping_monitor.traced"]
+						if !ok {
+							return fmt.Errorf("lastping_monitor.traced not in state")
+						}
+						k, err := testAccDirectClient(t).GetAPIKey(context.Background(), key.Primary.ID)
 						if err != nil {
 							return err
 						}
-						if k.CheckID == nil || *k.CheckID == "" {
-							return fmt.Errorf("server holds no check_id for key %s", id)
+						if k.CheckID == nil || *k.CheckID != mon.Primary.ID {
+							got := "none"
+							if k.CheckID != nil {
+								got = *k.CheckID
+							}
+							return fmt.Errorf("server binds key %s to monitor %s, want %s", key.Primary.ID, got, mon.Primary.ID)
 						}
 						return nil
-					}),
+					},
 				),
-			},
-			{
-				ExpectError: regexp.MustCompile(`check_id needs scope`),
-				Config: `
-resource "lastping_api_key" "wrong" {
-  name     = "acc-ingest-wrong"
-  scope    = "write"
-  check_id = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
-}`,
-				PlanOnly: true,
 			},
 		},
 	})

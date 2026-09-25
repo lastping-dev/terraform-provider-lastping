@@ -55,7 +55,7 @@ func TestAPIKeyCheckIDSchema(t *testing.T) {
 	require.True(t, eattr.Optional)
 
 	for _, vs := range [][]validator.String{attr.Validators, eattr.Validators} {
-		for _, good := range []string{testMonitorID, "6BA7B810-9DAD-11D1-80B4-00C04FD430C8"} {
+		for _, good := range []string{testMonitorID} {
 			r := validator.StringResponse{}
 			for _, v := range vs {
 				v.ValidateString(context.Background(),
@@ -63,7 +63,10 @@ func TestAPIKeyCheckIDSchema(t *testing.T) {
 			}
 			require.False(t, r.Diagnostics.HasError(), "%q is a monitor id", good)
 		}
-		for _, bad := range []string{"nightly-backup", "", "6ba7b810"} {
+		// An uppercase id is refused: the API answers in lowercase, so state
+		// would never match the configuration and every plan would replace
+		// the key.
+		for _, bad := range []string{"nightly-backup", "", "6ba7b810", "6BA7B810-9DAD-11D1-80B4-00C04FD430C8"} {
 			r := validator.StringResponse{}
 			for _, v := range vs {
 				v.ValidateString(context.Background(),

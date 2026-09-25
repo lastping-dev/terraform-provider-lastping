@@ -41,8 +41,11 @@ const (
 // plan time names the attribute instead of failing partway through an apply.
 var apiKeyScopes = []string{apiKeyScopeRead, apiKeyScopeWrite, apiKeyScopeAdmin, apiKeyScopeIngest}
 
-// checkIDPattern is a canonical UUID, the only shape a monitor id takes.
-var checkIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+// checkIDPattern is a canonical lowercase UUID, the only shape a monitor id
+// takes. Lowercase only: the API returns the id in lowercase, so an uppercase
+// value in configuration would differ from what the server hands back and the
+// key would be replaced on every plan.
+var checkIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 // validateIngestBinding refuses a check_id on a key whose configured scope is
 // not "ingest". The API answers that with a 400, and since both key surfaces
