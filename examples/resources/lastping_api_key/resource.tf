@@ -38,6 +38,22 @@ resource "lastping_api_key" "platform" {
   expires_at = "2027-01-01T00:00:00Z"
 }
 
+# A tracing key for an OpenTelemetry exporter. "ingest" can send pings, traces,
+# metrics and logs and cannot call the management API at all, so it is the key
+# to put in an exporter's configuration; check_id binds it to one monitor, and
+# telemetry naming any other monitor is refused. The monitor is looked up here;
+# a `lastping_monitor` resource's `id` works the same way.
+data "lastping_monitor" "etl_triage" {
+  slug = "etl-triage"
+}
+
+resource "lastping_api_key" "etl_tracing" {
+  name       = "etl-triage-tracing"
+  scope      = "ingest"
+  check_id   = data.lastping_monitor.etl_triage.id
+  expires_at = "2027-01-01T00:00:00Z"
+}
+
 # Removing `scope` from a configuration changes NOTHING: the key keeps the scope
 # it already has, the same way `expires_at` behaves. That matters for keys that
 # predate scopes — every one of them is "admin" on the server — because the

@@ -118,7 +118,8 @@ output "admin_run_key" {
 
 ### Optional
 
-- `scope` (String) What the key may do: `read` (every GET), `write` (everything except API key management) or `admin` (everything, key management included). Omitted, the API applies its own default of `write`.
+- `check_id` (String) Binds an `ingest` key to one monitor (its `id`), so the key can send telemetry for that monitor and nothing else. Only allowed with `scope = "ingest"`; this provider refuses any other combination before the key is minted.
+- `scope` (String) What the key may do: `read` (every GET), `write` (everything except API key management) or `admin` (everything, key management included), or `ingest` (pings, traces, metrics and logs only, never the management API; see `check_id`). Omitted, the API applies its own default of `write`.
 
 `admin` is the reason to set this. A run whose ephemeral key has to manage API keys — list, mint or revoke them — needs key-management power, and `write` is precisely everything except that, so an aliased provider fed by this resource must ask for `admin` explicitly:
 

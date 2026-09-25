@@ -107,6 +107,22 @@ resource "lastping_monitor" "etl_ingest" {
 # either resource — the monitor keeps its ping history and simply becomes
 # unowned, same as `terraform destroy` on the agent itself.
 
+# What the agent's OpenTelemetry traces keep of prompt, command and tool
+# content. "dropped" is the server's default and removes it at ingest; token
+# counts, cost and lengths are kept either way. "redacted" keeps the content,
+# with secret-shaped values redacted as it arrives: set it only when the people
+# whose prompts and commands the traces carry have agreed to that. Omitting the
+# attribute keeps whatever the monitor already has.
+resource "lastping_monitor" "etl_triage" {
+  name          = "ETL triage agent"
+  slug          = "etl-triage"
+  schedule_kind = "on_demand"
+  grace_s       = 300
+
+  agent_id      = lastping_agent.nightly_etl.id
+  trace_content = "redacted"
+}
+
 # Output assertions: the job runs on time, exits zero — and produced nothing.
 # A dead-man's-switch alone cannot tell that apart from a healthy run, because
 # nothing ever looks at what the run reported. An assertion does: it inspects

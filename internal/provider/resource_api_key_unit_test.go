@@ -311,6 +311,12 @@ func apiKeyCreateServer(t *testing.T, expires *time.Time, requested *map[string]
 			scope = "write"
 		}
 		parent := "22222222-2222-4222-a222-222222222222"
+		// A bound ingest key comes back naming its monitor, as the real API
+		// answers; an unbound key omits check_id.
+		var checkID *string
+		if v, ok := body["check_id"].(string); ok && v != "" {
+			checkID = &v
+		}
 		out := client.APIKey{
 			ID:             "11111111-1111-4111-a111-111111111111",
 			Name:           "k",
@@ -319,6 +325,7 @@ func apiKeyCreateServer(t *testing.T, expires *time.Time, requested *map[string]
 			ExpiresAt:      expires,
 			Scope:          scope,
 			CreatedByKeyID: &parent,
+			CheckID:        checkID,
 			Key:            "lp_abcdefg_secret",
 		}
 		w.Header().Set("Content-Type", "application/json")

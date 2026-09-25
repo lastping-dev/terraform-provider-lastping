@@ -88,7 +88,22 @@ const specPath = "../../testdata/openapi.yaml"
 // resource.lastping_monitor, data.lastping_monitor and
 // data.lastping_monitors.monitors went once a resync picked up a deployment
 // that carried the property on CheckCreate, Check and CheckPatch.
-var knownSpecGaps = map[string]string{}
+var knownSpecGaps = map[string]string{
+	// The API serves these, but the vendored copy of the spec predates them and
+	// is deliberately not resynced in the change that added them. Each entry
+	// fails once `make sync-openapi` pulls a copy that declares the property,
+	// and must then be deleted.
+	"resource.lastping_monitor.trace_content":       vendoredSpecPredatesIt,
+	"data.lastping_monitor.trace_content":           vendoredSpecPredatesIt,
+	"data.lastping_monitors.monitors.trace_content": vendoredSpecPredatesIt,
+	"resource.lastping_api_key.check_id":            vendoredSpecPredatesIt,
+	"ephemeral.lastping_api_key.check_id":           vendoredSpecPredatesIt,
+}
+
+// vendoredSpecPredatesIt is the reason for a knownSpecGaps entry whose
+// property the API already serves but testdata/openapi.yaml does not yet carry.
+const vendoredSpecPredatesIt = "served by the API (trace_content on CheckCreate, CheckPatch and Check; " +
+	"check_id on ApiKeyCreate and ApiKey), absent from the vendored testdata/openapi.yaml until the next resync"
 
 // deliberatelyUnmodelled records spec properties that live on a schema an
 // existing contractCase already checks, that the provider does NOT model, and

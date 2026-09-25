@@ -18,11 +18,12 @@ import (
 )
 
 var (
-	_ ephemeral.EphemeralResource              = (*apiKeyEphemeralResource)(nil)
-	_ ephemeral.EphemeralResourceWithConfigure = (*apiKeyEphemeralResource)(nil)
-	_ ephemeral.EphemeralResourceWithRenew     = (*apiKeyEphemeralResource)(nil)
-	_ ephemeral.EphemeralResourceWithClose     = (*apiKeyEphemeralResource)(nil)
-	_ validator.String                         = durationValidator{}
+	_ ephemeral.EphemeralResource                   = (*apiKeyEphemeralResource)(nil)
+	_ ephemeral.EphemeralResourceWithConfigure      = (*apiKeyEphemeralResource)(nil)
+	_ ephemeral.EphemeralResourceWithRenew          = (*apiKeyEphemeralResource)(nil)
+	_ ephemeral.EphemeralResourceWithClose          = (*apiKeyEphemeralResource)(nil)
+	_ ephemeral.EphemeralResourceWithValidateConfig = (*apiKeyEphemeralResource)(nil)
+	_ validator.String                              = durationValidator{}
 )
 
 const (
@@ -89,9 +90,10 @@ type apiKeyEphemeralResource struct {
 // ephemeral.lastping_api_key. Unlike the managed resource's model, none of this
 // is ever written to plan or state.
 type apiKeyEphemeralModel struct {
-	Name  types.String `tfsdk:"name"`
-	TTL   types.String `tfsdk:"ttl"`
-	Scope types.String `tfsdk:"scope"`
+	Name    types.String `tfsdk:"name"`
+	TTL     types.String `tfsdk:"ttl"`
+	Scope   types.String `tfsdk:"scope"`
+	CheckID types.String `tfsdk:"check_id"`
 
 	ID     types.String `tfsdk:"id"`
 	Prefix types.String `tfsdk:"prefix"`
@@ -161,8 +163,9 @@ func (e *apiKeyEphemeralResource) Schema(_ context.Context, _ ephemeral.SchemaRe
 			"scope": schema.StringAttribute{
 				Optional: true,
 				MarkdownDescription: "What the key may do: `read` (every GET), `write` (everything " +
-					"except API key management) or `admin` (everything, key management included). " +
-					"Omitted, the API applies its own default of `write`.\n\n" +
+					"except API key management) or `admin` (everything, key management included), or " +
+					"`ingest` (pings, traces, metrics and logs only, never the management API; see " +
+					"`check_id`). Omitted, the API applies its own default of `write`.\n\n" +
 					"`admin` is the reason to set this. A run whose ephemeral key has to manage API " +
 					"keys — list, mint or revoke them — needs key-management power, and `write` is " +
 					"precisely everything except that, so an aliased provider fed by this resource " +
@@ -180,6 +183,15 @@ func (e *apiKeyEphemeralResource) Schema(_ context.Context, _ ephemeral.SchemaRe
 					"every key it created goes with it. Mint keys that must survive the run with a " +
 					"credential that survives the run.",
 				Validators: []validator.String{stringvalidator.OneOf(apiKeyScopes...)},
+			},
+			"check_id": schema.StringAttribute{
+				Optional: true,
+				MarkdownDescription: "Binds an `ingest` key to one monitor (its `id`), so the key can send " +
+					"telemetry for that monitor and nothing else. Only allowed with `scope = \"ingest\"`; " +
+					"this provider refuses any other combination before the key is minted.",
+				Validators: []validator.String{
+					stringvalidator.RegexMatches(checkIDPattern, "must be a monitor id (a lowercase UUID)"),
+				},
 			},
 
 			"id": schema.StringAttribute{
@@ -200,6 +212,16 @@ func (e *apiKeyEphemeralResource) Schema(_ context.Context, _ ephemeral.SchemaRe
 			},
 		},
 	}
+}
+
+// ValidateConfig refuses a check_id on anything but an ingest key.
+func (e *apiKeyEphemeralResource) ValidateConfig(ctx context.Context, req ephemeral.ValidateConfigRequest, resp *ephemeral.ValidateConfigResponse) {
+	var cfg apiKeyEphemeralModel
+	resp.Diagnostics.Append(req.Config.Get(ctx, &cfg)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	resp.Diagnostics.Append(validateIngestBinding(cfg.Scope, cfg.CheckID)...)
 }
 
 func (e *apiKeyEphemeralResource) Configure(_ context.Context, req ephemeral.ConfigureRequest, resp *ephemeral.ConfigureResponse) {
@@ -270,6 +292,7 @@ func (e *apiKeyEphemeralResource) Open(ctx context.Context, req ephemeral.OpenRe
 		Name:      cfg.Name.ValueString(),
 		ExpiresAt: &expiresAt,
 		Scope:     scope,
+		CheckID:   cfg.CheckID.ValueString(),
 	})
 	if err != nil {
 		// err never contains key material: the plaintext exists only in a 2xx body.

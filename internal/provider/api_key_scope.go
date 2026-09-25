@@ -2,7 +2,10 @@ package provider
 
 import (
 	"fmt"
+	"regexp"
 
+	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
 	"github.com/lastping-dev/terraform-provider-lastping/internal/client"
@@ -26,12 +29,48 @@ const (
 	apiKeyScopeWrite = "write"
 	// apiKeyScopeAdmin reaches everything, key management included.
 	apiKeyScopeAdmin = "admin"
+	// apiKeyScopeIngest is not a tier above or below the other three: it can
+	// send pings, traces, metrics and logs and cannot call the management API
+	// at all. It is the key for an exporter's configuration or a dotfile, and
+	// the only scope that may be bound to a monitor with check_id.
+	apiKeyScopeIngest = "ingest"
 )
 
 // apiKeyScopes is the exact set the API stores (the monorepo's
 // api_keys_scope_check constraint). Anything else is a 400, so rejecting it at
 // plan time names the attribute instead of failing partway through an apply.
-var apiKeyScopes = []string{apiKeyScopeRead, apiKeyScopeWrite, apiKeyScopeAdmin}
+var apiKeyScopes = []string{apiKeyScopeRead, apiKeyScopeWrite, apiKeyScopeAdmin, apiKeyScopeIngest}
+
+// checkIDPattern is a canonical lowercase UUID, the only shape a monitor id
+// takes. Lowercase only: the API returns the id in lowercase, so an uppercase
+// value in configuration would differ from what the server hands back and the
+// key would be replaced on every plan.
+var checkIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+// validateIngestBinding refuses a check_id on a key whose configured scope is
+// not "ingest". The API answers that with a 400, and since both key surfaces
+// replace or re-mint on a scope change, catching it at plan time is the
+// difference between a clear error and a failed apply.
+//
+// An unknown value on either side (an interpolation not yet resolved) is left
+// alone: the API is still the final check.
+func validateIngestBinding(scope, checkID types.String) diag.Diagnostics {
+	var diags diag.Diagnostics
+	if checkID.IsNull() || checkID.IsUnknown() || scope.IsUnknown() {
+		return diags
+	}
+	if scope.IsNull() || scope.ValueString() != apiKeyScopeIngest {
+		got := "no scope (the API's default is write)"
+		if !scope.IsNull() {
+			got = fmt.Sprintf("scope %q", scope.ValueString())
+		}
+		diags.AddAttributeError(path.Root("check_id"),
+			"check_id needs scope = \"ingest\"",
+			fmt.Sprintf("check_id binds a tracing key to one monitor, and only an ingest key can be "+
+				"bound; this configuration asks for %s. Set scope = \"ingest\", or remove check_id.", got))
+	}
+	return diags
+}
 
 // apiKeyCreateDiagnostic turns a failed POST /api/v1/api-keys into a summary
 // and detail pair.

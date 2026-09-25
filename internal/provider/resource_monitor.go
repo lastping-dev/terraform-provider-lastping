@@ -56,6 +56,13 @@ var slugPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,48}[a-z0-9]$`)
 // INVALID_SOURCE_KIND for that reason, and so does this.
 var sourceKindPattern = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 
+// The two values trace_content takes. The API refuses anything else with a
+// 400, so the validator names the attribute at plan time instead.
+const (
+	traceContentDropped  = "dropped"
+	traceContentRedacted = "redacted"
+)
+
 // notUUIDSlugValidator rejects UUID-shaped slugs, which the server also rejects:
 // they are ambiguous with a monitor id during import.
 type notUUIDSlugValidator struct{}
@@ -150,6 +157,7 @@ type monitorResourceModel struct {
 	CiSecret             types.String `tfsdk:"ci_secret"`
 	SourceKind           types.String `tfsdk:"source_kind"`
 	SourceRef            types.String `tfsdk:"source_ref"`
+	TraceContent         types.String `tfsdk:"trace_content"`
 	ProbeURL             types.String `tfsdk:"probe_url"`
 	ProbeMethod          types.String `tfsdk:"probe_method"`
 	ProbeIntervalS       types.Int64  `tfsdk:"probe_interval_s"`
@@ -571,6 +579,25 @@ func (r *monitorResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 				Validators:    []validator.String{stringvalidator.LengthBetween(1, 512)},
 				PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
 			},
+			"trace_content": schema.StringAttribute{
+				Optional: true,
+				Computed: true,
+				MarkdownDescription: "What this monitor's OpenTelemetry traces keep of prompt, command and tool " +
+					"content: `dropped` (the server's default) removes it at ingest; `redacted` keeps it, with " +
+					"every secret-shaped value redacted when it arrives. Token counts, cost and lengths are kept " +
+					"either way.\n\n" +
+					"~> **Omitting this attribute keeps whatever the monitor already has — it does not reset it " +
+					"to `dropped`.** The server supplies the value for a monitor that never set one, so the " +
+					"provider takes it from the API rather than imposing its own default, and an existing " +
+					"monitor brought under management (or a provider upgrade) never plans a change to it. To " +
+					"go back to dropping content, set `trace_content = \"dropped\"` explicitly.\n\n" +
+					"Changing it is an in-place update. Only choose `redacted` when the people whose prompts " +
+					"and commands these traces carry have agreed to their content being stored.",
+				Validators: []validator.String{
+					stringvalidator.OneOf(traceContentDropped, traceContentRedacted),
+				},
+				PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
+			},
 			"probe_url": schema.StringAttribute{
 				Optional:            true,
 				MarkdownDescription: "Absolute http(s) URL to probe. Required for `monitor_type = \"http\"`.",
@@ -979,6 +1006,12 @@ func monitorFromModel(ctx context.Context, m monitorResourceModel) (client.Monit
 		// changed source count as a real diff rather than a no-op apply.
 		SourceKind: m.SourceKind.ValueString(),
 		SourceRef:  m.SourceRef.ValueString(),
+
+		// Optional+Computed: unconfigured on create, it plans UNKNOWN,
+		// ValueString() renders that as "", and `omitempty` drops it, so the
+		// server applies its own default. Here it also backs
+		// monitorPatchNeeded, which is what makes a changed value a real diff.
+		TraceContent: m.TraceContent.ValueString(),
 	}
 	if !m.BlockedTimeoutS.IsNull() && !m.BlockedTimeoutS.IsUnknown() {
 		v := m.BlockedTimeoutS.ValueInt64()
@@ -1275,6 +1308,17 @@ func monitorPatchFromModel(ctx context.Context, desired, cfg monitorResourceMode
 		}
 	}
 
+	// trace_content is sent only when the configuration names it. It is
+	// Optional+Computed, so an unconfigured value resolves from prior state
+	// and sending it would be a no-op anyway; leaving the key out says the
+	// same thing without writing the column. It is never sent as null: the
+	// API has no "unset" for it, only its two values.
+	if !cfg.TraceContent.IsNull() {
+		if v := desired.TraceContent.ValueString(); v != "" {
+			patch["trace_content"] = v
+		}
+	}
+
 	if cfg.MonitorFrom.IsNull() || desired.MonitorFrom.ValueString() == "" {
 		patch["monitor_from"] = nil
 	} else {
@@ -1482,6 +1526,10 @@ func modelFromMonitor(ctx context.Context, mon *client.Monitor, prior monitorRes
 		// genuinely cleared outside Terraform.
 		SourceKind: stringOrNull(mon.SourceKind),
 		SourceRef:  stringOrNull(mon.SourceRef),
+
+		// trace_content is on every response; stringOrNull only covers a
+		// server too old to know the field, where null is the honest answer.
+		TraceContent: stringOrNull(mon.TraceContent),
 
 		// failure_threshold is NOT NULL DEFAULT 1 server-side and always comes
 		// back, so it is a concrete number rather than an int64OrNull.

@@ -43,6 +43,7 @@ type monitorDataModel struct {
 	CiSecret             types.String `tfsdk:"ci_secret"`
 	SourceKind           types.String `tfsdk:"source_kind"`
 	SourceRef            types.String `tfsdk:"source_ref"`
+	TraceContent         types.String `tfsdk:"trace_content"`
 	FailureThreshold     types.Int64  `tfsdk:"failure_threshold"`
 	Tags                 types.Set    `tfsdk:"tags"`
 	RunawayCeiling       types.Int64  `tfsdk:"runaway_ceiling"`
@@ -184,6 +185,12 @@ func monitorDataAttributes() map[string]schema.Attribute {
 				"the discovery reconcile key.\n\n" +
 				"Always either both present or both null with `source_kind`: a database CHECK constraint " +
 				"makes a half-set identity unrepresentable.",
+		},
+		"trace_content": schema.StringAttribute{
+			Computed: true,
+			MarkdownDescription: "What this monitor's OpenTelemetry traces keep of prompt, command and tool " +
+				"content: `dropped` (the default) or `redacted` (kept, with secret-shaped values redacted " +
+				"at ingest).",
 		},
 		"failure_threshold": schema.Int64Attribute{
 			Computed: true,
@@ -337,6 +344,7 @@ func monitorDataFromAPI(ctx context.Context, m *client.Monitor) (monitorDataMode
 		// state would claim an identity of "" rather than none.
 		SourceKind:           stringOrNull(m.SourceKind),
 		SourceRef:            stringOrNull(m.SourceRef),
+		TraceContent:         stringOrNull(m.TraceContent),
 		ProbeURL:             stringOrNull(m.ProbeURL),
 		ProbeMethod:          stringOrNull(m.ProbeMethod),
 		ProbeIntervalS:       int64OrNull(m.ProbeIntervalS),

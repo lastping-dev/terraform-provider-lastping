@@ -18,9 +18,10 @@ import (
 )
 
 var (
-	_ resource.Resource              = (*apiKeyResource)(nil)
-	_ resource.ResourceWithConfigure = (*apiKeyResource)(nil)
-	_ validator.String               = futureTimestampValidator{}
+	_ resource.Resource                   = (*apiKeyResource)(nil)
+	_ resource.ResourceWithConfigure      = (*apiKeyResource)(nil)
+	_ resource.ResourceWithValidateConfig = (*apiKeyResource)(nil)
+	_ validator.String                    = futureTimestampValidator{}
 )
 
 // futureTimestampValidator mirrors the server's own check
@@ -79,6 +80,7 @@ type apiKeyResourceModel struct {
 	Name      types.String `tfsdk:"name"`
 	ExpiresAt types.String `tfsdk:"expires_at"`
 	Scope     types.String `tfsdk:"scope"`
+	CheckID   types.String `tfsdk:"check_id"`
 
 	Prefix         types.String `tfsdk:"prefix"`
 	CreatedAt      types.String `tfsdk:"created_at"`
@@ -195,7 +197,11 @@ func (r *apiKeyResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				Optional: true,
 				Computed: true,
 				MarkdownDescription: "What the key may do: `read` (every GET), `write` (everything " +
-					"except API key management) or `admin` (everything, key management included).\n\n" +
+					"except API key management) or `admin` (everything, key management included), or " +
+					"`ingest`: pings, traces, metrics and logs only, with no access to the management " +
+					"API at all — the key for an OpenTelemetry exporter's configuration, usually bound " +
+					"to one monitor with `check_id`. Minting any key needs a provider credential with " +
+					"the `admin` scope.\n\n" +
 					"Omit it and the API chooses: a new key gets the API's own default, which is " +
 					"`write` — the tier a credential handed to CI or to an agent should have, since " +
 					"it can do the work and cannot mint itself a replacement that survives its own " +
@@ -217,6 +223,26 @@ func (r *apiKeyResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 					stringplanmodifier.UseStateForUnknown(),
 					stringplanmodifier.RequiresReplaceIfConfigured(),
 				},
+			},
+
+			// Optional only, unlike scope and expires_at: the server never
+			// supplies a binding the configuration did not ask for, so there is
+			// nothing for Computed to absorb. RequiresReplace because the API
+			// cannot rebind a key: binding, unbinding or moving it mints a new
+			// one.
+			"check_id": schema.StringAttribute{
+				Optional: true,
+				MarkdownDescription: "Binds an `ingest` key to one monitor (its `id`), so the key can send " +
+					"telemetry for that monitor and nothing else: a payload naming a different monitor is " +
+					"refused. Use it for an exporter that can set a header but not a resource attribute. " +
+					"Only allowed with `scope = \"ingest\"`; this provider refuses any other combination " +
+					"at plan time.\n\n" +
+					"Deleting the monitor deletes the key. The API cannot rebind a key, so changing or " +
+					"removing this replaces it.",
+				Validators: []validator.String{
+					stringvalidator.RegexMatches(checkIDPattern, "must be a monitor id (a lowercase UUID)"),
+				},
+				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
 			},
 
 			"prefix": schema.StringAttribute{
@@ -260,6 +286,16 @@ func (r *apiKeyResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 			},
 		},
 	}
+}
+
+// ValidateConfig refuses a check_id on anything but an ingest key.
+func (r *apiKeyResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
+	var cfg apiKeyResourceModel
+	resp.Diagnostics.Append(req.Config.Get(ctx, &cfg)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	resp.Diagnostics.Append(validateIngestBinding(cfg.Scope, cfg.CheckID)...)
 }
 
 func (r *apiKeyResource) Configure(_ context.Context, req resource.ConfigureRequest, resp *resource.ConfigureResponse) {
@@ -345,6 +381,7 @@ func modelFromAPIKey(k *client.APIKey, prior apiKeyResourceModel) apiKeyResource
 		CreatedAt:      types.StringValue(k.CreatedAt.UTC().Format(time.RFC3339)),
 		LastUsedAt:     lastUsedAtValue(k.LastUsedAt),
 		CreatedByKeyID: createdByKeyIDValue(k.CreatedByKeyID),
+		CheckID:        checkIDValue(k.CheckID),
 		Key:            prior.Key,
 	}
 	if k.Key != "" {
@@ -383,6 +420,15 @@ func scopeValue(apiVal string, prior types.String) types.String {
 // null for a key with no parent — one minted from a dashboard session, or one
 // whose parent has since been revoked — otherwise the parent key's UUID.
 func createdByKeyIDValue(v *string) types.String {
+	if v == nil {
+		return types.StringNull()
+	}
+	return types.StringValue(*v)
+}
+
+// checkIDValue maps the API's optional check_id onto state: null for an
+// unbound key, which is every key that is not a bound ingest key.
+func checkIDValue(v *string) types.String {
 	if v == nil {
 		return types.StringNull()
 	}
@@ -431,6 +477,7 @@ func (r *apiKeyResource) Create(ctx context.Context, req resource.CreateRequest,
 		Name:      plan.Name.ValueString(),
 		ExpiresAt: expiresAt,
 		Scope:     requestedScope,
+		CheckID:   config.CheckID.ValueString(),
 	})
 	if err != nil {
 		// err never contains key material: the plaintext exists only in a 2xx body.

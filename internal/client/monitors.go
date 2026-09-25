@@ -122,6 +122,12 @@ type Monitor struct {
 	SourceKind string `json:"source_kind,omitempty"`
 	SourceRef  string `json:"source_ref,omitempty"`
 
+	// TraceContent is what this monitor's traces keep of prompt, command and
+	// tool content: "dropped" (the server's default) or "redacted". Every
+	// response carries it. The `omitempty` matters on create only, where an
+	// absent key takes the server's default; updates go through MonitorPatch.
+	TraceContent string `json:"trace_content,omitempty"`
+
 	// Computed.
 	Paused           bool    `json:"paused,omitempty"`
 	Status           string  `json:"status,omitempty"`

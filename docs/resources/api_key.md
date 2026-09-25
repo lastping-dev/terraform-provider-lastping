@@ -62,6 +62,22 @@ resource "lastping_api_key" "platform" {
   expires_at = "2027-01-01T00:00:00Z"
 }
 
+# A tracing key for an OpenTelemetry exporter. "ingest" can send pings, traces,
+# metrics and logs and cannot call the management API at all, so it is the key
+# to put in an exporter's configuration; check_id binds it to one monitor, and
+# telemetry naming any other monitor is refused. The monitor is looked up here;
+# a `lastping_monitor` resource's `id` works the same way.
+data "lastping_monitor" "etl_triage" {
+  slug = "etl-triage"
+}
+
+resource "lastping_api_key" "etl_tracing" {
+  name       = "etl-triage-tracing"
+  scope      = "ingest"
+  check_id   = data.lastping_monitor.etl_triage.id
+  expires_at = "2027-01-01T00:00:00Z"
+}
+
 # Removing `scope` from a configuration changes NOTHING: the key keeps the scope
 # it already has, the same way `expires_at` behaves. That matters for keys that
 # predate scopes — every one of them is "admin" on the server — because the
@@ -119,6 +135,9 @@ output "ci_api_key_prefix" {
 
 ### Optional
 
+- `check_id` (String) Binds an `ingest` key to one monitor (its `id`), so the key can send telemetry for that monitor and nothing else: a payload naming a different monitor is refused. Use it for an exporter that can set a header but not a resource attribute. Only allowed with `scope = "ingest"`; this provider refuses any other combination at plan time.
+
+Deleting the monitor deletes the key. The API cannot rebind a key, so changing or removing this replaces it.
 - `expires_at` (String) RFC 3339 timestamp after which the key stops authenticating, for example `2027-01-01T00:00:00Z`. Must be in the future.
 
 Omit it for a key that never expires — unless the credential running Terraform expires itself, in which case the server gives the new key its creator's expiry, because a key may never outlive the key that minted it. That server-assigned value is read back into state, so an omitted `expires_at` can come back populated; it is not drift and no later plan proposes a change for it.
@@ -126,7 +145,7 @@ Omit it for a key that never expires — unless the credential running Terraform
 A configured value beyond the creating key's own expiry is refused by the API, with the ceiling reported as `max_expires_at` — it is never quietly lowered.
 
 The API cannot change a key's expiry, so changing this replaces the key. REMOVING it does not: with nothing configured Terraform keeps whatever expiry the key already has, so minting a never-expiring replacement takes `terraform apply -replace`.
-- `scope` (String) What the key may do: `read` (every GET), `write` (everything except API key management) or `admin` (everything, key management included).
+- `scope` (String) What the key may do: `read` (every GET), `write` (everything except API key management) or `admin` (everything, key management included), or `ingest`: pings, traces, metrics and logs only, with no access to the management API at all — the key for an OpenTelemetry exporter's configuration, usually bound to one monitor with `check_id`. Minting any key needs a provider credential with the `admin` scope.
 
 Omit it and the API chooses: a new key gets the API's own default, which is `write` — the tier a credential handed to CI or to an agent should have, since it can do the work and cannot mint itself a replacement that survives its own revocation. That server-assigned value is read back into state, so an omitted `scope` can come back populated; it is not drift and no later plan proposes a change for it.
 
