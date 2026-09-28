@@ -158,12 +158,11 @@ func (r *agentResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 			"job, an LLM agent — that owns one or more monitors. Registering one gives it a stable " +
 			"identity, and its `status` rolls up live from the monitors it owns, so a fleet of workers " +
 			"can be watched as workers rather than as a pile of unrelated checks.\n\n" +
-			"~> **`slug` is derived from `name` at creation and never changes again.** The API has no " +
-			"path to rename a slug, and renaming the agent deliberately does not re-derive one: anything " +
-			"already referring to the agent by slug keeps working. An agent named `Nightly ETL bot` and " +
-			"later renamed to `Hourly ETL bot` keeps the slug `nightly-etl-bot`. Destroy and recreate the " +
-			"agent if the slug itself has to change — which unowns its monitors (see below), it does not " +
-			"delete them.\n\n" +
+			"~> **`slug` is derived from `name` at creation; it changes only when someone changes it " +
+			"explicitly in the console or API, and Terraform then reads the new value on refresh.** " +
+			"Renaming the agent here deliberately does not re-derive one: anything already referring to " +
+			"the agent by slug keeps working. An agent named `Nightly ETL bot` and later renamed to " +
+			"`Hourly ETL bot` keeps the slug `nightly-etl-bot`.\n\n" +
 			"Creating an agent is create-only, not an upsert: a name whose derived slug is already taken " +
 			"in this project fails the apply with a clear error instead of silently taking over an agent " +
 			"this configuration does not own. Import it instead.\n\n" +
@@ -192,12 +191,16 @@ func (r *agentResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 
 			"slug": schema.StringAttribute{
 				Computed: true,
-				MarkdownDescription: "Stable, project-scoped identifier derived from `name` at creation and " +
-					"immutable thereafter. Use it to import the agent, and to attach monitors to it — the " +
+				MarkdownDescription: "Project-scoped identifier derived from `name` at creation. A rename " +
+					"here never changes it; it changes only when someone changes it explicitly in the console " +
+					"or API, and a refresh then reads the new value. Use it to import the agent, and to attach monitors to it — the " +
 					"API accepts either the slug or the UUID wherever an agent is referenced.",
-				// The server never re-derives a slug, so the value in state is
+				// A rename never re-derives a slug, so the value in state is
 				// the value after any apply. Without this, every rename would
-				// plan slug as "(known after apply)" and imply otherwise.
+				// plan slug as "(known after apply)" and imply otherwise. A
+				// slug changed in the console or API still reaches state on
+				// refresh (TestAgentReadTakesTheServersSlug): this modifier
+				// shapes the plan only.
 				PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
 			},
 			"status": schema.StringAttribute{

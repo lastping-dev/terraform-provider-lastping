@@ -3,13 +3,17 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
+	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-go/tftypes"
 	"github.com/stretchr/testify/require"
 
 	"github.com/lastping-dev/terraform-provider-lastping/internal/client"
@@ -146,8 +150,10 @@ func TestAgentDescriptionIsNotComputed(t *testing.T) {
 // response from the monitors the agent owns — nothing stores them. Pinning them
 // with UseStateForUnknown would freeze a stale rollup into the plan and, worse,
 // promise a value the apply then contradicts. slug and created_at are the
-// opposite: immutable once set, so they SHOULD be pinned, or every rename plans
-// them as "(known after apply)" and implies the slug is about to move.
+// opposite: no apply of this resource changes them, so they SHOULD be pinned,
+// or every rename plans them as "(known after apply)" and implies the slug is
+// about to move. (A slug changed in the console or API is read back on
+// refresh; see TestAgentReadTakesTheServersSlug.)
 func TestAgentVolatileAttributesHaveNoUseStateForUnknown(t *testing.T) {
 	s := agentSchema(t)
 
@@ -168,7 +174,7 @@ func TestAgentVolatileAttributesHaveNoUseStateForUnknown(t *testing.T) {
 		a, ok := s.Attributes[name].(schema.StringAttribute)
 		require.True(t, ok, "%s must be a string attribute", name)
 		require.NotEmpty(t, a.PlanModifiers,
-			"%s never changes after creation, so it must use prior state rather than plan as unknown", name)
+			"no apply of this resource changes %s, so it must use prior state rather than plan as unknown", name)
 	}
 }
 
@@ -276,4 +282,37 @@ func TestModelFromAgent(t *testing.T) {
 		require.Equal(t, seen, got.LastSeen.ValueString())
 		require.Equal(t, "bot", got.Slug.ValueString())
 	})
+}
+
+// TestAgentReadTakesTheServersSlug: a slug changed outside Terraform (in the
+// console or through the API) is read back on refresh. Read must overwrite the
+// slug in state with the server's value, not keep the one recorded at
+// creation. UseStateForUnknown on slug only shapes the plan; it cannot hide a
+// refreshed value, and this is the test that says so.
+func TestAgentReadTakesTheServersSlug(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodGet, r.Method)
+		require.Equal(t, "/api/v1/agents/agent-1", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"agent-1","slug":"reddit-bot","name":"Reddit Bot","description":"",` +
+			`"status":"idle","monitor_count":0,"created_at":"2026-07-01T12:00:00Z"}`))
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	s := agentSchema(t)
+	stale := tfsdk.State{Schema: s, Raw: tftypes.NewValue(s.Type().TerraformType(ctx), nil)}
+	require.False(t, stale.Set(ctx, modelFromAgent(&client.Agent{
+		ID: "agent-1", Slug: "codex", Name: "Reddit Bot", Status: "idle", CreatedAt: "2026-07-01T12:00:00Z",
+	})).HasError())
+
+	r := &agentResource{client: client.New(srv.URL, "lp_test", "unit")}
+	resp := &resource.ReadResponse{State: stale}
+	r.Read(ctx, resource.ReadRequest{State: stale}, resp)
+	require.False(t, resp.Diagnostics.HasError(), "%v", resp.Diagnostics)
+
+	var got agentResourceModel
+	require.False(t, resp.State.Get(ctx, &got).HasError())
+	require.Equal(t, "reddit-bot", got.Slug.ValueString(), "refresh must record the server's slug")
+	require.Equal(t, "Reddit Bot", got.Name.ValueString())
 }

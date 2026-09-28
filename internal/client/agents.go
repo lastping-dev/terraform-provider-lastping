@@ -21,7 +21,8 @@ type Agent struct {
 
 	// Computed — server-supplied, never part of a request payload.
 	//
-	// Slug is derived from Name, not accepted on create and ignored on patch.
+	// Slug is derived from Name at creation and never sent by this provider;
+	// it changes only when someone changes it in the console or API.
 	// Status/MonitorCount/LastSeen are not stored at all: the API recomputes
 	// them on every response from the agent's monitors (core/agent.RollUp), so
 	// they change without anything in Terraform changing.
