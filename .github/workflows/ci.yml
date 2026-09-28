@@ -9,8 +9,7 @@ permissions:
   contents: read
 
 # Acceptance tests (`make testacc`) are intentionally not run here: they
-# require a live LastPing backend and are wired up separately from the
-# monorepo's CI.
+# require a live LastPing backend and run in a separate job that has one.
 
 jobs:
   build:

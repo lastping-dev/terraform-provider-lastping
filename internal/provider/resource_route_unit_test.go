@@ -61,15 +61,15 @@ func TestParseRouteImportID(t *testing.T) {
 // defaultAlertEvents as well.
 //
 // The two slices look interchangeable and are not. routeEventTypes is what the
-// API will *route* (api/routes.go: validEventTypes); defaultAlertEvents is the
+// API will *route*; defaultAlertEvents is the
 // much smaller set the API *auto-attaches* to a new monitor's default email
-// destination (api/defaultdest.go). Only the second one drives
+// destination. Only the second one drives
 // routeIsServerDefault's adoption exemption, so an entry added there tells
 // Terraform to silently take over a route a person created by hand — the exact
 // clobber the whole adoption guard exists to prevent.
 func TestRouteEventTypeSetsStayDistinct(t *testing.T) {
 	require.Equal(t, []string{"down", "fail", "recovery", "blocked"}, defaultAlertEvents,
-		"defaultAlertEvents mirrors api/defaultdest.go and must not drift from it")
+		"defaultAlertEvents mirrors the server's default routes and must not drift from them")
 
 	// The invariant is not the literal list, it is the CLASS. The API auto-routes
 	// its RateClassAlert events and never its RateClassInfo ones: every-run,
@@ -98,7 +98,7 @@ func TestRouteEventTypeSetsStayDistinct(t *testing.T) {
 //
 // A literal only catches a typo made here; it says nothing about the actual
 // failure mode this guards against — the API's canonical event-type set
-// (internal/alertevent.validEventTypes in the monorepo) growing while
+// growing while
 // routeEventTypes does not. Comparing against the spec catches that the next
 // time the spec is refreshed, the same way contract_test.go catches field
 // drift for every other resource.
@@ -188,7 +188,7 @@ func TestRouteAdoptionConflict(t *testing.T) {
 // The API auto-routes every new monitor's down/fail/recovery events to the
 // project's default email channel, so the routes Terraform meets on a monitor
 // it created a millisecond ago are the server's, not a person's. Adopting them
-// is right. Adopting anything wider than the exact signature attachDefaultRoutes
+// is right. Adopting anything wider than the exact signature the server's default routing
 // writes — one destination, and that destination is the project's first verified
 // email channel — would reinstate the hazard the guard exists for, which is a
 // silent redirect of somebody's alerts.
@@ -207,14 +207,14 @@ func TestRouteIsServerDefault(t *testing.T) {
 		want          bool
 	}{
 		{
-			name:          "exactly what attachDefaultRoutes writes",
+			name:          "exactly what the server's default routing writes",
 			eventType:     "down",
 			existing:      []string{defaultEmail},
 			defaultDestID: defaultEmail,
 			want:          true,
 		},
 		{
-			// attachDefaultRoutes writes down, fail and recovery — never
+			// The server's default routing writes down, fail and recovery — never
 			// every-run. An every-run route pointing at the default destination
 			// is therefore somebody's deliberate choice, and adopting it would
 			// silently redirect routing nobody asked Terraform to touch.
@@ -257,7 +257,7 @@ func TestRouteIsServerDefault(t *testing.T) {
 			want:          true,
 		},
 		{
-			// Two destinations cannot have come from attachDefaultRoutes: it
+			// Two destinations cannot have come from the server's default routing: it
 			// writes a one-element list. Somebody added the second one.
 			name:          "default destination plus another",
 			existing:      []string{defaultEmail, slack},
@@ -286,7 +286,7 @@ func TestRouteIsServerDefault(t *testing.T) {
 			want:          false,
 		},
 		{
-			// No verified email channel means attachDefaultRoutes returned
+			// No verified email channel means the server's default routing returned
 			// early and never wrote anything, so nothing can be its output.
 			// Without the guard, "" would match a project whose route list the
 			// API somehow answered with an empty id.

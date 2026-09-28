@@ -12,7 +12,7 @@ import (
 // TestReplacementPayload is the whole reason this resource does a GET before
 // every write. The API's replace semantics are not uniform: event-wide keys are
 // wiped and reapplied, but a per-cause row is only touched when the request
-// names it (api/api_templates.go: handleAPIPutTemplates). Sending just the
+// names it. Sending just the
 // desired map would leave a removed `down/silence` in place forever.
 func TestReplacementPayload(t *testing.T) {
 	for _, tc := range []struct {

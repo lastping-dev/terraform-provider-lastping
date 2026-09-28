@@ -79,9 +79,8 @@ func testAccCreatingKeyExpiry(t *testing.T) (*time.Time, error) {
 }
 
 // testAccCheckExpiryInheritedFromCreator asserts what an OMITTED expires_at may
-// read back as, and it is the assertion the monorepo's provider-acceptance job
-// pins LASTPING_SEED_KEY_EXPIRY=never to avoid (see .github/workflows/ci.yml
-// there): it replaces a flat TestCheckNoResourceAttr, which could only ever hold
+// read back as, and it is the assertion the provider-acceptance job
+// pins LASTPING_SEED_KEY_EXPIRY=never to avoid: it replaces a flat TestCheckNoResourceAttr, which could only ever hold
 // for a permanent creating key.
 //
 // A key may not outlive the key that minted it, so with an expiring creating key
@@ -578,8 +577,8 @@ resource "lastping_api_key" "bad" {
 // key, whatever the configuration says.
 //
 // The write key is minted in-test, by the suite's own admin key, because the
-// seeded acceptance key is always admin (the monorepo's scripts/seed-acc-key.sh
-// inserts the row without a scope, taking the column default). It is revoked
+// seeded acceptance key is always admin (the seeding step inserts it without
+// a scope, taking the default). It is revoked
 // again at the end.
 //
 // TWO refusals are acceptable, and which one arrives depends on a server flag

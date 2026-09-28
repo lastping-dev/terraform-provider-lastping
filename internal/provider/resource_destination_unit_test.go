@@ -31,7 +31,7 @@ func validateDestinationString(t *testing.T, attrName, value string) validator.S
 }
 
 // TestDestinationAddressIsValidatedAtPlanTime: the API runs mail.ParseAddress
-// (api/channels.go: validateChannelConfig), so a typo'd address is a 400
+// on every address, so a typo'd address is a 400
 // partway through an apply. Every other constraint on this resource is a plan
 // error naming the attribute, and this one has no business being different.
 func TestDestinationAddressIsValidatedAtPlanTime(t *testing.T) {
@@ -103,7 +103,7 @@ func TestDestinationConfigOmitsUnsetNtfyToken(t *testing.T) {
 //
 // Note what this does NOT claim. Resending an identical config would not reset
 // `verified` either: the server compares the old and new addresses before
-// touching verification (api/channels.go: handleUpdateChannel), so it is the
+// touching verification, so it is the
 // server, not this skip, that makes a rename safe for an email destination.
 // What the skip buys is a rename that stays a rename — no needless rewrite of
 // write-only credentials over the wire on an update that has nothing to do with

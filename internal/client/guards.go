@@ -11,7 +11,7 @@ import (
 // Path, rolls it up across the trailing WindowS seconds with Aggregation, and
 // opens an incident with cause `runaway` when the result exceeds Ceiling.
 //
-// The field names mirror the API's own DTO (api/api_guards.go). Note that Path
+// The field names mirror the API's own response shape. Note that Path
 // is `path` on the wire even though the column behind it is `json_path`: it is
 // the identical dotted path an Assertion carries, read by the identical code,
 // and the API deliberately gives one concept one name across the two sibling

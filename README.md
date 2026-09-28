@@ -123,8 +123,7 @@ code path where the suite passes against a project missing this seed.
 **The scope tests need no extra seeding.** `TestAccAPIKey_scopeCapIsEnforcedByTheServer`
 mints its own `write` key with the configured key and authenticates a second,
 aliased provider with it, because the seeded acceptance key is always `admin`
-(the monorepo's `scripts/seed-acc-key.sh` inserts the row without a scope, so it
-takes the column default). The test accepts either refusal — the create-time
+(the seeding step inserts the key without a scope, so it takes the default). The test accepts either refusal — the create-time
 scope cap (400, `max_scope`) or, once `LP_API_KEY_SCOPES_ENFORCE` is on, the
 route's own 403 (`required_scope`) — since which one arrives is a server-side
 flag this repository does not control.

@@ -85,7 +85,7 @@ func TestMonitorSurfacesAgreeOnEmptyValues(t *testing.T) {
 
 // TestMonitorDataSourceCiWebhookURLAgreesWithResource pins ci_webhook_url as
 // an ordinary readable field on the data source too: unlike ci_secret, it is
-// populated by rowToDTO on every GET, so both surfaces must report the
+// populated by the API on every GET, so both surfaces must report the
 // identical value for the identical response instead of the data source
 // reading a stale or null value.
 func TestMonitorDataSourceCiWebhookURLAgreesWithResource(t *testing.T) {

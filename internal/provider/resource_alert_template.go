@@ -30,15 +30,14 @@ var (
 	_ validator.String = trimmedValidator{}
 )
 
-// templateKeyPattern mirrors the server's key grammar (api/api_templates.go:
-// parseTemplateKey plus alertevent.IsValidEventType): an event type on its own,
+// templateKeyPattern mirrors the server's key grammar: an event type on its own,
 // or `event/cause` for a per-cause override. The cause half is deliberately
 // unconstrained — the server does not validate it either, and pinning a list
 // here would reject causes added later by the backend.
 var templateKeyPattern = regexp.MustCompile(`^(down|recovery|fail|every-run|success|started|blocked|note)(/.+)?$`)
 
 // trimmedValidator rejects a body that is not already in the form the server
-// would store. handleAPIPutTemplates runs strings.TrimSpace on every value, so
+// would store. the templates PUT runs strings.TrimSpace on every value, so
 // a padded template comes back trimmed and the apply fails as an inconsistent
 // result. A provider cannot fix that by rewriting the planned value — Terraform
 // rejects a planned value that differs from a known config value — so the only
@@ -185,9 +184,8 @@ func templatesFromModel(ctx context.Context, m alertTemplateResourceModel) (map[
 // and the configuration does not.
 //
 // This is NOT redundant with the API's replace semantics, which are uniform
-// only for event-wide keys (api/api_templates.go: handleAPIPutTemplates deletes
-// every bare event type — `down`, `recovery`, `fail`, `every-run`, `success`,
-// `started`, `blocked`, `note` — before applying the request, but touches a
+// only for event-wide keys (a PUT deletes every bare event type — `down`,
+// `recovery`, `fail`, `every-run`, `success`, `started`, `blocked`, `note` — before applying the request, but touches a
 // per-cause row only when the request names it). Sending just the
 // desired map would therefore leave `down/silence` behind forever once it had
 // been set — a removed key that never actually goes away, and a permanent diff.

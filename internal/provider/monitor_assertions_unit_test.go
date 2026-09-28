@@ -158,7 +158,7 @@ func TestAssertionsEqual(t *testing.T) {
 	require.True(t, assertionsEqual(nil, []client.Assertion{}))
 }
 
-// validateAssertions mirrors core/assertion.Validate at plan time. Every case
+// validateAssertions mirrors the API's assertion validation at plan time. Every case
 // here is a configuration the API would reject with a 400 partway through an
 // apply; catching them in the plan is the difference between an error that
 // names the assertion and one that arrives after Terraform has started

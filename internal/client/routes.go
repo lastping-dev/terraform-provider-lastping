@@ -9,8 +9,8 @@ import (
 // list of destinations LastPing notifies when that event fires.
 //
 // ChannelIDs is a *list*, not a set. The API stores and returns the array in
-// the order it was sent (api/routes.go: handleUpsertRoute stores the deduped
-// slice verbatim), so order is observable and must round-trip.
+// the order it was sent (it stores the deduplicated list verbatim), so order
+// is observable and must round-trip.
 type Route struct {
 	EventType  string   `json:"event_type"`
 	ChannelIDs []string `json:"channel_ids"`

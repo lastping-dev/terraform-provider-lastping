@@ -37,8 +37,7 @@ var (
 	_ validator.String = rfc3339Validator{}
 )
 
-// slugPattern mirrors the server's own rule (api/slug.go: validateSlug in the
-// LastPing monorepo). The server normalises (trim + lowercase) before it
+// slugPattern mirrors the server's own rule. The server normalises (trim + lowercase) before it
 // validates, so `  Rev-Case-Slug  ` would be accepted server-side and come back
 // as `rev-case-slug` — a value Terraform never planned. A provider cannot fix
 // that by rewriting the planned value (Terraform rejects a planned value that
@@ -46,7 +45,7 @@ var (
 // the un-normalised form at plan time.
 var slugPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,48}[a-z0-9]$`)
 
-// sourceKindPattern mirrors api/check_source.go's sourceKindRe exactly.
+// sourceKindPattern mirrors the server's source-kind rule exactly.
 //
 // Refusing a malformed kind at plan time is not politeness about a 400. The
 // reconcile key is compared byte-for-byte by a unique index, so "GitHub
@@ -375,9 +374,9 @@ func (r *monitorResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 					"`step_timeout_s` it has no run-scoped precondition that would make it a no-op there.",
 				// The API declares no bounds for this attribute and enforces none, so
 				// this validator is deliberately the loosest one that still refuses a
-				// value that could not mean what it says: core/check reads any
+				// value that could not mean what it says: the server reads any
 				// blocked_timeout_s <= 0 as "unset" and applies the 24-hour default
-				// (core/check/detect.go), so a configured 0 would be stored, read
+				// when it computes deadlines, so a configured 0 would be stored, read
 				// back as 0, and behave as 86400 — state that agrees with the
 				// configuration and lies about the monitor.
 				Validators: []validator.Int64{int64validator.AtLeast(1)},
@@ -500,8 +499,7 @@ func (r *monitorResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 				MarkdownDescription: "The HMAC key your CI provider's pipeline signs its `ci_webhook_url` " +
 					"requests with.\n\n" +
 					"~> **WRITE-ONCE — returned only by the create call that sets `ci_provider`.** No " +
-					"`GET`, list or `PATCH` response ever carries it (api/checks.go: rowToDTO's own comment " +
-					"says so — \"ci_secret is NEVER populated here\"), so this provider carries the value " +
+					"`GET`, list or `PATCH` response ever carries it, so this provider carries the value " +
 					"captured at creation forward across every later refresh instead of re-reading it, the " +
 					"same pattern `lastping_api_key`'s `key` uses for its own write-once credential. A " +
 					"refresh reporting nothing new here is expected, not a sign anything is wrong.\n\n" +
@@ -722,7 +720,7 @@ func (r *monitorResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 //
 // And two rules that are not about http at all: step_timeout_s must be strictly
 // below the effective run budget (see validateStepTimeoutBudget), and every
-// `assertion` block must be one core/assertion.Validate would accept (see
+// `assertion` block must be one the API's validation would accept (see
 // validateAssertions, which also refuses assertions on an http monitor — a
 // probe has no ping body, so they could never be evaluated).
 // ConfigValidators enforces the discovery identity's set-together rule at plan
@@ -829,10 +827,9 @@ func (r *monitorResource) ValidateConfig(ctx context.Context, req resource.Valid
 // validateCIFilters refuses ci_workflow or ci_branch on a monitor that has no
 // ci_provider.
 //
-// The API does not refuse it — it silently discards both. api/checks.go only
-// calls SetCheckCIBinding when a provider was supplied on create, and
-// api/checks.go's PATCH path guards the same call with
-// `existing.CiProvider.Valid && existing.CiProvider.String != ""`, so the
+// The API does not refuse it — it silently discards both. It stores the CI
+// binding only when a provider was supplied on create, and its PATCH path
+// stores it only when the monitor already has a CI provider, so the
 // filters are accepted with a 200 and dropped on the floor. The spec says as
 // much in prose ("Has no effect when `ci_provider` is not set").
 //
@@ -846,7 +843,7 @@ func (r *monitorResource) ValidateConfig(ctx context.Context, req resource.Valid
 // Unknown is not an error: a ci_provider interpolated from another resource is
 // unknown at plan time and known at apply time, and the API is the backstop.
 // validateOnDemandSchedule refuses a cadence on an on_demand monitor, matching
-// the API's ON_DEMAND_SCHEDULE_CONFLICT rejection (api/checks.go). on_demand
+// the API's ON_DEMAND_SCHEDULE_CONFLICT rejection. on_demand
 // arms no absence deadlines between runs, so period_s and cron_expr would be
 // persisted on a monitor that never reads either -- silently accepted, silently
 // meaningless. The API refuses it outright; refusing at plan time surfaces the
@@ -1145,7 +1142,7 @@ func monitorPatchFromModel(ctx context.Context, desired, cfg monitorResourceMode
 	// attribute the API documents as immutable-and-ignored-on-update, and it is
 	// sent for the same reason they are: this provider still has to be correct
 	// against a server that replaces rather than merges. Against the real API it
-	// is a guaranteed no-op — checkPatchRequest has no ci_provider member, so
+	// is a guaranteed no-op — the PATCH body has no ci_provider member, so
 	// the key is not even decoded — and RequiresReplace means a changed value
 	// never reaches Update in the first place.
 	putString("ci_provider", desired.CiProvider)
@@ -1251,7 +1248,7 @@ func monitorPatchFromModel(ctx context.Context, desired, cfg monitorResourceMode
 	// schema's LengthAtLeast(1) refuses a configured "" at plan time.
 	//
 	// Sending the pair on a monitor with no CI binding is a no-op the API
-	// accepts: it guards SetCheckCIBinding on the STORED ci_provider, so the
+	// accepts: it stores a CI binding only on the STORED ci_provider, so the
 	// merged filters are simply never written. ValidateConfig has already
 	// refused a configured filter in that case anyway.
 	if cfg.CiWorkflow.IsNull() || desired.CiWorkflow.IsNull() {
@@ -1328,8 +1325,8 @@ func monitorPatchFromModel(ctx context.Context, desired, cfg monitorResourceMode
 	// agent_id is clearable for the same reason as the rest of this group: an
 	// absent key under merge-patch leaves the stored attachment alone, so
 	// "detach this monitor from its agent" would be unreachable through
-	// Terraform if the key were only ever omitted. api/checks_patch.go resolves
-	// an explicit null to SetCheckAgent(agent_id = NULL) — always a 200, never
+	// Terraform if the key were only ever omitted. The API resolves an explicit
+	// null to detaching the agent — always a 200, never
 	// a 400, so sending it on every PATCH (even one that never had an
 	// attachment) is a harmless no-op, exactly like monitor_from and the
 	// budgets above.
@@ -1387,12 +1384,11 @@ func int64OrNull(v int64) types.Int64 {
 //
 //   - ci_workflow and ci_branch are write-only from the API's point of view:
 //     the provider sends them on create and PATCH, but no response — GET,
-//     list or PATCH's own reply — ever reports them back. checkResponse simply
+//     list or PATCH's own reply — ever reports them back. The API response simply
 //     has no field for either.
 //   - ci_secret is the mirror shape, read-once: the provider never sends it
 //     (it cannot be configured at all), and the API reports it back exactly
-//     once, in the create response, per api/checks.go's rowToDTO comment
-//     ("ci_secret is NEVER populated here" — true of every other response).
+//     once, in the create response (no other response ever carries it).
 //
 // In both cases, passing the API's "" straight through stringOrNull would null
 // the attribute on the very next refresh, producing a permanent diff (for
@@ -1495,12 +1491,12 @@ func modelFromMonitor(ctx context.Context, mon *client.Monitor, prior monitorRes
 		ProbeMethod:  types.StringValue(mon.ProbeMethod),
 
 		// agent_id: the API omits it entirely when the monitor is unattached
-		// (checkResponse.AgentID has `omitempty`), and always reports the
+		// (agent_id is `omitempty` in the API response), and always reports the
 		// canonical UUID — never the slug a caller may have attached it with.
 		AgentID: stringOrNull(mon.AgentID),
 
 		// ci_provider and ci_webhook_url ARE reported by GET and list
-		// (checkResponse.CiProvider / CiWebhookURL, both omitempty), so both
+		// (both omitempty in the API response), so both
 		// refresh normally and an import picks them up. ci_workflow and
 		// ci_branch do not — see writeOnlyString — and neither does ci_secret,
 		// for the opposite (read-once, not write-only) reason writeOnlyString's
@@ -1511,7 +1507,7 @@ func modelFromMonitor(ctx context.Context, mon *client.Monitor, prior monitorRes
 		CiWebhookURL: stringOrNull(mon.CiWebhookURL),
 		CiSecret:     writeOnlyString(mon.CiSecret, prior.CiSecret),
 
-		// The discovery identity refreshes normally: checkResponse carries
+		// The discovery identity refreshes normally: the API response carries
 		// both fields, and a monitor with no source simply omits them, which
 		// decodes as "".
 		//

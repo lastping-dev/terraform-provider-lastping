@@ -10,8 +10,9 @@ import (
 // for an autonomous worker that owns monitors.
 //
 // Only Name and Description are ever sent. Slug is derived server-side from
-// Name at creation (api/agents_api.go: slugFromName) and is immutable
-// afterwards, and everything below the Computed comment is rolled up live from
+// Name at creation and is never sent by this provider: the server changes a
+// slug only when a request sends one, so sending it would rename the agent's
+// slug. Everything below the Computed comment is rolled up live from
 // the monitors the agent owns — none of it is storable, so none of it is part
 // of a request body.
 type Agent struct {
@@ -23,7 +24,7 @@ type Agent struct {
 	//
 	// Slug is derived from Name, not accepted on create and ignored on patch.
 	// Status/MonitorCount/LastSeen are not stored at all: the API recomputes
-	// them on every response from the agent's monitors (core/agent.RollUp), so
+	// them on every response from the agent's monitors, so
 	// they change without anything in Terraform changing.
 	Slug         string  `json:"slug,omitempty"`
 	Status       string  `json:"status,omitempty"`

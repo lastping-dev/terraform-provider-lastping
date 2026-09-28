@@ -11,7 +11,7 @@ import (
 // alert delivery target (Slack, email, a webhook, …).
 //
 // SECURITY: the API stores Config but NEVER returns it. A response carries only
-// Target, a deliberately non-secret hint (api/channels.go: channelDTO), which is
+// Target, a deliberately non-secret hint, which is
 // the raw value for webhook/ntfy/email, "chat <id>" for telegram, and a fixed
 // label such as "slack webhook" for the credential-bearing kinds. Config is
 // therefore a request-only field: it is populated when building a payload and
@@ -84,8 +84,7 @@ func (c *Client) ListDestinations(ctx context.Context) ([]Destination, error) {
 // DefaultEmailDestinationID returns the destination the API auto-routes every
 // newly created monitor to, or "" when the project has none.
 //
-// It mirrors the server's own selection exactly (api/defaultdest.go:
-// attachDefaultRoutes in the LastPing monorepo): the FIRST channel that is
+// It mirrors the server's own selection exactly: the FIRST channel that is
 // `kind = "email"` and verified, in the order the API returns them. Both sides
 // read the same query — `SELECT * FROM channels WHERE project_id = $1 ORDER BY
 // created_at` — and GET /api/v1/channels serialises those rows in order, so
@@ -93,7 +92,7 @@ func (c *Client) ListDestinations(ctx context.Context) ([]Destination, error) {
 //
 // Two deliberate omissions, both of which keep this in step with the server:
 //
-//   - A disabled channel is still eligible, because attachDefaultRoutes tests
+//   - A disabled channel is still eligible, because the server's default routing tests
 //     only verified_at. Skipping disabled channels here would make the provider
 //     name a different channel than the one the auto-created route points at.
 //

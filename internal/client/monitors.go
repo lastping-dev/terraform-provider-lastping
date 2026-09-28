@@ -43,7 +43,7 @@ type Monitor struct {
 	ProbeTimeoutS        int64    `json:"probe_timeout_s,omitempty"`
 	ProbeFollowRedirects bool     `json:"probe_follow_redirects,omitempty"`
 	// AgentID attaches this monitor to an agent, by either the agent's id or
-	// its slug (api/checks.go: createCheckRequest.AgentID / checkResponse.AgentID).
+	// its slug (the API accepts both on create; responses carry the id).
 	// Empty/omitted means "no attachment" on create, and is never populated by a
 	// response that reports one — see modelFromMonitor's use of stringOrNull.
 	// Updates go through MonitorPatch, not this field, the same as every other
@@ -52,14 +52,14 @@ type Monitor struct {
 
 	// CI binding. CiProvider is create-only: POST /api/v1/checks generates a
 	// webhook secret and binds it, and PATCH does not decode the field at all
-	// (api/checks_patch.go: checkPatchRequest has no ci_provider member), so a
+	// (the PATCH body has no ci_provider member), so a
 	// changed provider is only reachable by replacing the monitor. GET and list
-	// DO report it (checkResponse.CiProvider), so it round-trips.
+	// DO report it (the API response carries it), so it round-trips.
 	//
 	// CiWorkflow and CiBranch are WRITE-ONLY, and this is the sharpest edge in
 	// this struct: both are accepted on create and on PATCH, but no response
-	// ever carries them — api/checks.go's checkResponse has no field for
-	// either, so rowToDTO cannot populate them and GET/list omit them
+	// ever carries them — the API's response has no field for either, so
+	// GET/list omit them
 	// unconditionally. They therefore always decode as "" here regardless of
 	// what the server holds, and Terraform state for them has to be carried
 	// forward from the prior state rather than refreshed. See
@@ -75,8 +75,8 @@ type Monitor struct {
 	CiBranch   string `json:"ci_branch,omitempty"`
 
 	// CiWebhookURL is, unlike CiWorkflow/CiBranch, an ordinary readable
-	// response field: api/checks.go's rowToDTO populates it from row.CiProvider
-	// on every GET and list, exactly like CiProvider itself. Omitted (empty)
+	// response field: the API populates it from the stored CI provider on
+	// every GET and list, exactly like CiProvider itself. Omitted (empty)
 	// when the monitor has no CI binding.
 	CiWebhookURL string `json:"ci_webhook_url,omitempty"`
 
@@ -84,8 +84,7 @@ type Monitor struct {
 	// the API returns it, but only in the 201 response to POST /api/v1/checks
 	// when ci_provider was set on that same request, and from
 	// POST /api/v1/checks/{id}/ci/regenerate (which this provider does not
-	// call). rowToDTO never populates it — api/checks.go's own comment on
-	// rowToDTO says so explicitly: "ci_secret is NEVER populated here". Every
+	// call). No other response ever populates it. Every
 	// GET, list and PATCH response therefore decodes this as "", regardless of
 	// whether the monitor has a live secret, and modelFromMonitor has to carry
 	// the value forward from prior state instead of refreshing it — see
@@ -100,8 +99,8 @@ type Monitor struct {
 	// the reconcile key that makes a discovery scan safe to re-run — the second
 	// run diffs against what exists instead of creating every monitor again.
 	//
-	// They are ordinary readable response fields: api/checks.go's checkResponse
-	// carries both with `omitempty`, so a hand-made monitor (the state of every
+	// They are ordinary readable response fields: the API's response carries
+	// both with `omitempty`, so a hand-made monitor (the state of every
 	// monitor that predates discovery) decodes both as "". That is why the
 	// provider maps them through stringOrNull and never through
 	// writeOnlyString — absent means "no source", not "the API declined to
@@ -138,7 +137,7 @@ type Monitor struct {
 	AlertAfter       *string `json:"alert_after,omitempty"`
 	MaintenanceUntil *string `json:"maintenance_until,omitempty"`
 	// NextProbeAt is due_at's counterpart for monitor_type = "http": when the
-	// prober will next probe the URL. api/checks.go's checkResponse omits it
+	// prober will next probe the URL. The API's response omits it
 	// for every other monitor_type, so it decodes as nil there, the same as
 	// due_at would for a monitor type that has no due_at.
 	NextProbeAt *string `json:"next_probe_at,omitempty"`

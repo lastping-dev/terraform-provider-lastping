@@ -139,7 +139,7 @@ func TestMonitorNewInt64Validators(t *testing.T) {
 		{"notify_min_run_s", 59, false},
 		{"notify_min_run_s", 31536001, false},
 		// blocked_timeout_s has no server-side bounds at all, so the only
-		// values refused here are the ones core/check would read as "unset"
+		// values refused here are the ones the server would read as "unset"
 		// and silently replace with the 24-hour default. There is no upper
 		// bound to assert: the API declares none, and inventing one would
 		// refuse a configuration the API accepts.
@@ -356,7 +356,7 @@ func TestMonitorMonitorFromRejectsNonRFC3339(t *testing.T) {
 }
 
 // TestMonitorAgentIDRequiresUUID pins the deliberate divergence from the API:
-// resolveAgentID (api/agents_api.go) accepts either an agent's id or its slug,
+// the API accepts either an agent's id or its slug,
 // but the response always echoes back the canonical UUID, never the slug it
 // was attached with. Because agent_id is plain Optional (not Computed), a
 // slug written here would apply cleanly and then desync state from plan on
@@ -419,8 +419,7 @@ func monitorStringRequiresReplace(t *testing.T, attrName, from, to string) bool 
 // ci_provider is a replacement and not an in-place update.
 //
 // It is not a style choice. `PATCH /api/v1/checks/{id}` does not decode
-// ci_provider at all — api/checks_patch.go's checkPatchRequest has no member
-// for it, and the spec lists it beside slug, monitor_type and ci_secret as
+// ci_provider at all — the PATCH body has no member for it, and the spec lists it beside slug, monitor_type and ci_secret as
 // immutable and ignored if present. Without RequiresReplace, changing
 // `github` to `gitlab` would produce a plan reading as a clean one-attribute
 // update, an apply that returned 200 having changed nothing, and the same diff
@@ -443,7 +442,7 @@ func TestMonitorCIProviderRequiresReplace(t *testing.T) {
 }
 
 // TestMonitorCIProviderRejectsUnknownProvider mirrors the API's
-// knownCIProviders set (api/checks.go), which answers 400 for anything else.
+// set of known CI providers, which answers 400 for anything else.
 func TestMonitorCIProviderRejectsUnknownProvider(t *testing.T) {
 	for _, ok := range []string{"github", "gitlab", "jenkins"} {
 		require.False(t, validateString(t, "ci_provider", ok).Diagnostics.HasError(), "%s must be accepted", ok)
@@ -498,7 +497,7 @@ func TestMonitorCIFiltersRequireProvider(t *testing.T) {
 // problem.
 //
 // ci_workflow and ci_branch are accepted by the API and never reported back:
-// api/checks.go's checkResponse has no field for either, so every GET decodes
+// the API's response has no field for either, so every GET decodes
 // them as "". Mapping that "" through stringOrNull — the obvious thing, and
 // what every other user-supplied string here does — would null both attributes
 // on the first refresh after an apply, leaving a permanent diff against any
@@ -552,8 +551,8 @@ func TestMonitorCIFiltersSurviveRefresh(t *testing.T) {
 
 // TestMonitorCiWebhookURLRefreshesNormally pins the OTHER half of the CI
 // fields: unlike ci_workflow/ci_branch/ci_secret, ci_webhook_url is an
-// ordinary readable response field (api/checks.go's rowToDTO populates it
-// from row.CiProvider on every GET, the same as ci_provider itself), so it
+// ordinary readable response field (the API populates it from the stored
+// CI provider on every GET, the same as ci_provider itself), so it
 // must NOT go through writeOnlyString's carry-forward — a stale prior value
 // must not survive a response that now says something different, and an
 // absent binding must read as null even with a stale prior in state.
@@ -586,8 +585,7 @@ func TestMonitorCiWebhookURLRefreshesNormally(t *testing.T) {
 // TestMonitorCiSecretSurvivesRefresh is the security-critical invariant for
 // ci_secret, on identical terms to TestAPIKeyModelPreservesPlaintext for
 // apiKeyResourceModel.Key: the API returns the plaintext secret exactly once,
-// in the create response, and never again — api/checks.go's rowToDTO comment
-// says so explicitly. A refresh (or an update, which also calls
+// in the create response, and never again. A refresh (or an update, which also calls
 // modelFromMonitor) must carry the value already in state forward rather than
 // nulling it, or the one copy that exists anywhere is destroyed.
 //
@@ -750,7 +748,7 @@ func TestMonitorCiSecretIsSensitive(t *testing.T) {
 
 // TestMonitorNextProbeAtIsHTTPOnly pins due_at's http-monitor counterpart: the
 // API omits next_probe_at for every monitor_type other than http
-// (api/checks.go's checkResponse has `omitempty` on it), which has to read as
+// (the response field is `omitempty`), which has to read as
 // null rather than as an empty string.
 func TestMonitorNextProbeAtIsHTTPOnly(t *testing.T) {
 	ctx := context.Background()
@@ -966,7 +964,7 @@ func TestMonitorPatchFromModel(t *testing.T) {
 		// nil has to reach the wire as JSON null, not as a dropped key: an
 		// absent key is exactly what the old payload sent and exactly what
 		// merge-patch reads as "leave it alone". For agent_id specifically,
-		// that null is what api/checks_patch.go reads as "detach from the
+		// that null is what the API reads as "detach from the
 		// agent" — the whole point of the attribute being clearable.
 		body, err := json.Marshal(got)
 		require.NoError(t, err)
@@ -1426,8 +1424,8 @@ func TestMonitorSourceIsOptionalComputed(t *testing.T) {
 	}
 }
 
-// TestMonitorSourceKindValidators mirrors api/check_source.go's sourceKindRe and
-// maxSourceKindLen at plan time.
+// TestMonitorSourceKindValidators mirrors the server's source-kind rule and
+// length cap at plan time.
 //
 // The pattern is load-bearing for re-runnability, not tidiness: the reconcile
 // key is compared byte-for-byte by a unique index, so "GitHub Actions" and
@@ -1676,7 +1674,7 @@ func TestMonitorSourceCreatePayloadOmitsUnset(t *testing.T) {
 
 // TestMonitorSourceReadsAbsentAsNull is hazard 3.
 //
-// The API's checkResponse carries both fields with `omitempty`, so a monitor a
+// The API response carries both fields with `omitempty`, so a monitor a
 // human created — every monitor that predates discovery, and the overwhelming
 // majority of monitors in any real configuration — omits both keys, which
 // decode as "". Mapping that to StringValue("") would put an empty string into

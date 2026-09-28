@@ -12,9 +12,8 @@ import (
 // TestDefaultEmailDestinationID pins the provider's copy of the server's
 // "which channel does a new monitor get routed to" rule.
 //
-// The API auto-routes every new monitor to the FIRST verified email channel in
-// `SELECT * FROM channels WHERE project_id = $1 ORDER BY created_at`
-// (api/defaultdest.go: attachDefaultRoutes). GET /api/v1/channels serves those
+// The API auto-routes every new monitor to the FIRST verified email channel
+// among the project's channels in creation order. GET /api/v1/channels serves those
 // same rows in that same order, so the provider can reproduce the choice — but
 // only if it reads the list the same way. Picking the wrong one turns the route
 // resource's auto-adoption into either a refusal on a legitimate first apply or,
@@ -31,7 +30,7 @@ func TestDefaultEmailDestinationID(t *testing.T) {
 			want: "",
 		},
 		{
-			// attachDefaultRoutes returns early here and writes no routes, so
+			// The server's default routing returns early here and writes no routes, so
 			// there is nothing for the route resource to adopt.
 			name: "no email destination",
 			body: `[{"id":"a","kind":"slack","verified":true}]`,
@@ -63,7 +62,7 @@ func TestDefaultEmailDestinationID(t *testing.T) {
 			want: "b",
 		},
 		{
-			// attachDefaultRoutes tests verified_at only; it has no opinion on
+			// The server's default routing tests verified_at only; it has no opinion on
 			// disabled_at. Skipping a disabled channel here would name a
 			// different channel than the route holds.
 			name: "a disabled but verified email destination is still the default",

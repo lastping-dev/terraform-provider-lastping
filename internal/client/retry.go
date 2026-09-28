@@ -11,7 +11,7 @@ import (
 // Retry policy for HTTP 429.
 //
 // The API rate-limits per key — LP_API_RATE_MAX requests per LP_API_RATE_WINDOW_S,
-// 60 per minute by default, over a fixed window (api/ratelimit.go). Terraform
+// 60 per minute by default, over a fixed window. Terraform
 // walks the graph with a default parallelism of 10, so any configuration of
 // more than a few dozen resources will cross that limit partway through an
 // apply. Treating the 429 as terminal loses the worst way possible: the

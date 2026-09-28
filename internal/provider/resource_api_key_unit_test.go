@@ -104,7 +104,7 @@ func TestAPIKeyExpiresAtValue(t *testing.T) {
 	})
 }
 
-// TestFutureTimestampValidator mirrors api/apikeys_api.go, which rejects an
+// TestFutureTimestampValidator mirrors the API's create call, which rejects an
 // expires_at that is not After(now). Refusing it at plan time can only move the
 // server's error earlier; refusing anything the server would accept would be a
 // bug, hence the "well into the future" case.

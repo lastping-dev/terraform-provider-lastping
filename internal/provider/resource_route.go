@@ -29,10 +29,10 @@ var (
 	_ validator.String = uuidValidator{}
 )
 
-// routeEventTypes is the set the API accepts (api/routes.go: validEventTypes).
+// routeEventTypes is the set the API accepts.
 //
-// This is NOT the same set the API auto-routes on monitor creation
-// (api/defaultdest.go: defaultAlertEvents), which is down/fail/recovery/blocked.
+// This is NOT the same set the API auto-routes on monitor creation, which is
+// down/fail/recovery/blocked.
 // every-run, success, started and note are deliberately absent there -- they are
 // RateClassInfo, one or more per run, and auto-routing them would mail a user on
 // every task transition. Widening this slice must not widen the adoption
@@ -41,7 +41,7 @@ var routeEventTypes = []string{
 	"down", "recovery", "fail", "every-run", "success", "started", "blocked", "note",
 }
 
-// defaultAlertEvents mirrors api/defaultdest.go: the events the API attaches to
+// defaultAlertEvents mirrors the server: the events the API attaches to
 // the project's default email destination when a monitor is created. Kept
 // separate from routeEventTypes on purpose — every-run, success, started and
 // note are routable but are never auto-routed.
@@ -275,14 +275,14 @@ func routeAdoptionConflict(existing, want []string) bool {
 // by itself when the monitor was created, rather than routing a person chose.
 //
 // The API auto-routes every new monitor's down/fail/recovery events to the
-// project's default email channel (api/defaultdest.go: attachDefaultRoutes),
+// project's default email channel,
 // which means a monitor Terraform created a millisecond ago already has three
 // routes Terraform did not create. Treating those as somebody else's
 // configuration made the obvious first apply — a monitor and its routes
 // together — impossible: it always failed, and the only way forward was to
 // apply, discover the auto-routes, write import blocks and apply again.
 //
-// The signature is deliberately narrow. attachDefaultRoutes writes exactly one
+// The signature is deliberately narrow. The server's default routing writes exactly one
 // destination, and that destination is the project's default email channel, so
 // anything else — two destinations, one destination that is something else —
 // cannot have come from it and is left to the guard. A human who deliberately
@@ -292,7 +292,7 @@ func routeAdoptionConflict(existing, want []string) bool {
 // write explicitly rather than an alert path they lose silently.
 //
 // defaultDestID is "" when the project has no verified email channel. Then
-// attachDefaultRoutes returned early, no auto-route exists, and nothing can
+// the server's default routing returned early, no auto-route exists, and nothing can
 // match — hence the explicit guard rather than a comparison against "".
 //
 // eventType gates the exemption to the three events the API actually

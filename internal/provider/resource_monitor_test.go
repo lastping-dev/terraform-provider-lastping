@@ -19,14 +19,14 @@ import (
 //
 // The second half exists because a project without one hid a real bug: the API
 // only auto-routes a new monitor's down/fail/recovery events when it has a
-// default email channel to route to (attachDefaultRoutes no-ops otherwise), so
+// default email channel to route to (default routing does nothing otherwise), so
 // the auto-route/adoption scenario simply never arose against an unseeded
 // project, and 43 passing acceptance tests never touched it. That is not a
 // property of one or two route tests — it is a property of the fixture the
 // whole suite runs against — so the requirement lives here, not in individual
 // tests' PreChecks, and applies to every acceptance test without exception.
 //
-// These run from the monorepo CI against docker-compose, not from public CI.
+// These run against a live backend (docker-compose), not from public CI.
 func testAccPreCheck(t *testing.T) {
 	t.Helper()
 	if os.Getenv("LASTPING_API_KEY") == "" {
@@ -120,7 +120,7 @@ resource "lastping_monitor" "cron" {
 }
 
 // TestAccMonitor_httpProbe covers monitor_type = "http". The API floors the
-// effective grace to 2*probe_interval_s (api/checks.go: createHTTPCheckFromValidated),
+// effective grace to 2*probe_interval_s on create,
 // so a configuration that asks for less must still apply: with grace_s Required
 // (non-computed) Terraform rejects the server's larger value as an inconsistent
 // result after apply, which made http monitors impossible to create at all.
@@ -1817,7 +1817,7 @@ resource "lastping_monitor" "ciimp" {
 				// ci_secret joins the write-only filters for a different but
 				// equally structural reason: the API returns it ONLY on create
 				// and on the regenerate endpoint, never on the GET an import
-				// performs (api/checks.go's rowToDTO says so in as many words).
+				// performs.
 				// So an imported CI monitor legitimately has no secret in
 				// state, exactly as the attribute's own documentation warns.
 				ImportStateVerifyIgnore: []string{"ci_workflow", "ci_branch", "ci_secret"},

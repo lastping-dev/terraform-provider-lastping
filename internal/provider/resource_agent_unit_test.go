@@ -38,8 +38,8 @@ func validateAgentName(t *testing.T, value string) validator.StringResponse {
 	return resp
 }
 
-// TestDeriveAgentSlug pins the provider's copy of the server's slugFromName
-// (api/agents_api.go). The provider never SENDS a slug, so a disagreement here
+// TestDeriveAgentSlug pins the provider's copy of the server's slug
+// derivation. The provider never SENDS a slug, so a disagreement here
 // cannot corrupt state — but it would misreport the slug in the collision
 // diagnostic and in the plan-time name check, which is where an operator is
 // least able to tell a provider bug from an API one.
@@ -67,7 +67,7 @@ func TestDeriveAgentSlug(t *testing.T) {
 }
 
 // TestAgentNameIsValidatedAtPlanTime covers the refusals that mirror the
-// server's own validateSlug, so "cannot derive a valid slug from name" is a
+// server's own slug rule, so "cannot derive a valid slug from name" is a
 // plan-time error naming the attribute instead of an opaque 400 partway through
 // an apply. The length rule is the one worth catching early: it applies to the
 // DERIVED SLUG, not to the name, so a name that looks entirely reasonable can

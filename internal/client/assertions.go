@@ -10,7 +10,7 @@ import (
 // an incident with cause `assertion` instead of being recorded as a healthy
 // check-in.
 //
-// The omitempty tags mirror the API's own DTO (api/api_assertions.go). Value,
+// The omitempty tags mirror the API's own response shape. Value,
 // Path and Op are each meaningful for only some kinds, and the API stores the
 // empty string for the rest — so omitting them on the wire and receiving them
 // absent are the same state.

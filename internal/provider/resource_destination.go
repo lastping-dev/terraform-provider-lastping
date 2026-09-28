@@ -28,14 +28,13 @@ var (
 	_ resource.ConfigValidator              = (*kindRequiresValidator)(nil)
 )
 
-// destinationKinds is the set of kinds the API accepts (api/channels.go:
-// handleCreateChannel).
+// destinationKinds is the set of kinds the API accepts.
 var destinationKinds = []string{
 	"webhook", "telegram", "discord", "slack", "msteams", "googlechat", "ntfy", "pushover", "email",
 }
 
 // destinationKindAttrs maps each kind onto the configuration attributes the API
-// *requires* for it (api/channels.go: validateChannelConfig). Anything outside a
+// *requires* for it. Anything outside a
 // kind's required-plus-optional lists is not meaningful for it.
 var destinationKindAttrs = map[string][]string{
 	"webhook":    {"url", "secret"},
@@ -53,7 +52,7 @@ var destinationKindAttrs = map[string][]string{
 // does not require. These have to be tracked separately from the required set:
 // they must be allowed through the foreign-attribute check without being
 // demanded, and they must be included in the `config` payload when set, because
-// the API replaces config wholesale (api/channels.go: handleUpdateChannel) and
+// the API replaces config wholesale on update and
 // an omitted credential is a wiped credential.
 //
 // `token` is the one member so far — ntfy sends it as `Authorization: Bearer`
@@ -164,8 +163,7 @@ func (v *kindRequiresValidator) ValidateResource(ctx context.Context, req resour
 }
 
 // emailAddressValidator rejects an address the API would reject. It mirrors the
-// server exactly — api/channels.go: validateChannelConfig runs the same
-// net/mail.ParseAddress — so this can only move an error earlier, never invent
+// server exactly — the API runs the same net/mail.ParseAddress — so this can only move an error earlier, never invent
 // one. Without it a typo'd address is an opaque 400 partway through an apply,
 // which is the one thing this resource's plan-time validation exists to avoid.
 type emailAddressValidator struct{}
@@ -424,7 +422,7 @@ func destinationConfig(m destinationResourceModel) map[string]string {
 //
 // It is NOT what protects an email destination's verification, despite being an
 // easy thing to assume. The server compares the old and new addresses before it
-// touches verification (api/channels.go: handleUpdateChannel), so resending an
+// touches verification, so resending an
 // identical config would preserve `verified` just the same. Only a genuine
 // address change resets it, which is exactly what an operator would expect.
 func destinationConfigPatch(plan, state destinationResourceModel) map[string]string {

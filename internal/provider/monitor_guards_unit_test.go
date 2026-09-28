@@ -142,7 +142,7 @@ func TestGuardsEqual_CeilingComparisonIsExact(t *testing.T) {
 	require.True(t, guardsEqual(a, a))
 }
 
-// validateGuards mirrors core/metricguard.Validate at plan time. Every case
+// validateGuards mirrors the API's guard validation at plan time. Every case
 // here is a configuration the API would reject with a 400 partway through an
 // apply.
 func TestValidateGuardsRejectsWhatTheAPIWouldReject(t *testing.T) {
