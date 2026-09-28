@@ -193,14 +193,18 @@ func (r *agentResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 				Computed: true,
 				MarkdownDescription: "Project-scoped identifier derived from `name` at creation. A rename " +
 					"here never changes it; it changes only when someone changes it explicitly in the console " +
-					"or API, and a refresh then reads the new value. Use it to import the agent, and to attach monitors to it — the " +
-					"API accepts either the slug or the UUID wherever an agent is referenced.",
+					"or API, and a refresh then reads the new value. Use it to import the agent; attach monitors " +
+					"to it by the agent's `id`, not its slug (see `lastping_monitor.agent_id`).",
 				// A rename never re-derives a slug, so the value in state is
 				// the value after any apply. Without this, every rename would
 				// plan slug as "(known after apply)" and imply otherwise. A
-				// slug changed in the console or API still reaches state on
-				// refresh (TestAgentReadTakesTheServersSlug): this modifier
-				// shapes the plan only.
+				// slug changed in the console or API reaches state on refresh
+				// (TestAgentReadTakesTheServersSlug). The cost: a plan made
+				// from stale state (plan -refresh=false, or a slug changed out
+				// of band between plan -out and apply) promises the old slug,
+				// and an apply that renames the agent can then fail with
+				// "Provider produced inconsistent result after apply" on slug.
+				// Re-planning fixes it, since the refresh reads the new slug.
 				PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
 			},
 			"status": schema.StringAttribute{
@@ -277,9 +281,8 @@ func (r *agentResource) Configure(_ context.Context, req resource.ConfigureReque
 // to "". Omitting the key instead would leave the stored description in place
 // and make "remove the description" unreachable through Terraform.
 //
-// `slug` is never sent. It is immutable server-side and ignored if present, and
-// sending a value Terraform cannot change would only invite the belief that it
-// can.
+// `slug` is never sent by this provider: a sent slug would change it
+// server-side, and this resource does not manage the slug.
 func agentPatchFromModel(desired, cfg agentResourceModel) client.AgentPatch {
 	patch := client.AgentPatch{"name": desired.Name.ValueString()}
 

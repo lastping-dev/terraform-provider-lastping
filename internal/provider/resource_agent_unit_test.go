@@ -239,7 +239,7 @@ func TestAgentPatchFromModel(t *testing.T) {
 	t.Run("slug is never sent", func(t *testing.T) {
 		got := agentPatchFromModel(stored, stored)
 		require.NotContains(t, got, "slug",
-			"slug is immutable server-side; sending it would imply Terraform can change it")
+			"slug is never sent by this provider; a sent slug would change it server-side")
 	})
 }
 
@@ -290,9 +290,11 @@ func TestModelFromAgent(t *testing.T) {
 // creation. UseStateForUnknown on slug only shapes the plan; it cannot hide a
 // refreshed value, and this is the test that says so.
 func TestAgentReadTakesTheServersSlug(t *testing.T) {
+	// The handler only records the request: require calls t.FailNow, which
+	// must run on the test goroutine, so the assertions come after Read.
+	var gotMethod, gotPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, http.MethodGet, r.Method)
-		require.Equal(t, "/api/v1/agents/agent-1", r.URL.Path)
+		gotMethod, gotPath = r.Method, r.URL.Path
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"agent-1","slug":"reddit-bot","name":"Reddit Bot","description":"",` +
 			`"status":"idle","monitor_count":0,"created_at":"2026-07-01T12:00:00Z"}`))
@@ -309,6 +311,8 @@ func TestAgentReadTakesTheServersSlug(t *testing.T) {
 	r := &agentResource{client: client.New(srv.URL, "lp_test", "unit")}
 	resp := &resource.ReadResponse{State: stale}
 	r.Read(ctx, resource.ReadRequest{State: stale}, resp)
+	require.Equal(t, http.MethodGet, gotMethod)
+	require.Equal(t, "/api/v1/agents/agent-1", gotPath)
 	require.False(t, resp.Diagnostics.HasError(), "%v", resp.Diagnostics)
 
 	var got agentResourceModel
