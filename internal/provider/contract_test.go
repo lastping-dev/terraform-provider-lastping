@@ -88,22 +88,13 @@ const specPath = "../../testdata/openapi.yaml"
 // resource.lastping_monitor, data.lastping_monitor and
 // data.lastping_monitors.monitors went once a resync picked up a deployment
 // that carried the property on CheckCreate, Check and CheckPatch.
-var knownSpecGaps = map[string]string{
-	// The API serves these, but the vendored copy of the spec predates them and
-	// is deliberately not resynced in the change that added them. Each entry
-	// fails once `make sync-openapi` pulls a copy that declares the property,
-	// and must then be deleted.
-	"resource.lastping_monitor.trace_content":       vendoredSpecPredatesIt,
-	"data.lastping_monitor.trace_content":           vendoredSpecPredatesIt,
-	"data.lastping_monitors.monitors.trace_content": vendoredSpecPredatesIt,
-	"resource.lastping_api_key.check_id":            vendoredSpecPredatesIt,
-	"ephemeral.lastping_api_key.check_id":           vendoredSpecPredatesIt,
-}
-
-// vendoredSpecPredatesIt is the reason for a knownSpecGaps entry whose
-// property the API already serves but testdata/openapi.yaml does not yet carry.
-const vendoredSpecPredatesIt = "served by the API (trace_content on CheckCreate, CheckPatch and Check; " +
-	"check_id on ApiKeyCreate and ApiKey), absent from the vendored testdata/openapi.yaml until the next resync"
+//
+// trace_content (on all three monitor surfaces) and check_id (on the managed
+// and ephemeral API key) were the last five entries: the API served them before
+// the vendored copy carried them, and they went when a resync pulled a spec
+// declaring them on CheckCreate, CheckPatch and Check, and on ApiKeyCreate and
+// ApiKey.
+var knownSpecGaps = map[string]string{}
 
 // deliberatelyUnmodelled records spec properties that live on a schema an
 // existing contractCase already checks, that the provider does NOT model, and
@@ -205,6 +196,48 @@ var deliberatelyUnmodelled = map[string]string{
 		"provider says \"destination\" everywhere the API says \"channel\" (see destination_ids in " +
 		"this case's sendExempt/readExempt)",
 
+	// Read-only runtime and observational figures the API adds to its monitor,
+	// agent and destination responses for the console and the MCP server:
+	// usage, spend, latency, uptime, hook state, counts and recent outcomes.
+	// Terraform carries declarative configuration only. None of these can be
+	// set, each changes between applies without any configuration change, and
+	// a Computed attribute over them would only churn state that nothing
+	// converges toward. They stay readable through the REST API and the hosted
+	// MCP server at mcp.lastping.dev.
+	"resource.lastping_monitor.claude_code_seen_at":        monitorHookObservedExempt,
+	"data.lastping_monitor.claude_code_seen_at":            monitorHookObservedExempt,
+	"data.lastping_monitors.monitors.claude_code_seen_at":  monitorHookObservedExempt,
+	"resource.lastping_monitor.hook_seen_at":               monitorHookObservedExempt,
+	"data.lastping_monitor.hook_seen_at":                   monitorHookObservedExempt,
+	"data.lastping_monitors.monitors.hook_seen_at":         monitorHookObservedExempt,
+	"resource.lastping_monitor.hook_version":               monitorHookObservedExempt,
+	"data.lastping_monitor.hook_version":                   monitorHookObservedExempt,
+	"data.lastping_monitors.monitors.hook_version":         monitorHookObservedExempt,
+	"resource.lastping_monitor.hook_version_current":       monitorHookVersionCurrentExempt,
+	"data.lastping_monitor.hook_version_current":           monitorHookVersionCurrentExempt,
+	"data.lastping_monitors.monitors.hook_version_current": monitorHookVersionCurrentExempt,
+	"resource.lastping_monitor.kind":                       monitorKindExempt,
+	"data.lastping_monitor.kind":                           monitorKindExempt,
+	"data.lastping_monitors.monitors.kind":                 monitorKindExempt,
+	"resource.lastping_monitor.latency_ms":                 monitorRuntimeFigureExempt,
+	"data.lastping_monitor.latency_ms":                     monitorRuntimeFigureExempt,
+	"data.lastping_monitors.monitors.latency_ms":           monitorRuntimeFigureExempt,
+	"resource.lastping_monitor.recent_outcomes":            monitorRuntimeFigureExempt,
+	"data.lastping_monitor.recent_outcomes":                monitorRuntimeFigureExempt,
+	"data.lastping_monitors.monitors.recent_outcomes":      monitorRuntimeFigureExempt,
+	"resource.lastping_monitor.uptime_90d":                 monitorRuntimeFigureExempt,
+	"data.lastping_monitor.uptime_90d":                     monitorRuntimeFigureExempt,
+	"data.lastping_monitors.monitors.uptime_90d":           monitorRuntimeFigureExempt,
+	"resource.lastping_monitor.routes_count":               routingCountExempt,
+	"data.lastping_monitor.routes_count":                   routingCountExempt,
+	"data.lastping_monitors.monitors.routes_count":         routingCountExempt,
+	"resource.lastping_agent.runs_7d":                      agentActivityExempt,
+	"resource.lastping_agent.spend_24h":                    agentActivityExempt,
+	"resource.lastping_agent.top_dependencies":             agentActivityExempt,
+	"resource.lastping_agent.usage_24h":                    agentActivityExempt,
+	"resource.lastping_destination.used_by_monitors":       routingCountExempt,
+	"data.lastping_destination.used_by_monitors":           routingCountExempt,
+
 	// The rest of discovery has NO entry here, and cannot have one — no
 	// contractCase covers POST /api/v1/discovery/reconcile or
 	// components.schemas.DiscoverySource, so nothing in this file would flag
@@ -241,6 +274,31 @@ const apiKeyLastUsedSurfaceExempt = "derived from the caller-controlled, spoofab
 	"not from any cryptographic or protocol-level signal — a caller can " +
 	"claim to be any surface it likes. Useful as a best-effort dashboard hint for \"did my client ever " +
 	"authenticate?\", but never state Terraform should try to converge configuration toward."
+
+// monitorHookObservedExempt covers the hook and Claude Code sightings on a
+// monitor: facts about what a machine last reported, not configuration.
+const monitorHookObservedExempt = "observed state: recorded from the start pings and traces a " +
+	"machine sends, never set by a request, and it changes with every run"
+
+// monitorHookVersionCurrentExempt covers hook_version_current.
+const monitorHookVersionCurrentExempt = "a server-wide constant (the hook version set-up installs " +
+	"today), not a property of this monitor and not configurable"
+
+// monitorKindExempt covers the console grouping on a monitor.
+const monitorKindExempt = "derived server-side from monitor_type, agent_id and ci_provider, which " +
+	"the provider already models; a presentation grouping, not configuration"
+
+// monitorRuntimeFigureExempt covers latency, uptime and recent outcomes.
+const monitorRuntimeFigureExempt = "a runtime measurement of how the monitor has been behaving, " +
+	"recomputed as pings and probes arrive; nothing a configuration could set or converge toward"
+
+// routingCountExempt covers the route counts on monitors and destinations.
+const routingCountExempt = "a count derived from lastping_route resources, which Terraform " +
+	"already models directly; exposing the count would duplicate that state as a figure"
+
+// agentActivityExempt covers the agent's activity rollups.
+const agentActivityExempt = "an activity rollup over a trailing window (runs, spend, model usage, " +
+	"dependencies), recomputed as traces arrive; observational, not configuration"
 
 // ciConfiguredExempt is shared by all three monitor-reading cases.
 const ciConfiguredExempt = "always exactly (ci_provider != null) — a derived boolean mirror of " +
@@ -286,7 +344,27 @@ const ciConfiguredExempt = "always exactly (ci_provider != null) — a derived b
 // out, and why that is a decision rather than a second silent gap.
 //
 // Keys are "<case name>[.<nested attribute>].<spec property name>".
-var knownModellingGaps = map[string]string{}
+var knownModellingGaps = map[string]string{
+	// The API now returns the CI run filters on components.schemas.Check, and
+	// lastping_monitor already models both as configuration, but neither
+	// monitor data source exposes them yet. The resource still carries them
+	// forward from prior state (see ciFilterWriteOnly) rather than refreshing
+	// from the response; that read-direction change belongs with the fix.
+	"data.lastping_monitor.ci_branch":             ciFilterDataSourceGap,
+	"data.lastping_monitor.ci_workflow":           ciFilterDataSourceGap,
+	"data.lastping_monitors.monitors.ci_branch":   ciFilterDataSourceGap,
+	"data.lastping_monitors.monitors.ci_workflow": ciFilterDataSourceGap,
+
+	// The incident's own id, the handle GET /api/v1/incidents/{id} takes. It
+	// is an identity, not a runtime figure, and the incidents data source
+	// lists incidents without a way to address any one of them.
+	"data.lastping_incidents.incidents.incident_id": "the incident's identity, needed to address one " +
+		"incident (GET /api/v1/incidents/{id}); the data source lists incidents but does not expose it yet",
+}
+
+// ciFilterDataSourceGap is the reason for the CI filter entries above.
+const ciFilterDataSourceGap = "a monitor configuration field lastping_monitor already models and the " +
+	"API now returns on Check, but the monitor data sources do not expose it yet"
 
 // destinationConfigExempt is the reason every per-kind credential attribute on
 // lastping_destination has no spec property of its own. They are flattened by
@@ -311,6 +389,11 @@ const destinationConfigExempt = "flattened out of the API's free-form `config` o
 // unlike knownSpecGaps it will not fail on its own when that happens, so the
 // change lands with the read-direction fix in modelFromMonitor's
 // writeOnlyString rather than before it.
+//
+// That has now happened: the resync that pulled a spec declaring ci_branch and
+// ci_workflow on components.schemas.Check recorded the data-source half as
+// knownModellingGaps entries. This exemption stays until the read-direction
+// fix lands with those entries, and goes with it.
 const ciFilterWriteOnly = "write-only: accepted on CheckCreate and CheckPatch, but no API response " +
 	"carries it (the API response has no such field), so the provider carries the prior state forward " +
 	"instead of refreshing"
