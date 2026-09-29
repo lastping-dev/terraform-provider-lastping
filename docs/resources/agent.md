@@ -4,7 +4,7 @@ page_title: "lastping_agent Resource - terraform-provider-lastping"
 subcategory: ""
 description: |-
   A registry entry for an autonomous agent: a worker — a deploy bot, an ETL job, an LLM agent — that owns one or more monitors. Registering one gives it a stable identity, and its status rolls up live from the monitors it owns, so a fleet of workers can be watched as workers rather than as a pile of unrelated checks.
-  ~> slug is derived from name at creation and never changes again. The API has no path to rename a slug, and renaming the agent deliberately does not re-derive one: anything already referring to the agent by slug keeps working. An agent named Nightly ETL bot and later renamed to Hourly ETL bot keeps the slug nightly-etl-bot. Destroy and recreate the agent if the slug itself has to change — which unowns its monitors (see below), it does not delete them.
+  ~> slug is derived from name at creation; it changes only when someone changes it explicitly in the console or API, and Terraform then reads the new value on refresh. Renaming the agent here deliberately does not re-derive one: anything already referring to the agent by slug keeps working. An agent named Nightly ETL bot and later renamed to Hourly ETL bot keeps the slug nightly-etl-bot.
   Creating an agent is create-only, not an upsert: a name whose derived slug is already taken in this project fails the apply with a clear error instead of silently taking over an agent this configuration does not own. Import it instead.
   Destroying an agent does not destroy its monitors. Every monitor it owned survives with its ping history, incidents and schedule intact and simply becomes unowned.
 ---
@@ -13,7 +13,7 @@ description: |-
 
 A registry entry for an autonomous agent: a worker — a deploy bot, an ETL job, an LLM agent — that owns one or more monitors. Registering one gives it a stable identity, and its `status` rolls up live from the monitors it owns, so a fleet of workers can be watched as workers rather than as a pile of unrelated checks.
 
-~> **`slug` is derived from `name` at creation and never changes again.** The API has no path to rename a slug, and renaming the agent deliberately does not re-derive one: anything already referring to the agent by slug keeps working. An agent named `Nightly ETL bot` and later renamed to `Hourly ETL bot` keeps the slug `nightly-etl-bot`. Destroy and recreate the agent if the slug itself has to change — which unowns its monitors (see below), it does not delete them.
+~> **`slug` is derived from `name` at creation; it changes only when someone changes it explicitly in the console or API, and Terraform then reads the new value on refresh.** Renaming the agent here deliberately does not re-derive one: anything already referring to the agent by slug keeps working. An agent named `Nightly ETL bot` and later renamed to `Hourly ETL bot` keeps the slug `nightly-etl-bot`.
 
 Creating an agent is create-only, not an upsert: a name whose derived slug is already taken in this project fails the apply with a clear error instead of silently taking over an agent this configuration does not own. Import it instead.
 
@@ -33,9 +33,11 @@ resource "lastping_agent" "nightly_etl" {
 }
 
 # The slug is derived from the name at creation — lowercased, with every run of
-# characters outside [a-z0-9] collapsed to a single hyphen — and never changes
-# again. "Nightly ETL bot" gives "nightly-etl-bot"; renaming the agent later
-# keeps that slug, so anything already referring to it by slug keeps working.
+# characters outside [a-z0-9] collapsed to a single hyphen. "Nightly ETL bot"
+# gives "nightly-etl-bot"; renaming the agent later keeps that slug, so anything
+# already referring to it by slug keeps working. It changes only when someone
+# changes it explicitly in the console or API, and Terraform then reads the new
+# value on refresh.
 #
 # The derived slug must be 3-50 characters, which this provider checks at plan
 # time rather than letting the API answer 400 partway through an apply.
@@ -99,7 +101,7 @@ resource "lastping_agent" "deploy" {
 - `monitor_count` (Number) How many monitors this agent owns. Counted live, so it changes as monitors are attached and detached elsewhere.
 
 ~> **This value is only as fresh as the last refresh of this resource.** If a `lastping_monitor` in the same configuration attaches to this agent, that attach happens after this agent is read, so `monitor_count` in the state produced by that same `terraform apply` still shows the count from before the attach. It catches up on the next `terraform plan` or `terraform refresh`, once this resource is read again - Terraform does not re-read a resource's computed attributes just because a different resource, later in the same apply, made them stale.
-- `slug` (String) Stable, project-scoped identifier derived from `name` at creation and immutable thereafter. Use it to import the agent, and to attach monitors to it — the API accepts either the slug or the UUID wherever an agent is referenced.
+- `slug` (String) Project-scoped identifier derived from `name` at creation. A rename here never changes it; it changes only when someone changes it explicitly in the console or API, and a refresh then reads the new value. Use it to import the agent; attach monitors to it by the agent's `id`, not its slug (see `lastping_monitor.agent_id`).
 - `status` (String) Health rolled up live from the monitors this agent owns, worst first: `down`, `blocked` (a run is waiting on a human), `late`, `running` (a run is in flight), `up`, `pending` (a monitor exists but has never reported — usually broken wiring) or `idle` (no monitors, or all of them paused or in maintenance). Paused and in-maintenance monitors never contribute. Never stored, so it changes without any configuration change.
 
 ## Import

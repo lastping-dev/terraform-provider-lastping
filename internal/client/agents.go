@@ -10,8 +10,9 @@ import (
 // for an autonomous worker that owns monitors.
 //
 // Only Name and Description are ever sent. Slug is derived server-side from
-// Name at creation (api/agents_api.go: slugFromName) and is immutable
-// afterwards, and everything below the Computed comment is rolled up live from
+// Name at creation and is never sent by this provider: the server changes a
+// slug only when a request sends one, so sending it would rename the agent's
+// slug. Everything below the Computed comment is rolled up live from
 // the monitors the agent owns — none of it is storable, so none of it is part
 // of a request body.
 type Agent struct {
@@ -21,7 +22,8 @@ type Agent struct {
 
 	// Computed — server-supplied, never part of a request payload.
 	//
-	// Slug is derived from Name, not accepted on create and ignored on patch.
+	// Slug is derived from Name at creation and never sent by this provider;
+	// it changes only when someone changes it in the console or API.
 	// Status/MonitorCount/LastSeen are not stored at all: the API recomputes
 	// them on every response from the agent's monitors (core/agent.RollUp), so
 	// they change without anything in Terraform changing.
@@ -56,7 +58,8 @@ type createAgentRequest struct {
 //     state, so it can never be blanked;
 //   - any other value replaces the stored one.
 //
-// `slug` is immutable after creation and is ignored if present.
+// `slug` is never sent by this provider: a sent slug would change it
+// server-side.
 //
 // This is a map and not a struct for the same reason MonitorPatch is: presence
 // is the whole point of a merge patch, and a struct with `omitempty` makes

@@ -9,9 +9,11 @@ resource "lastping_agent" "nightly_etl" {
 }
 
 # The slug is derived from the name at creation — lowercased, with every run of
-# characters outside [a-z0-9] collapsed to a single hyphen — and never changes
-# again. "Nightly ETL bot" gives "nightly-etl-bot"; renaming the agent later
-# keeps that slug, so anything already referring to it by slug keeps working.
+# characters outside [a-z0-9] collapsed to a single hyphen. "Nightly ETL bot"
+# gives "nightly-etl-bot"; renaming the agent later keeps that slug, so anything
+# already referring to it by slug keeps working. It changes only when someone
+# changes it explicitly in the console or API, and Terraform then reads the new
+# value on refresh.
 #
 # The derived slug must be 3-50 characters, which this provider checks at plan
 # time rather than letting the API answer 400 partway through an apply.
