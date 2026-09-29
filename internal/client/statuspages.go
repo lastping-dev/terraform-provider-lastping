@@ -42,7 +42,7 @@ type createStatusPageRequest struct {
 
 // updateStatusPageRequest is the PATCH /api/v1/status-pages/{id} body. Unlike
 // create it is a full replacement and slug is REQUIRED — the API validates it
-// unconditionally (api/statuspages.go: handleUpdateStatusPage), so an update
+// unconditionally, so an update
 // must resend the current slug rather than omit it.
 type updateStatusPageRequest struct {
 	Slug       string   `json:"slug"`
@@ -61,7 +61,7 @@ type updateStatusPageRequest struct {
 func IsSlugConflict(err error) bool { return statusIs(err, http.StatusConflict) }
 
 // IsPublicPageLimit reports whether err is the free-tier cap of one public
-// status page per project (api/statuspages.go: handleCreateStatusPage).
+// status page per project.
 //
 // It is deliberately NOT folded into IsSlugConflict. Both are 4xx failures on
 // create, but they mean opposite things — one is "someone else owns this

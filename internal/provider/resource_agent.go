@@ -27,13 +27,12 @@ var (
 )
 
 // uuidShapedSlugPattern matches a canonical UUID string. The server rejects a
-// derived slug of this shape (api/slug.go: validateSlug) because it would be
+// derived slug of this shape because it would be
 // ambiguous with an agent id during import — and ImportState below resolves a
 // slug before it tries uuid.Parse, so the ambiguity is real here too.
 var uuidShapedSlugPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
-// deriveAgentSlug mirrors the server's slugFromName (api/agents_api.go)
-// exactly: lowercase, every run of characters outside [a-z0-9] collapses to a
+// deriveAgentSlug mirrors the server's slug derivation exactly: lowercase, every run of characters outside [a-z0-9] collapses to a
 // single hyphen, leading and trailing hyphens are trimmed.
 //
 // It exists only to predict the slug at plan time — for agentNameValidator's
@@ -63,7 +62,7 @@ func deriveAgentSlug(name string) string {
 
 // agentNameValidator rejects a name the server could not turn into a valid
 // slug. It mirrors the server exactly — deriveAgentSlug plus the same
-// slugPattern and UUID-shape rules validateSlug applies (api/slug.go) — so it
+// slugPattern and UUID-shape rules the server applies — so it
 // can only move the server's own 400 to plan time, never invent an error.
 //
 // Without it, "cannot derive a valid slug from name" arrives as an opaque 400
@@ -134,7 +133,7 @@ type agentResource struct {
 //
 // Everything below Slug is server-supplied. Status, MonitorCount and LastSeen
 // are not even stored: the API recomputes them from the agent's monitors on
-// every response (core/agent.RollUp), so they move on their own and must not
+// every response, so they move on their own and must not
 // carry a UseStateForUnknown plan modifier.
 type agentResourceModel struct {
 	ID          types.String `tfsdk:"id"`
@@ -319,8 +318,8 @@ func modelFromAgent(a *client.Agent) agentResourceModel {
 // an upsert-by-slug that only refuses to adopt because CreateMonitor sends
 // `If-None-Match: *` — POST /api/v1/agents is genuinely create-only server-side.
 // A collision on the slug derived from `name` is a 409 and nothing is written
-// (api/agents_api.go: createAgentForProject maps the unique-violation 23505 to
-// createAgentConflict). There is no upsert branch to opt out of, so this resource
+// (the server answers a slug collision with a conflict, never a takeover).
+// There is no upsert branch to opt out of, so this resource
 // sends no precondition header; it converts the 409 into the same actionable
 // "import it instead" diagnostic the monitor resource gives for its 412, because
 // silently adopting an agent this configuration does not own is the outcome both

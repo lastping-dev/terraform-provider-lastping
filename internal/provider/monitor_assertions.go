@@ -19,12 +19,12 @@ import (
 	"github.com/lastping-dev/terraform-provider-lastping/internal/client"
 )
 
-// maxAssertionsPerMonitor mirrors the API's cap (api/api_assertions.go). It is
+// maxAssertionsPerMonitor mirrors the API's cap. It is
 // checked at plan time so hitting it names the monitor and costs nothing,
 // instead of arriving as a 400 partway through an apply.
 const maxAssertionsPerMonitor = 20
 
-// maxAssertionPatternBytes mirrors core/assertion's cap on a `matches` pattern.
+// maxAssertionPatternBytes mirrors the API's cap on a `matches` pattern.
 const maxAssertionPatternBytes = 1000
 
 // assertionKinds and assertionOps are the accepted enum values, in the order
@@ -236,8 +236,8 @@ func assertionsEqual(a, b []client.Assertion) bool {
 	return true
 }
 
-// validateAssertions mirrors core/assertion.Validate — the function the API
-// applies at write time and the processor's evaluator is built on — at plan
+// validateAssertions mirrors the validation the API applies at write time,
+// the same rules its evaluator is built on, at plan
 // time, so a malformed assertion names the offending block instead of arriving
 // as a 400 partway through an apply.
 //

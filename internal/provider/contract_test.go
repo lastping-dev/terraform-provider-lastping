@@ -60,8 +60,8 @@ const specPath = "../../testdata/openapi.yaml"
 // ─────────────────────────────────────────────────────────────────────────────
 
 // knownSpecGaps are provider attributes backed by real API behaviour that the
-// *published spec* does not document. They are bugs in the monorepo's
-// api/swagger/openapi.yaml, not in the provider, and they are listed here so
+// *published spec* does not document. They are bugs in the published spec,
+// not in the provider, and they are listed here so
 // the contract test can stay green without pretending the gap is fine.
 //
 // Each entry is asserted to STILL be missing. When the spec is fixed and
@@ -73,16 +73,16 @@ const specPath = "../../testdata/openapi.yaml"
 // Empty is the healthy state, and the map is kept rather than deleted so the
 // next gap is recorded here — visibly, with a reason — instead of being waved
 // through an exempt map. The last three entries (maintenance_until on the
-// monitor resource and both monitor data sources) went when the monorepo added
+// monitor resource and both monitor data sources) went when the spec added
 // the property to components.schemas.Check.
 //
 // step_timeout_s did NOT need an entry, and the near miss is worth recording:
 // the deployed https://app.lastping.dev/openapi.yaml — what `make sync-openapi`
-// fetches — was behind the monorepo and omitted the property, while
-// api/swagger/openapi.yaml on main declared it on CheckCreate, Check and
-// CheckPatch all along. A deployment lag reads exactly like a spec gap from
-// here, so confirm against the monorepo's file, not the served document, before
-// adding an entry.
+// fetches — lagged behind the server's source and omitted the property,
+// while the source declared it on CheckCreate, Check and CheckPatch all
+// along. A deployment lag reads exactly like a spec gap from
+// here, so confirm the gap survives a deployment of the server before adding
+// an entry.
 //
 // notify_min_run_s was the same deployment-lag shape: three entries covering
 // resource.lastping_monitor, data.lastping_monitor and
@@ -137,7 +137,7 @@ var deliberatelyUnmodelled = map[string]string{
 
 	// last_used_surface stays unmodelled on both surfaces: it is derived from
 	// the caller-controlled, spoofable User-Agent header on the
-	// authenticating request (the monorepo's api.detectSurface), not from
+	// authenticating request, not from
 	// any cryptographic or protocol-level signal. It answers "did my client
 	// ever successfully authenticate?", not "what is true" — a caller can
 	// claim to be any surface it likes — so it is useful as an honest,
@@ -237,8 +237,8 @@ var deliberatelyUnmodelled = map[string]string{
 // api_key cases: both omit last_used_surface for the same reason — it is
 // derived from the spoofable User-Agent header, so it is a best-effort
 // client hint, never something a config-as-code tool should converge on.
-const apiKeyLastUsedSurfaceExempt = "derived from the caller-controlled, spoofable User-Agent header " +
-	"(monorepo api.detectSurface), not from any cryptographic or protocol-level signal — a caller can " +
+const apiKeyLastUsedSurfaceExempt = "derived from the caller-controlled, spoofable User-Agent header, " +
+	"not from any cryptographic or protocol-level signal — a caller can " +
 	"claim to be any surface it likes. Useful as a best-effort dashboard hint for \"did my client ever " +
 	"authenticate?\", but never state Terraform should try to converge configuration toward."
 
@@ -302,8 +302,8 @@ const destinationConfigExempt = "flattened out of the API's free-form `config` o
 // This is NOT a knownSpecGaps entry, and the distinction is the whole point of
 // keeping the two mechanisms apart: the spec is accurate here. CheckCreate and
 // CheckPatch both declare the properties, components.schemas.Check deliberately
-// does not, and the API agrees — api/checks.go's checkResponse has no field for
-// either, so rowToDTO could not populate them if it wanted to. The filters are
+// does not, and the API agrees — its response has no field for either, so
+// it could not return them if it wanted to. The filters are
 // genuinely write-only, and an entry in knownSpecGaps would be asserting that a
 // correct spec is wrong.
 //
@@ -312,7 +312,7 @@ const destinationConfigExempt = "flattened out of the API's free-form `config` o
 // change lands with the read-direction fix in modelFromMonitor's
 // writeOnlyString rather than before it.
 const ciFilterWriteOnly = "write-only: accepted on CheckCreate and CheckPatch, but no API response " +
-	"carries it (checkResponse has no such field), so the provider carries the prior state forward " +
+	"carries it (the API response has no such field), so the provider carries the prior state forward " +
 	"instead of refreshing"
 
 // destinationConfigAttrs is that set, kept in one place so a new credential
@@ -775,7 +775,7 @@ func TestOpenAPIContract(t *testing.T) {
 
 // TestOpenAPIContract_KnownSpecGapsStillExist keeps knownSpecGaps honest. Every
 // entry must name a real provider attribute that is still absent from the spec;
-// once the monorepo publishes the missing property, this fails and the entry has
+// once the spec publishes the missing property, this fails and the entry has
 // to go — which is how the workaround gets cleaned up instead of accumulating.
 func TestOpenAPIContract_KnownSpecGapsStillExist(t *testing.T) {
 	t.Parallel()

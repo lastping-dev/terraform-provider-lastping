@@ -36,8 +36,8 @@ const (
 	apiKeyScopeIngest = "ingest"
 )
 
-// apiKeyScopes is the exact set the API stores (the monorepo's
-// api_keys_scope_check constraint). Anything else is a 400, so rejecting it at
+// apiKeyScopes is the exact set the API stores (the database refuses any
+// other value). Anything else is a 400, so rejecting it at
 // plan time names the attribute instead of failing partway through an apply.
 var apiKeyScopes = []string{apiKeyScopeRead, apiKeyScopeWrite, apiKeyScopeAdmin, apiKeyScopeIngest}
 

@@ -33,8 +33,7 @@ func (c *Client) GetTemplates(ctx context.Context, monitorID string) (map[string
 // resulting set.
 //
 // The API's replace semantics are NOT uniform, and the difference is the whole
-// reason callers must not simply send the desired map (api/api_templates.go:
-// handleAPIPutTemplates):
+// reason callers must not simply send the desired map:
 //
 //   - Event-wide keys (`down`, `fail`, …) are replace-the-set: every one is
 //     deleted first, then the request's entries are applied. Dropping such a

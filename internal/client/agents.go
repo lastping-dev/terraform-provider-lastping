@@ -25,7 +25,7 @@ type Agent struct {
 	// Slug is derived from Name at creation and never sent by this provider;
 	// it changes only when someone changes it in the console or API.
 	// Status/MonitorCount/LastSeen are not stored at all: the API recomputes
-	// them on every response from the agent's monitors (core/agent.RollUp), so
+	// them on every response from the agent's monitors, so
 	// they change without anything in Terraform changing.
 	Slug         string  `json:"slug,omitempty"`
 	Status       string  `json:"status,omitempty"`

@@ -199,7 +199,7 @@ resource "lastping_status_page" "pub" {
 }
 
 // TestAccStatusPage_generatedSlug: slug is Optional AND Computed because the
-// server genuinely supplies one (api/statuspages.go: generateStatusPageSlug).
+// server genuinely supplies one.
 // The PlanOnly step is the real assertion — a computed value that is not held
 // in state would show up as a perpetual diff, and for this attribute a diff
 // means a replacement that releases a live URL.
@@ -253,7 +253,7 @@ resource "lastping_status_page" "gen" {
 // say the namespace is global and offer both remedies.
 //
 // The collision is simulated within one account because the 409 is the same
-// code path either way (api/statuspages.go: errSlugConflict).
+// code path either way.
 func TestAccStatusPage_slugTakenGivesActionableError(t *testing.T) {
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },

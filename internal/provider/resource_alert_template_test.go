@@ -52,7 +52,7 @@ func checkTemplatesOnServer(t *testing.T, want map[string]string) resource.TestC
 //
 // The API's PUT is only half a replace: event-wide keys are wiped and reapplied,
 // but a per-cause key such as `down/silence` is touched only when the request
-// names it (api/api_templates.go: handleAPIPutTemplates). A provider that simply
+// names it. A provider that simply
 // sent the configured map would leave a removed per-cause override in place
 // forever — invisible in state, still overriding real alerts. So the assertion
 // here is deliberately made against the server, not against Terraform state.

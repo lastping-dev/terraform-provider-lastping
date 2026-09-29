@@ -25,8 +25,7 @@ var (
 )
 
 // futureTimestampValidator mirrors the server's own check
-// (api/apikeys_api.go: handleCreateAPIKey rejects an expires_at that is not
-// After(now)), so an already-expired timestamp is a plan-time error naming the
+// (the create call rejects an expires_at that is not after now), so an already-expired timestamp is a plan-time error naming the
 // attribute rather than an opaque 400 partway through an apply. It can only move
 // the server's error earlier, never invent one: a value the server would accept
 // at plan time is in the future, and a value it would reject is not.
@@ -131,7 +130,7 @@ func (r *apiKeyResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 			},
 			// Optional AND Computed: the server has the last word on a key's
 			// expiry. A key may not outlive the key that minted it
-			// (api/apikeys_api.go: handleCreateAPIKey), so an apply
+			// (the create call enforces it), so an apply
 			// authenticated with an expiring key can be handed an expires_at it
 			// never asked for. Optional alone fails that apply outright with
 			// "Provider produced inconsistent result after apply".

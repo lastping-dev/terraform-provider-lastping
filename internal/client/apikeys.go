@@ -10,7 +10,7 @@ import (
 //
 // SECURITY: Key is the plaintext credential and is populated by CreateAPIKey
 // ONLY. The server returns it exactly once, from POST; list responses carry the
-// non-secret prefix and nothing else (api/apikeys_api.go: apiKeyResponse). It
+// non-secret prefix and nothing else. It
 // must never be logged, and never sent back to the server — which is why
 // createAPIKeyRequest is a separate type rather than this struct reused.
 type APIKey struct {
@@ -21,7 +21,7 @@ type APIKey struct {
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 
 	// LastUsedAt is when this key last authenticated a request, updated on
-	// every authenticated call (api/auth.go's TouchAPIKey). Omitted — nil
+	// every authenticated call. Omitted — nil
 	// here — for a key that has never been used.
 	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
 

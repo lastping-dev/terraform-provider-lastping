@@ -21,7 +21,7 @@ import (
 )
 
 // maxGuardsPerMonitor and maxGuardWindowSeconds mirror the API's caps
-// (core/metricguard). They are checked at plan time so hitting either names the
+// They are checked at plan time so hitting either names the
 // offending guard and costs nothing, instead of arriving as a 400 partway
 // through an apply.
 const (
@@ -243,8 +243,8 @@ func guardsEqual(a, b []client.MetricGuard) bool {
 	return true
 }
 
-// validateGuards mirrors core/metricguard.Validate — the function the API
-// applies at write time — at plan time, so a malformed guard names the
+// validateGuards mirrors the validation the API applies at write time, at
+// plan time, so a malformed guard names the
 // offending block instead of arriving as a 400 partway through an apply.
 //
 // It also refuses guards on an http monitor, which the API tolerates but which
@@ -320,7 +320,7 @@ func validateOneGuard(m monitorGuardModel, resp *resource.ValidateConfigResponse
 	}
 
 	// There is deliberately no finite-ceiling check here, unlike
-	// core/metricguard.Validate. Terraform's number type is a big.Float, which
+	// the API's own validation. Terraform's number type is a big.Float, which
 	// has no NaN and no infinity, and terraform-plugin-framework panics if a
 	// provider tries to construct one — so a non-finite ceiling cannot reach
 	// this function at all. The API keeps its own check because JSON can carry

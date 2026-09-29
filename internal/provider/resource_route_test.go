@@ -711,7 +711,7 @@ resource "lastping_route" "down" {
 // It fails rather than skips. A skip here would be indistinguishable from a
 // pass, and the bug this guards against — a monitor and its routes being
 // impossible to create in one apply — is invisible in a project that has no
-// verified email channel, because attachDefaultRoutes then returns early and
+// verified email channel, because the server's default routing then returns early and
 // writes no routes at all. That is exactly how the whole suite missed it.
 func testAccDefaultEmailDestinationID(t *testing.T) string {
 	t.Helper()
@@ -735,8 +735,7 @@ func testAccDefaultEmailDestinationID(t *testing.T) string {
 // obvious use case, and before the auto-route exemption it was impossible.
 //
 // The API attaches down/fail/recovery routes to the project's default email
-// channel the moment a monitor is created (api/defaultdest.go:
-// attachDefaultRoutes), so by the time Terraform creates the route resources in
+// channel the moment a monitor is created, so by the time Terraform creates the route resources in
 // the same apply, all three event types are already routed — to destinations
 // Terraform did not write. The adoption guard refused, every time, with
 // "Route already exists", and the only way forward was to apply, read the
@@ -803,7 +802,7 @@ resource "lastping_route" "recovery" {
 							}
 							// Only the events this config DECLARES should have been
 							// adopted onto oncall. The API also auto-routes blocked to
-							// the project default (api/defaultdest.go), and Terraform
+							// the project default, and Terraform
 							// never declared it, so it legitimately still points there.
 							// Asserting over every route on the monitor conflated
 							// "the routes I declared were adopted" with "this monitor

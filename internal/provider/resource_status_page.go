@@ -40,7 +40,7 @@ type statusPageResource struct {
 //
 // Slug is the one attribute here that is Optional *and* Computed, and it earns
 // it: the server genuinely supplies a value when none is configured
-// (api/statuspages.go: generateStatusPageSlug). check_ids is plain Optional so
+// (it generates one). check_ids is plain Optional so
 // that removing it from the configuration actually empties the page.
 type statusPageResourceModel struct {
 	ID         types.String `tfsdk:"id"`

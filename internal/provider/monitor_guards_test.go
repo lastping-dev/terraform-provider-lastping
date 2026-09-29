@@ -14,8 +14,8 @@ import (
 )
 
 // Acceptance tests for the `metric_guard` nested block. They are TF_ACC-gated
-// and run against a live backend from the monorepo's CI, like the rest of this
-// package.
+// and run against a live backend, like the rest of this package's acceptance
+// tests.
 //
 // Every ExpectError pattern uses `\s+` rather than a literal space: Terraform
 // re-wraps diagnostic text to the terminal width, so a literal space in the
