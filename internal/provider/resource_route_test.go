@@ -722,11 +722,8 @@ func testAccDefaultEmailDestinationID(t *testing.T) string {
 	if id == "" {
 		t.Fatal("this project has no verified email destination, so the API will not " +
 			"auto-route new monitors and this test cannot exercise anything.\n" +
-			"Seed one in the acceptance backend, for example:\n" +
-			"  docker compose exec -T postgres psql -U lastping -d lastping -c \\\n" +
-			"    \"INSERT INTO channels (id, project_id, kind, name, config, verified_at) \\\n" +
-			"     VALUES (gen_random_uuid(), '<project>', 'email', 'Email', \\\n" +
-			"             '{\\\"address\\\":\\\"acc@example.com\\\"}'::jsonb, now());\"")
+			"Add an email destination to this project in the LastPing console (or create one " +
+			"through the API) and click the verification link sent to that address, then re-run.")
 	}
 	return id
 }

@@ -36,8 +36,8 @@ resource "lastping_monitor" "second" {
 // that cross-tenant resources stay invisible. It skips rather than fails when
 // the second key is absent: a single-project backend cannot demonstrate
 // isolation either way, and unlike the default-email-channel prerequisite (see
-// testAccPreCheck), a second project is genuinely optional for local work — it
-// cannot be seeded by one `psql -c INSERT` into the same backend. The skip
+// testAccPreCheck), a second project is genuinely optional for local work —
+// it is more than a one-step setup in the console. The skip
 // message is deliberately loud rather than terse, so a run that silently
 // proves nothing about tenant isolation cannot be mistaken for one that does.
 func testAccForeignClient(t *testing.T) *client.Client {
