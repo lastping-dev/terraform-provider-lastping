@@ -55,8 +55,8 @@ var destinationKindAttrs = map[string][]string{
 // the API replaces config wholesale on update and
 // an omitted credential is a wiped credential.
 //
-// `token` is the one member so far — ntfy sends it as `Authorization: Bearer`
-// (internal/channels/ntfy.go), which is what authenticated and self-hosted ntfy
+// `token` is the one member so far — the API sends it to the ntfy server as
+// `Authorization: Bearer`, which is what authenticated and self-hosted ntfy
 // servers need. Note it is simultaneously a *required* attribute of pushover;
 // that is exactly why validation keys off `kind` rather than attribute name.
 var destinationKindOptionalAttrs = map[string][]string{

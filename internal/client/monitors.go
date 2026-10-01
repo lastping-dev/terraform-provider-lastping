@@ -145,7 +145,8 @@ type Monitor struct {
 
 // CreateMonitor creates a monitor with create-only semantics: If-None-Match: *
 // makes a slug collision a 412 rather than a silent adoption of an existing
-// monitor. See spec §4.5 / §5.6 H1.
+// monitor. Without the header, the API treats a POST whose slug already exists
+// as an upsert of that monitor.
 func (c *Client) CreateMonitor(ctx context.Context, m Monitor) (*Monitor, error) {
 	var out Monitor
 	err := c.Do(ctx, http.MethodPost, "/api/v1/checks", m, &out, WithHeader("If-None-Match", "*"))

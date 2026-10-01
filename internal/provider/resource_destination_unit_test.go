@@ -68,8 +68,8 @@ func TestDestinationAddressIsValidatedAtPlanTime(t *testing.T) {
 }
 
 // TestDestinationConfigCarriesNtfyToken: ntfy accepts an optional bearer token
-// (internal/channels/ntfy.go sends it as `Authorization: Bearer`), which is what
-// authenticated and self-hosted ntfy servers require. The API replaces `config`
+// (the API sends it to the ntfy server as `Authorization: Bearer`), which is
+// what authenticated and self-hosted ntfy servers require. The API replaces `config`
 // wholesale on PATCH, so a payload that omits the token silently wipes the
 // stored credential on the next topic_url change.
 func TestDestinationConfigCarriesNtfyToken(t *testing.T) {
