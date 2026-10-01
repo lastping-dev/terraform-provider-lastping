@@ -98,44 +98,42 @@ require a LastPing backend and are not run in this repository's CI.
 
 ### Acceptance test backend
 
-`make testacc` reads `LASTPING_API_KEY` and `LASTPING_ENDPOINT`, and skips
-entirely without the first.
+`make testacc` runs against a LastPing account through the public API, exactly
+as a practitioner's configuration does. It reads `LASTPING_API_KEY` (an `admin`
+API key for the project the tests should use) and `LASTPING_ENDPOINT` (the API
+base URL, defaulting to `https://app.lastping.dev`), and skips entirely without
+the key. Use a project set aside for testing: the suite creates and deletes real
+monitors, destinations and routes in it.
 
 **The project behind that key must have a verified email destination.** LastPing
 auto-routes every new monitor's `down`, `fail` and `recovery` events to the
-project's default email channel, and a project without one takes that path
+project's default email destination, and a project without one takes that path
 never — which makes the acceptance suite pass against behaviour real users never
 see. That is exactly how the route resource shipped unable to create a monitor
 and its routes in the same apply: locally the monitor came back unrouted, so
-nothing ever collided. Seed one before running the suite:
-
-```sh
-docker compose exec -T postgres psql -U lastping -d lastping -c \
-  "INSERT INTO channels (id, project_id, kind, name, config, verified_at)
-   VALUES (gen_random_uuid(), '<project-id>', 'email', 'Email',
-           '{\"address\":\"acc@example.com\"}'::jsonb, now());"
-```
+nothing ever collided. Before running the suite, add an email destination to
+the project in the console (or create one with `POST /api/v1/channels`, or a
+`lastping_destination` with `kind = "email"`) and click the verification link
+LastPing sends to that address.
 
 Because this is checked once, centrally, in `testAccPreCheck`, every acceptance
 test fails with those instructions rather than skipping — there is no longer a
-code path where the suite passes against a project missing this seed.
+code path where the suite passes against a project missing this destination.
 
 **The scope tests need no extra seeding.** `TestAccAPIKey_scopeCapIsEnforcedByTheServer`
 mints its own `write` key with the configured key and authenticates a second,
-aliased provider with it, because the seeded acceptance key is always `admin`
-(the seeding step inserts the key without a scope, so it takes the default). The test accepts either refusal — the create-time
-scope cap (400, `max_scope`) or, once `LP_API_KEY_SCOPES_ENFORCE` is on, the
+aliased provider with it, because the acceptance key is `admin`. The test accepts either refusal — the create-time
+scope cap (400, `max_scope`) or, once the server enforces per-route scopes, the
 route's own 403 (`required_scope`) — since which one arrives is a server-side
 flag this repository does not control.
 
 **`TestAccStatusPage_importOfForeignSlugIsNotFound` additionally wants a SECOND,
 distinct project's API key**, in `LASTPING_ACC_FOREIGN_API_KEY`, to prove
 cross-tenant status-page import stays invisible across projects. Unlike the
-email channel above, this cannot be seeded with one SQL statement against the
-same backend, so it is optional for local work and the test skips — loudly,
-naming the variable and what goes unverified — rather than failing when it is
-unset. Wiring a second seeded project's key into CI so this actually runs
-there is an open item, not yet automated.
+email destination above, a second project is more than a one-step setup, so it
+is optional for local work and the test skips — loudly, naming the variable and
+what goes unverified — rather than failing when it is unset. Running this
+automatically with a second project's key is an open item.
 
 ### API contract test
 

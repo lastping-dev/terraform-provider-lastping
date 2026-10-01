@@ -577,14 +577,12 @@ resource "lastping_api_key" "bad" {
 // key, whatever the configuration says.
 //
 // The write key is minted in-test, by the suite's own admin key, because the
-// seeded acceptance key is always admin (the seeding step inserts it without
-// a scope, taking the default). It is revoked
-// again at the end.
+// acceptance key is admin. It is revoked again at the end.
 //
-// TWO refusals are acceptable, and which one arrives depends on a server flag
-// this repository does not control:
+// TWO refusals are acceptable, and which one arrives depends on a server
+// setting this repository does not control:
 //
-//   - LP_API_KEY_SCOPES_ENFORCE off (today): the write key reaches the endpoint
+//   - per-route scope enforcement off (today): the write key reaches the endpoint
 //     and the create-time scope CAP refuses it — 400, max_scope.
 //   - enforcement on: the key never reaches the handler at all, and scoped()
 //     refuses it — 403, required_scope.
