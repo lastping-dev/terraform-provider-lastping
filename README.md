@@ -1,11 +1,80 @@
+<p align="center">
+  <a href="https://lastping.dev/terraform">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset=".github/hero-dark.svg">
+      <source media="(prefers-color-scheme: light)" srcset=".github/hero-light.svg">
+      <img alt="LastPing. A stopped agent looks exactly like a thinking one. Monitoring for AI agent runs, cron jobs and CI/CD. Free for individuals." src=".github/hero-light.svg" width="100%">
+    </picture>
+  </a>
+</p>
+
+<p align="center">
+  <a href="https://lastping.dev"><img alt="Website" src="https://img.shields.io/badge/Website-0f766e?style=for-the-badge"></a>
+  <a href="https://lastping.dev/terraform"><img alt="Terraform docs" src="https://img.shields.io/badge/Terraform%20docs-2f3a49?style=for-the-badge"></a>
+  <a href="https://app.lastping.dev/docs"><img alt="API docs" src="https://img.shields.io/badge/API%20docs-2f3a49?style=for-the-badge"></a>
+  <a href="https://app.lastping.dev/status/lastping-self"><img alt="Status" src="https://img.shields.io/badge/Status-2f3a49?style=for-the-badge"></a>
+</p>
+
+<p align="center">
+  <a href="https://registry.terraform.io/providers/lastping-dev/lastping"><img alt="Terraform Registry version" src="https://img.shields.io/github/v/release/lastping-dev/terraform-provider-lastping?label=registry&color=2dd4bf"></a>
+  <a href="https://github.com/lastping-dev/terraform-provider-lastping/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/lastping-dev/terraform-provider-lastping/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="./LICENSE"><img alt="License: MPL-2.0" src="https://img.shields.io/github/license/lastping-dev/terraform-provider-lastping"></a>
+</p>
+
 # terraform-provider-lastping
 
-Terraform provider for [LastPing](https://lastping.dev) — monitoring as code
-for cron jobs, CI/CD pipelines, and AI-agent jobs.
+The official Terraform provider for [LastPing](https://lastping.dev), monitoring
+as code for cron jobs, CI/CD pipelines and AI agent runs. LastPing waits for
+your jobs to check in and opens an incident when an expected signal never
+arrives. This provider keeps monitors, agents, alert destinations, routing,
+alert messages, status pages and API keys in the same configuration as the
+infrastructure they watch. **Free for individuals.**
+
+## Quick start
+
+```hcl
+terraform {
+  required_providers {
+    lastping = {
+      source  = "lastping-dev/lastping"
+      version = "~> 0.5"
+    }
+  }
+}
+
+provider "lastping" {}
+
+# A nightly backup job that pings in on a cron schedule. grace_s is how long
+# after the scheduled 03:00 UTC run the monitor waits before alerting.
+resource "lastping_monitor" "nightly_backup" {
+  name          = "Nightly backup"
+  slug          = "nightly-backup"
+  schedule_kind = "cron"
+  cron_expr     = "0 3 * * *"
+  tz            = "UTC"
+  grace_s       = 900
+}
+
+output "ping_url" {
+  value = lastping_monitor.nightly_backup.ping_url
+}
+```
+
+```sh
+export LASTPING_API_KEY=lp_your_key   # Settings, API keys at app.lastping.dev
+terraform init && terraform apply
+```
+
+Then have the job request `ping_url` when it finishes. More examples, from
+HTTP probes to output assertions and spend guards, are in
+[`examples/`](./examples) and in the
+[Registry documentation](https://registry.terraform.io/providers/lastping-dev/lastping/latest/docs).
 
 This provider is under active development; the API surface may still change
 before 1.0. See the [releases page](https://github.com/lastping-dev/terraform-provider-lastping/releases)
 for what has shipped.
+
+## What it manages
 
 ### Resources
 
@@ -48,7 +117,7 @@ terraform {
   required_providers {
     lastping = {
       source  = "lastping-dev/lastping"
-      version = "~> 0.1"
+      version = "~> 0.5"
     }
   }
 }
