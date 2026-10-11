@@ -51,9 +51,8 @@ var destinationKindAttrs = map[string][]string{
 // destinationKindOptionalAttrs maps a kind onto config attributes it accepts but
 // does not require. These have to be tracked separately from the required set:
 // they must be allowed through the foreign-attribute check without being
-// demanded, and they must be included in the `config` payload when set, because
-// the API replaces config wholesale on update and
-// an omitted credential is a wiped credential.
+// demanded, and on update they follow a three-way rule (see
+// destinationConfigPatch) rather than the always-send rule of required ones.
 //
 // `token` is the one member so far — the API sends it to the ntfy server as
 // `Authorization: Bearer`, which is what authenticated and self-hosted ntfy
@@ -304,7 +303,8 @@ func (r *destinationResource) Schema(_ context.Context, _ resource.SchemaRequest
 				MarkdownDescription: "Bearer token. Required for `kind = \"pushover\"` (the Pushover " +
 					"application token) and optional for `kind = \"ntfy\"`, where it is sent as " +
 					"`Authorization: Bearer` — set it for a protected topic or a self-hosted server, " +
-					"and leave it unset for a public ntfy.sh topic. Write-only: never returned by the API.",
+					"and leave it unset for a public ntfy.sh topic. Removing it from the configuration clears " +
+					"the stored token. Write-only: never returned by the API.",
 			},
 			"user_key": schema.StringAttribute{
 				Optional:  true,
@@ -376,18 +376,9 @@ func (r *destinationResource) Configure(_ context.Context, req resource.Configur
 	r.client = c
 }
 
-// destinationConfig builds the API `config` object for the configured kind.
-// Attributes belonging to other kinds are ignored — ConfigValidators has
-// already rejected them.
-//
-// Required attributes are always sent, even when empty, because the API
-// re-validates the whole object and an empty value is a better error than a
-// missing key. An unset optional attribute is omitted entirely, so a tokenless
-// ntfy destination produces exactly the payload it always did; a *set* one is
-// always sent, because PATCH replaces config wholesale and omitting it would
-// wipe a credential the API never returns.
-func destinationConfig(m destinationResourceModel) map[string]string {
-	values := map[string]types.String{
+// destinationConfigValues maps each config attribute name onto its model value.
+func destinationConfigValues(m destinationResourceModel) map[string]types.String {
+	return map[string]types.String{
 		"url":         m.URL,
 		"secret":      m.Secret,
 		"bot_token":   m.BotToken,
@@ -398,6 +389,21 @@ func destinationConfig(m destinationResourceModel) map[string]string {
 		"user_key":    m.UserKey,
 		"address":     m.Address,
 	}
+}
+
+// destinationConfig builds the API `config` object for the configured kind.
+// Attributes belonging to other kinds are ignored — ConfigValidators has
+// already rejected them.
+//
+// Required attributes are always sent, even when empty, because the API
+// re-validates the whole object and an empty value is a better error than a
+// missing key. Every required credential is therefore written on every config
+// change, which is what lets a target change (webhook `url`) go through: the
+// hosted API at app.lastping.dev refuses a target change that omits a stored
+// secret. An unset optional attribute is omitted entirely, so a tokenless ntfy
+// destination produces exactly the payload it always did on create.
+func destinationConfig(m destinationResourceModel) map[string]string {
+	values := destinationConfigValues(m)
 	kind := m.Kind.ValueString()
 	cfg := map[string]string{}
 	for _, attr := range destinationKindAttrs[kind] {
@@ -414,11 +420,20 @@ func destinationConfig(m destinationResourceModel) map[string]string {
 // destinationConfigPatch returns the `config` object to send with an update, or
 // nil to leave the stored config alone.
 //
-// The API replaces config wholesale, so this is all-or-nothing: either every
-// attribute for the kind goes, credentials included, or none does. Skipping an
-// unchanged config keeps a rename a rename — no needless rewrite of write-only
-// credentials over the wire on an update that has nothing to do with them, and
-// no re-validation of a config the operator did not touch.
+// On PATCH the API treats a secret key that is OMITTED as "keep the stored
+// value" and an explicit empty string as "clear it". An optional secret (the
+// ntfy `token`) therefore follows a three-way rule:
+//
+//   - set in the plan: sent, as on create;
+//   - unset in the plan but set in prior state: sent as an empty string, so the
+//     server clears it. Omitting it here would silently keep the old token
+//     while state says there is none, and a removal combined with a target
+//     change would be refused by the API outright;
+//   - unset in both: omitted, so a tokenless destination's payload is unchanged.
+//
+// Skipping an unchanged config keeps a rename a rename — no needless rewrite of
+// write-only credentials over the wire on an update that has nothing to do with
+// them, and no re-validation of a config the operator did not touch.
 //
 // It is NOT what protects an email destination's verification, despite being an
 // easy thing to assume. The server compares the old and new addresses before it
@@ -429,6 +444,20 @@ func destinationConfigPatch(plan, state destinationResourceModel) map[string]str
 	planCfg, stateCfg := destinationConfig(plan), destinationConfig(state)
 	if maps.Equal(planCfg, stateCfg) {
 		return nil
+	}
+	planValues := destinationConfigValues(plan)
+	for _, attr := range destinationKindOptionalAttrs[plan.Kind.ValueString()] {
+		if _, sent := planCfg[attr]; sent {
+			continue
+		}
+		if _, wasSet := stateCfg[attr]; !wasSet {
+			continue
+		}
+		// An unknown plan value is not a removal; never clear on a guess.
+		if planValues[attr].IsUnknown() {
+			continue
+		}
+		planCfg[attr] = ""
 	}
 	return planCfg
 }

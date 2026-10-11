@@ -69,9 +69,8 @@ func TestDestinationAddressIsValidatedAtPlanTime(t *testing.T) {
 
 // TestDestinationConfigCarriesNtfyToken: ntfy accepts an optional bearer token
 // (the API sends it to the ntfy server as `Authorization: Bearer`), which is
-// what authenticated and self-hosted ntfy servers require. The API replaces `config`
-// wholesale on PATCH, so a payload that omits the token silently wipes the
-// stored credential on the next topic_url change.
+// what authenticated and self-hosted ntfy servers require. A set token must be
+// in the payload: the API refuses a topic_url change that omits a stored secret.
 func TestDestinationConfigCarriesNtfyToken(t *testing.T) {
 	cfg := destinationConfig(destinationResourceModel{
 		Kind:     types.StringValue("ntfy"),
@@ -162,6 +161,68 @@ func TestDestinationConfigPatchSkipsUnchangedConfig(t *testing.T) {
 		// And an unchanged token is not a reason to rewrite anything.
 		require.Nil(t, destinationConfigPatch(
 			ntfy(types.StringValue("tk")), ntfy(types.StringValue("tk"))))
+	})
+}
+
+// TestDestinationConfigPatchOptionalSecret pins the three-way rule for an
+// optional secret on update. The API keeps a stored secret whose key is omitted
+// and clears it on an explicit empty string, so a token removed from the
+// configuration has to go out as "" — omitting it would leave the old token
+// delivering while state reports none.
+func TestDestinationConfigPatchOptionalSecret(t *testing.T) {
+	ntfy := func(topic string, token types.String) destinationResourceModel {
+		return destinationResourceModel{
+			Kind:     types.StringValue("ntfy"),
+			Name:     types.StringValue("alerts"),
+			TopicURL: types.StringValue(topic),
+			Token:    token,
+		}
+	}
+	const a, b = "https://ntfy.example.com/a", "https://ntfy.example.com/b"
+
+	t.Run("set in plan is sent", func(t *testing.T) {
+		require.Equal(t, map[string]string{"topic_url": a, "token": "tk_new"},
+			destinationConfigPatch(ntfy(a, types.StringValue("tk_new")), ntfy(a, types.StringValue("tk_old"))))
+	})
+
+	t.Run("removed from plan but set in state is sent empty", func(t *testing.T) {
+		got := destinationConfigPatch(ntfy(a, types.StringNull()), ntfy(a, types.StringValue("tk_old")))
+		require.Equal(t, map[string]string{"topic_url": a, "token": ""}, got)
+		require.Contains(t, got, "token", "the empty token must be present as a key, not omitted")
+	})
+
+	t.Run("set to empty in plan but set in state is sent empty", func(t *testing.T) {
+		require.Equal(t, map[string]string{"topic_url": a, "token": ""},
+			destinationConfigPatch(ntfy(a, types.StringValue("")), ntfy(a, types.StringValue("tk_old"))))
+	})
+
+	t.Run("removed together with a topic change clears in the same request", func(t *testing.T) {
+		require.Equal(t, map[string]string{"topic_url": b, "token": ""},
+			destinationConfigPatch(ntfy(b, types.StringNull()), ntfy(a, types.StringValue("tk_old"))))
+	})
+
+	t.Run("absent in both is omitted", func(t *testing.T) {
+		got := destinationConfigPatch(ntfy(b, types.StringNull()), ntfy(a, types.StringNull()))
+		require.Equal(t, map[string]string{"topic_url": b}, got)
+		require.NotContains(t, got, "token")
+	})
+
+	t.Run("unknown in plan is never treated as a removal", func(t *testing.T) {
+		got := destinationConfigPatch(ntfy(b, types.StringUnknown()), ntfy(a, types.StringValue("tk_old")))
+		require.NotContains(t, got, "token")
+	})
+
+	t.Run("required secrets are sent from the plan on every config change", func(t *testing.T) {
+		pushover := func(user string) destinationResourceModel {
+			return destinationResourceModel{
+				Kind:    types.StringValue("pushover"),
+				Name:    types.StringValue("p"),
+				Token:   types.StringValue("app_tk"),
+				UserKey: types.StringValue(user),
+			}
+		}
+		require.Equal(t, map[string]string{"token": "app_tk", "user_key": "u2"},
+			destinationConfigPatch(pushover("u2"), pushover("u1")))
 	})
 }
 
