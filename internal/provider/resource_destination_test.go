@@ -7,6 +7,8 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/plancheck"
+
+	"github.com/lastping-dev/terraform-provider-lastping/internal/client"
 )
 
 // TestAccDestination_emailRenameIsUpdate is the reason this resource exists in
@@ -266,11 +268,24 @@ resource "lastping_destination" "ntfy" {
 // pinned. First, the token must be accepted at all: `token` is pushover's
 // required attribute, so a validator that keys purely off the attribute name
 // would reject it here as belonging to another kind. Second — the reason this
-// test changes topic_url — the API replaces `config` wholesale on PATCH, so an
-// update that rebuilds the payload without the token silently wipes a
-// credential the API will never hand back.
+// test changes topic_url — the API refuses a topic_url change that omits a
+// stored token, so Update has to resend the token on every config change.
+//
+// It then removes the token, alone and together with a topic_url change, and
+// asks the server whether it still holds one. The API never returns the token,
+// so state alone cannot prove a removal reached the server; see
+// testAccNtfyStoredTokenProbe for how the server is asked.
 func TestAccDestination_ntfyToken(t *testing.T) {
 	const token = "tk_acc_ntfy_token"
+	const res = "lastping_destination.auth_ntfy"
+	withoutToken := func(topic string) string {
+		return fmt.Sprintf(`
+resource "lastping_destination" "auth_ntfy" {
+  kind      = "ntfy"
+  name      = "acc-ntfy-auth"
+  topic_url = %q
+}`, topic)
+	}
 
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
@@ -332,6 +347,58 @@ resource "lastping_destination" "auth_ntfy" {
 					resource.TestCheckResourceAttr("lastping_destination.auth_ntfy", "target",
 						"https://ntfy.example.com/acc-moved"),
 					resource.TestCheckResourceAttr("lastping_destination.auth_ntfy", "token", token),
+					// Positive companion for the removal probes below: while a
+					// token is stored, the probe must see the server refuse.
+					testAccNtfyStoredTokenProbe(t, res, true, "https://ntfy.example.com/acc-moved"),
+				),
+			},
+			{
+				// Remove the token, topic_url unchanged. The server must clear
+				// it, not keep sending the old token while state says none.
+				Config: withoutToken("https://ntfy.example.com/acc-moved"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction(res, plancheck.ResourceActionUpdate),
+					},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(res, "token"),
+					testAccNtfyStoredTokenProbe(t, res, false, "https://ntfy.example.com/acc-moved"),
+				),
+			},
+			{
+				Config:   withoutToken("https://ntfy.example.com/acc-moved"),
+				PlanOnly: true,
+			},
+			{
+				// Put the token back, so the next step removes it again.
+				Config: fmt.Sprintf(`
+resource "lastping_destination" "auth_ntfy" {
+  kind      = "ntfy"
+  name      = "acc-ntfy-auth"
+  topic_url = "https://ntfy.example.com/acc-moved"
+  token     = %q
+}`, token),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(res, "token", token),
+					testAccNtfyStoredTokenProbe(t, res, true, "https://ntfy.example.com/acc-moved"),
+				),
+			},
+			{
+				// Remove the token AND change topic_url in one apply. Omitting
+				// the token here would be a target change with a stored secret
+				// left out, which the API refuses; it has to go out as a clear.
+				Config: withoutToken("https://ntfy.example.com/acc-final"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction(res, plancheck.ResourceActionUpdate),
+					},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(res, "topic_url", "https://ntfy.example.com/acc-final"),
+					resource.TestCheckResourceAttr(res, "target", "https://ntfy.example.com/acc-final"),
+					resource.TestCheckNoResourceAttr(res, "token"),
+					testAccNtfyStoredTokenProbe(t, res, false, "https://ntfy.example.com/acc-final"),
 				),
 			},
 			{
@@ -342,6 +409,37 @@ resource "lastping_destination" "auth_ntfy" {
 				ImportStateVerifyIgnore: []string{"token"},
 			},
 		},
+	})
+}
+
+// testAccNtfyStoredTokenProbe asks the server whether an ntfy destination still
+// holds a token. The API never returns one, but it refuses a topic_url change
+// that omits a stored token with DESTINATION_SECRET_REQUIRED, so the probe sends
+// exactly that change out of band. A refusal means a token is stored; an
+// accepted change means none is, and the probe then puts topicURL back so the
+// next plan sees no drift.
+func testAccNtfyStoredTokenProbe(t *testing.T, res string, wantStored bool, topicURL string) resource.TestCheckFunc {
+	return resource.TestCheckResourceAttrWith(res, "id", func(id string) error {
+		c := testAccDirectClient(t)
+		_, err := c.UpdateDestination(t.Context(), id, nil,
+			map[string]string{"topic_url": topicURL + "-probe"})
+		if wantStored {
+			if err == nil {
+				return fmt.Errorf("server accepted a topic_url change without the token, so it holds none; want a stored token")
+			}
+			if code := client.ProblemCode(err); code != "DESTINATION_SECRET_REQUIRED" {
+				return fmt.Errorf("probe refused with code %q, want DESTINATION_SECRET_REQUIRED: %w", code, err)
+			}
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("server refused a topic_url change without the token, so it still holds one: %w", err)
+		}
+		if _, err := c.UpdateDestination(t.Context(), id, nil,
+			map[string]string{"topic_url": topicURL}); err != nil {
+			return fmt.Errorf("restoring topic_url after the probe: %w", err)
+		}
+		return nil
 	})
 }
 

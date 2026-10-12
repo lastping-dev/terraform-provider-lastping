@@ -42,9 +42,11 @@ type createDestinationRequest struct {
 // are pointers because the API treats an omitted field as "leave unchanged";
 // kind is never sent because the API rejects any attempt to change it.
 //
-// Config is all-or-nothing server-side: when present it replaces the stored
-// config wholesale and is re-validated against the kind's required fields, so a
-// caller must send every field for the kind, secrets included.
+// When Config is present the API re-validates it against the kind's required
+// fields. For secret fields an omitted key keeps the stored value and an
+// explicit empty string clears an optional one; changing a target field (a
+// webhook `url`, an ntfy `topic_url`) while omitting a stored secret is refused
+// with DESTINATION_SECRET_REQUIRED.
 type updateDestinationRequest struct {
 	Name   *string            `json:"name,omitempty"`
 	Config *map[string]string `json:"config,omitempty"`

@@ -126,7 +126,7 @@ variable "pushover_user_key" {
 - `bot_token` (String, Sensitive) Telegram bot token. Required for `kind = "telegram"`. Write-only: never returned by the API.
 - `chat_id` (String) Telegram chat ID to post into. Required for `kind = "telegram"`.
 - `secret` (String, Sensitive) Shared secret used to sign webhook deliveries. Required for `kind = "webhook"`. Write-only: never returned by the API.
-- `token` (String, Sensitive) Bearer token. Required for `kind = "pushover"` (the Pushover application token) and optional for `kind = "ntfy"`, where it is sent as `Authorization: Bearer` — set it for a protected topic or a self-hosted server, and leave it unset for a public ntfy.sh topic. Write-only: never returned by the API.
+- `token` (String, Sensitive) Bearer token. Required for `kind = "pushover"` (the Pushover application token) and optional for `kind = "ntfy"`, where it is sent as `Authorization: Bearer` — set it for a protected topic or a self-hosted server, and leave it unset for a public ntfy.sh topic. Removing it from the configuration clears the stored token. Write-only: never returned by the API.
 - `topic_url` (String) Full ntfy topic URL, for example `https://ntfy.sh/my-alerts` or `https://ntfy.internal.example.com/my-alerts`. Required for `kind = "ntfy"`; pair it with `token` for a protected topic.
 - `url` (String) Endpoint LastPing POSTs to. Required for `kind = "webhook"`.
 - `user_key` (String, Sensitive) Pushover user or group key. Required for `kind = "pushover"`. Write-only: never returned by the API.
