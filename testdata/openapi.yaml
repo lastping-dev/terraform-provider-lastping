@@ -76,6 +76,20 @@ components:
         header: send the `lp_csrf` cookie's value in `X-CSRF-Token` on `POST`,
         `PUT`, `PATCH` and `DELETE`, or the request is refused `403
         CSRF_REQUIRED`.
+
+        While an admin is viewing an account read only, every write made with
+        this cookie is refused `403 READ_ONLY_IMPERSONATION`. If the view-as
+        state cannot be read, the request is answered `503
+        IMPERSONATION_UNAVAILABLE` and nothing is served or written.
+
+        The console sends `X-LP-View-As: <user id>` on every write while it
+        believes it is viewing an account (the `user_id` GET /api/v1/me
+        reported with `viewing_as` set). A write carrying that header when no
+        view-as is active, or when the active one is of a different account,
+        is refused `409 VIEW_AS_CHANGED` and nothing is written: the page's
+        picture of the session is stale, and it should re-read GET
+        /api/v1/me. With a matching view-as the write is still refused `403
+        READ_ONLY_IMPERSONATION`. Other clients never need to send it.
   responses:
     RateLimited:
       description: |
@@ -131,8 +145,8 @@ components:
         The metrics rate cap for this project (3,600 requests/hour, its own
         bucket) is exceeded, with `Retry-After: 60`. Or the project's daily
         span budget, which data points count against, is used up: `code:
-        "SPAN_BUDGET_EXCEEDED"`, `Retry-After` to 00:00 UTC. Or the ingest
-        task is already reading as many OTLP exports as it takes at once:
+        "SPAN_BUDGET_EXCEEDED"`, `Retry-After` to 00:00 UTC. Or LastPing
+        is already reading as many OTLP exports as it takes at once:
         `code: "OTLP_BUSY"`, `Retry-After: 5`.
       headers:
         Retry-After:
@@ -151,8 +165,8 @@ components:
         span budget, which log records count against, is used up: `code:
         "SPAN_BUDGET_EXCEEDED"`. Or today's log event cap inside it (default
         200,000 per UTC day) is used up: `code: "LOG_EVENT_BUDGET_EXCEEDED"`.
-        Both budget refusals carry a `Retry-After` to 00:00 UTC. Or the
-        ingest task is already reading as many OTLP exports as it takes at
+        Both budget refusals carry a `Retry-After` to 00:00 UTC. Or
+        LastPing is already reading as many OTLP exports as it takes at
         once: `code: "OTLP_BUSY"`, `Retry-After: 5`.
       headers:
         Retry-After:
@@ -224,7 +238,13 @@ components:
       properties:
         name:
           type: string
-          description: Human-readable name for the check.
+          maxLength: 200
+          description: |
+            Human-readable name for the check: at most 200 characters (not
+            bytes) and no control or invisible characters (a tab, newline,
+            zero-width character or non-ASCII space is rejected with 400
+            `INVALID_NAME`; an ordinary space is fine). Bytes that are not valid UTF-8 are
+            replaced with U+FFFD when the request is decoded, and accepted.
           example: "Daily backup job"
         slug:
           type: string
@@ -322,6 +342,18 @@ components:
             the first-run seed (`alert_after = monitor_from + grace_s`) keep
             using `grace_s`.  This is what makes "alert if silent for more
             than 10 minutes, but allow a 4-hour run" expressible.
+
+            Time a run spends `blocked` (waiting on a person) does not count
+            toward this budget: the run's clocks pause at the `blocked` ping,
+            and when the next ping or step ends the wait, the waited time is
+            added to the run's budget and the `step_timeout_s` clock starts
+            again from that moment.  Each single wait is bounded by
+            `blocked_timeout_s`, but the total a run can add this way has no
+            cap: a run that keeps alternating waits shorter than
+            `blocked_timeout_s` with progress never overruns.  On a `simple`
+            or `cron` monitor the added time never postpones a missed
+            scheduled run: when the next run's silence deadline comes sooner,
+            that deadline still pages.
 
             Null or omitted falls back to `grace_s`, so a monitor that never
             sets it behaves exactly as before this field existed.
@@ -544,6 +576,13 @@ components:
             **Rejected with 400 (`FIELD_NOT_IN_SHAPE`) when `monitor_type` is
             `http`.**  An http monitor is never bound to CI; the request used
             to be accepted, create no binding, and report success.
+
+            Fixed at creation.  On the slug upsert of a monitor that already
+            has a binding, the stored provider is accepted as a no-op (the
+            provider and secret stay) and a different one is rejected with
+            400 (`CI_PROVIDER_IMMUTABLE`); on one created without a binding
+            it is rejected with 400 (`FIELD_NOT_IN_SHAPE`), because a binding
+            cannot be added to an existing monitor.
           example: "github"
         ci_workflow:
           type: string
@@ -557,15 +596,15 @@ components:
             setting `ci_workflow` without `ci_provider` applied clean and
             filtered nothing.
 
-            **Exception — the slug upsert.**  When `slug` names a check that
-            already exists, this POST updates it and returns 200, and that
-            branch never writes `ci_workflow`/`ci_branch`.  So with a
-            `ci_provider` in the same body the filter is accepted and silently
-            discarded, and without one the request is rejected — which means
-            following the rejection's advice lands on the discarding path.  Set
-            these two through `PATCH /api/v1/checks/{id}`, which does persist
-            them.  Tracked as a handler gap, not a shape one: the shape is
-            right, a handler branch does not honour it.
+            **On the slug upsert** (when `slug` names a check that already
+            exists, this POST updates it and returns 200) the CI binding is
+            the stored one: a CI-bound monitor accepts `ci_workflow` and
+            `ci_branch` without `ci_provider` being repeated, and a monitor
+            created without a binding still refuses them.  A filter is
+            written only when it is sent with a non-empty value; omitted or
+            `""` keeps the stored value, so an upsert can set a filter but
+            never clear one.  Clear a filter with
+            `PATCH /api/v1/checks/{id}` and `null`.
           example: "ci.yml"
         ci_branch:
           type: string
@@ -574,8 +613,8 @@ components:
 
             **Requires `ci_provider`, and this is enforced** — see
             `ci_workflow`.  Rejected with 400 (`FIELD_NOT_IN_SHAPE`) when the
-            monitor has no CI binding, and subject to the same slug-upsert
-            exception.
+            monitor has no CI binding, and follows the same slug-upsert rule:
+            set when sent, kept when omitted or empty, cleared only by PATCH.
           example: "main"
         runaway_ceiling:
           type: [integer, "null"]
@@ -767,8 +806,8 @@ components:
         **A value equal to the one `GET` already reports is also ignored.**  A
         monitor whose `probe_timeout_s` is 10 accepts `{"probe_timeout_s": 10}`
         whatever its type: the request asks for no change, so nothing can be
-        accepted and discarded.  This matters because every `checks` row carries
-        NOT NULL probe defaults (`probe_method` `"GET"`, `probe_expected_status`
+        accepted and discarded.  This matters because every monitor carries
+        probe defaults (`probe_method` `"GET"`, `probe_expected_status`
         200, `probe_timeout_s` 10, `probe_follow_redirects` `true`) that a `GET`
         returns for **every** monitor type, and a client that round-trips a `GET`
         into a `PATCH` — Terraform does exactly this, carrying prior state into
@@ -783,7 +822,13 @@ components:
       properties:
         name:
           type: string
-          description: Human-readable name for the check.
+          maxLength: 200
+          description: |
+            Human-readable name for the check. A new name must be at most 200
+            characters (not bytes) and free of control and invisible
+            characters (400 `INVALID_NAME`); sending the stored name unchanged
+            is always accepted. Bytes that are not valid UTF-8 are
+            replaced with U+FFFD when the request is decoded, and accepted.
           example: "Daily backup job"
         schedule_kind:
           type: string
@@ -842,6 +887,7 @@ components:
           description: |
             Run-duration budget in seconds for the **overrun deadline only**;
             the silence rule and the first-run seed keep using `grace_s`.
+            Time a run spends `blocked` does not count toward it.
 
             Explicit `null` clears it, restoring the fallback to `grace_s`;
             omitting the field leaves it as stored.
@@ -940,7 +986,7 @@ components:
             nor resets it: those page on their own count of runs in a row,
             which is 3 or this threshold, whichever is higher.
 
-            Not nullable: the column is `NOT NULL DEFAULT 1`, so there is no
+            Not nullable: it always has a value (default 1), so there is no
             "unset" state to return to.  An omitted field (or an explicit
             `null`, treated the same as omission) leaves the stored value
             unchanged.
@@ -1147,6 +1193,22 @@ components:
             are rejected with 400 (`INVALID_TRACE_CONTENT`): the setting has no
             unset state. A change reaches the ingest host within a minute.
           example: redacted
+        split_by_repo:
+          type: boolean
+          description: |
+            Whether runs from a hook (Claude Code, Codex, Antigravity) are
+            filed under one monitor per git repository (see the Check
+            schema). True splits from the next run on; false files every
+            new run on this monitor again and deletes nothing: the
+            repository monitors keep their history, and a run already open
+            on one ends there. Absent leaves it alone, and so does the value
+            the monitor already has, which is always accepted. A change is
+            rejected with 400 (`SPLIT_BY_REPO_ON_CHILD`) on a repository's
+            own monitor, and with 400 (`SPLIT_BY_REPO_NOT_ON_DEMAND`) on a
+            monitor that is on_demand neither before nor after the request
+            (scheduled, HTTP or CI). `null` is
+            rejected with 400 (`INVALID_SPLIT_BY_REPO`).
+          example: false
     Check:
       type: object
       description: A check resource returned by the API.
@@ -1174,6 +1236,9 @@ components:
         - hook_version_current
         - hook_seen_at
         - claude_code_seen_at
+        - parent_monitor_id
+        - repo
+        - split_by_repo
       properties:
         id:
           type: string
@@ -1393,6 +1458,94 @@ components:
             Optional branch filter narrowing which CI runs this check watches
             (omitted when unset, which watches every branch).
           example: "main"
+        ci_ignored:
+          type: object
+          description: |
+            Finished CI runs (succeeded or failed) that `ci_workflow` or
+            `ci_branch` filtered out since the last finished run that matched
+            them, or since the filters last changed. Omitted when none were. A
+            count that keeps growing with no recent match usually means a
+            filter no longer matches anything, for example after a workflow
+            rename or a default-branch change. A matching finished run and a
+            change to either filter both reset it. A repository webhook sends
+            the runs of every workflow, so with `ci_workflow` set, `count`
+            includes other workflows' runs, which the filter is meant to drop;
+            `same_workflow_count` counts only the runs of `ci_workflow` (or of
+            any workflow when it is not set) that `ci_branch` dropped.
+            `new_workflow` names the workflow that first appeared among the
+            ignored runs since the last match and has run most often since,
+            which is how a workflow renamed after it matched shows up (GitHub
+            and Jenkins monitors; always empty on GitLab, which names an
+            unnamed pipeline after its branch).
+            `last_workflow`, `last_branch`, `same_workflow_last_branch` and
+            `new_workflow` are copied from the CI provider's payload: treat
+            them as untrusted text.
+          required: [count, last_at, last_workflow, last_branch, last_matched_at, filters_changed_at, same_workflow_count, same_workflow_last_at, same_workflow_last_branch, new_workflow, new_workflow_first_at, new_workflow_count]
+          properties:
+            count:
+              type: integer
+              format: int32
+              description: Number of finished runs the filters ignored.
+              example: 12
+            last_at:
+              type: string
+              format: date-time
+              description: RFC 3339 UTC time the most recent ignored run arrived.
+              example: "2026-10-08T14:02:11Z"
+            last_workflow:
+              type: string
+              description: Workflow name of the most recent ignored run, as the CI provider sent it.
+              example: "CI"
+            last_branch:
+              type: string
+              description: Branch of the most recent ignored run, as the CI provider sent it.
+              example: "feature/login"
+            last_matched_at:
+              type: [string, "null"]
+              format: date-time
+              description: >-
+                RFC 3339 UTC time of the most recent finished run that matched the filters, or null when none has been recorded.
+              example: "2026-10-01T09:00:00Z"
+            filters_changed_at:
+              type: [string, "null"]
+              format: date-time
+              description: >-
+                RFC 3339 UTC time `ci_workflow` or `ci_branch` last changed, or null when that is not known.
+              example: "2026-09-20T12:00:00Z"
+            same_workflow_count:
+              type: integer
+              format: int32
+              description: >-
+                Number of the ignored finished runs that belong to `ci_workflow` (every ignored run when no workflow filter is set): the runs the branch filter alone dropped. 0 when every ignored run was another workflow's.
+              example: 3
+            same_workflow_last_at:
+              type: [string, "null"]
+              format: date-time
+              description: >-
+                RFC 3339 UTC time the most recent of those runs arrived, or null when `same_workflow_count` is 0.
+              example: "2026-10-08T11:40:00Z"
+            same_workflow_last_branch:
+              type: string
+              description: >-
+                Branch of the most recent of those runs, as the CI provider sent it; an empty string when `same_workflow_count` is 0.
+              example: "release/2.4"
+            new_workflow:
+              type: string
+              description: >-
+                Name of the workflow, other than `ci_workflow`, that first appeared after the last matching run and has the most ignored runs since (ties to the one that appeared first), as the CI provider sent it; an empty string when none did. A name first seen in the monitor's first 7 days of recording workflow names is never new. Always empty on GitLab monitors.
+              example: "Deploy prod"
+            new_workflow_first_at:
+              type: [string, "null"]
+              format: date-time
+              description: >-
+                RFC 3339 UTC time `new_workflow` first appeared, or null when `new_workflow_count` is 0.
+              example: "2026-10-06T09:12:00Z"
+            new_workflow_count:
+              type: integer
+              format: int32
+              description: >-
+                Number of the ignored finished runs that carried `new_workflow`; 0 when no new workflow appeared.
+              example: 2
         runaway_ceiling:
           type: [integer, "null"]
           format: int64
@@ -1435,8 +1588,7 @@ components:
             discovery reconcile key.
 
             `source_kind` and `source_ref` are always either both present or
-            both omitted: a database CHECK constraint makes a half-set
-            identity unrepresentable.
+            both omitted: a half-set identity is never stored.
           example: ".github/workflows/nightly.yml#build"
         trace_content:
           type: string
@@ -1524,7 +1676,7 @@ components:
             destination routed on both `down` and `fail` is one place the
             alerts go. `every-run` counts because it fires for every completed
             run, a failed one included. A route on `recovery`, `success`,
-            `started` or `note` is not counted: the notifier resolves routes
+            `started` or `note` is not counted: routes are resolved
             per event with no fallback, and none of those four ever fires for
             a failure, so a monitor routed only on them has nowhere for its
             bad news to go. 0 means failures would be silent, which the
@@ -1558,6 +1710,91 @@ components:
           type: [string, "null"]
           format: date-time
           description: Latest time this monitor received a Claude Code run (a hook start that reported a version, or a trace whose source is Claude Code). With hook_version null and a recent value here, the machine runs an older hook or none.
+        parent_monitor_id:
+          type: [string, "null"]
+          format: uuid
+          readOnly: true
+          description: |
+            For a repository's monitor, the hook-fed agent monitor it was
+            split from (for example "Claude Code"); null on every other
+            monitor. LastPing creates a repository's monitor on the first run
+            from a git repository it has not seen, named
+            "<parent name> · <repo>", with these parent settings as they are
+            at that moment: alert routes, max_runtime_s, blocked_timeout_s,
+            step_timeout_s, runaway_ceiling, failure_threshold,
+            notify_min_run_s, tags, trace_content, the pause and
+            maintenance_until. Not copied: expect_every_s (the parent keeps
+            it, and every repository's run counts as activity on the
+            parent), assertions, metric guards and alert templates. After
+            that it is independent. A successful run on a repository's
+            monitor also ends an outage on the parent. Runs that name no
+            repository stay on the parent. Deleting the parent keeps its
+            repository monitors as standalone monitors, and this becomes
+            null.
+          example: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+        repo:
+          type: [string, "null"]
+          readOnly: true
+          description: |
+            The git repository whose runs this monitor holds: the name of the
+            folder that holds the repository (never a path), as the hook sent
+            it, 1 to 64 characters. Null on a monitor that is not a
+            repository's. Plain text: render it as text, never as markup.
+          example: lastping-outreach
+        split_by_repo:
+          type: boolean
+          description: |
+            Whether runs from a hook (Claude Code, Codex, Antigravity) are
+            filed under one monitor per git repository, created on the first
+            run from each. True by default; false on a repository's own
+            monitor, which never splits. At most 20 repositories per monitor,
+            and never past the project's monitor limit: a run beyond either
+            stays here. Only on_demand monitors split.
+        repos:
+          type: object
+          readOnly: true
+          description: |
+            Returned on one monitor (get, create, update), never in the
+            list, and only on a monitor that splits (split_by_repo true on a
+            hook-fed on_demand monitor) or has repository monitors: the
+            repositories it has split into and whether a limit keeps runs
+            from new repositories here.
+          required: [children, limit, repo_limit_reached, monitor_cap_reached]
+          properties:
+            children:
+              type: array
+              items:
+                type: object
+                required: [monitor_id, name, repo, state, last_run_at, spend_24h]
+                properties:
+                  monitor_id:
+                    type: string
+                    format: uuid
+                  name:
+                    type: string
+                    example: "Claude Code · lastping-outreach"
+                  repo:
+                    type: string
+                    example: lastping-outreach
+                  state:
+                    type: string
+                    enum: [up, late, down, paused]
+                  last_run_at:
+                    type: [string, "null"]
+                    format: date-time
+                  spend_24h:
+                    oneOf:
+                      - $ref: "#/components/schemas/AgentSpend"
+                      - type: "null"
+            limit:
+              type: integer
+              example: 20
+            repo_limit_reached:
+              type: boolean
+              description: The monitor has split into `limit` repositories; runs from another repository stay on this monitor.
+            monitor_cap_reached:
+              type: boolean
+              description: The project holds its monitor limit; runs from a repository with no monitor yet stay on this monitor.
     DiscoverySource:
       type: object
       description: |
@@ -1596,9 +1833,15 @@ components:
             `source_ref` when omitted, and truncated to 200 **characters**
             (not bytes, so multi-byte names are never cut mid-character).
 
-            Must be valid UTF-8 and free of control characters — a newline
-            picked up from a crontab comment is rejected with 400
-            (`INVALID_NAME`) rather than stored.
+            A name you send must be free of control and invisible characters
+            (zero-width characters, non-ASCII spaces, line separators): a
+            newline picked up from a crontab comment is rejected with 400
+            (`INVALID_NAME`) rather than stored. Bytes that are not valid UTF-8 are
+            replaced with U+FFFD when the request is decoded, and accepted.
+
+            The `source_ref` default is cleaned instead of rejected: non-ASCII
+            spaces become ordinary spaces, other such characters are dropped,
+            and a ref with nothing printable left is named `Discovered job`.
 
             Ignored for a source that is already monitored: reconcile never
             modifies an existing monitor, including its name.
@@ -1750,7 +1993,13 @@ components:
       properties:
         name:
           type: string
-          description: Human-readable agent name. The slug is derived from this value.
+          maxLength: 200
+          description: |
+            Human-readable agent name. The slug is derived from this value.
+            Surrounding whitespace is trimmed; at most 200 characters (not
+            bytes) and no control or invisible characters (400
+            `INVALID_NAME`). Bytes that are not valid UTF-8 are
+            replaced with U+FFFD when the request is decoded, and accepted.
           example: "Nightly ETL bot"
         description:
           type: string
@@ -1764,7 +2013,7 @@ components:
 
         - **Omitted field** — the stored value is left unchanged.
         - **Explicit `null`** — clears the value. Only `description` accepts
-          `null` (the column is `NOT NULL DEFAULT ''`, so an explicit `null`
+          `null` (it is never null, so an explicit `null`
           maps to `""`).
         - **Any other value** — replaces the stored value.
 
@@ -1774,7 +2023,13 @@ components:
       properties:
         name:
           type: string
-          description: Human-readable agent name.
+          maxLength: 200
+          description: |
+            Human-readable agent name. Surrounding whitespace is trimmed, as on
+            create. A new name must be at most 200 characters (not bytes) and
+            free of control and invisible characters (400 `INVALID_NAME`);
+            sending the stored name unchanged is always accepted. Bytes that are not valid UTF-8 are
+            replaced with U+FFFD when the request is decoded, and accepted.
           example: "Nightly ETL bot"
         description:
           type: [string, "null"]
@@ -1843,7 +2098,7 @@ components:
             - `blocked` — no active monitor is down, but at least one owned
               monitor has a run that is blocked on a human right now. This is
               an alert-class state, not merely informational: it is excluded
-              from the notifier's info rate class precisely so it cannot be
+              from the informational alert rate limit precisely so it cannot be
               starved by high-volume traffic.
             - `late` — no active monitor is down or blocked, but at least one
               is late.
@@ -1881,11 +2136,11 @@ components:
             - type: "null"
           description: |
             Cost, token and run rollup across every monitor this agent owns,
-            over the trailing 24 hours (`run_span_stats.last_span_at` within
+            over the trailing 24 hours (runs whose latest span arrived within
             24 hours of now). `null` when the agent has no traced run in
             that window — distinct from a traced run that reported zero
             GenAI cost, which is a non-null object with `cost_usd: null` and
-            `runs > 0`. `run_span_stats` rows survive 90 days, well beyond
+            `runs > 0`. A run's span totals are kept 90 days, well beyond
             this 24-hour window.
 
             A run counts in full when its *last* span falls inside the
@@ -2342,7 +2597,8 @@ components:
       description: |
         One project label's usage over the range: the label a Claude Code
         hook sent on its runs' start pings (`Run.project`, the name of the
-        folder the session worked in). The sum of those traced runs' own
+        folder that holds the git repository the session worked in, or the
+        folder's name when it is not in a repository; a name, never a path). The sum of those traced runs' own
         totals (each run's tokens and cost, as the Runs list shows them), so
         traces only (`project_scope`). `tokens_in` INCLUDES
         `tokens_cache_read`.
@@ -2538,8 +2794,8 @@ components:
             log records), `unknown_monitor`, `expired_key`, `wrong_scope`,
             `wrong_project`, `monitor_mismatch`, `over_budget` (the shared
             daily budget), `over_log_budget` (the daily log event cap, logs
-            only), `rate_limited`, `busy` (every OTLP slot on the ingest
-            task was taken, answered 429 `OTLP_BUSY`) or `malformed`.
+            only), `rate_limited`, `busy` (every OTLP slot was taken,
+            answered 429 `OTLP_BUSY`) or `malformed`.
 
             A traces request answered 202 that kept nothing, with the outcome
             refused (the sending machine's clock needs fixing):
@@ -2584,16 +2840,16 @@ components:
             gzip is undone. On a refusal made before the body was read (a
             key, scope, rate or budget refusal), it is the request's
             Content-Length header, which is the compressed size when the body
-            is gzip; 0 when the header was absent. A request too large for
-            one queue message is stored as several accepted rows; the first
-            carries the request's bytes, protocol and user agent and the rest
-            carry 0 and empty strings, so a sum over rows is normally the
-            bytes received. A message that stored nothing new (every span
-            or log event already stored, every metric point of a new model
-            series past the daily limit, or every metric sample shed by the
-            processor for an invalid day, value, metric or label) writes no
-            accepted row, and when that message is the first, the request's
-            bytes, protocol and user agent go unrecorded.
+            is gzip; 0 when the header was absent. A large request can be
+            recorded as several accepted entries; the first carries the
+            request's bytes, protocol and user agent and the rest carry 0
+            and empty strings, so a sum over entries is normally the bytes
+            received. A part that stored nothing new (every span or log event
+            already stored, every metric point of a new model series past the
+            daily limit, or every metric sample dropped for an invalid day,
+            value, metric or label) records no accepted entry, and when that
+            part is the first, the request's bytes, protocol and user agent
+            go unrecorded.
           example: 20480
         protocol:
           type: string
@@ -2610,7 +2866,7 @@ components:
     TraceSummary:
       type: object
       description: What the monitor's newest traced run contained.
-      required: [rid, span_count, model, model_calls, tool_calls, tokens_in, tokens_out, cost_usd, cost_source, last_span_at]
+      required: [rid, span_count, model, model_calls, tool_calls, tokens_in, tokens_out, cost_usd, cost_source, last_span_at, is_test]
       properties:
         rid:
           type: string
@@ -2656,6 +2912,13 @@ components:
           type: [string, "null"]
           format: date-time
           example: "2026-09-21T16:40:12Z"
+        is_test:
+          type: boolean
+          description: |
+            True when this run is the set-up's test span (every span carried
+            `lastping.test=true`), as `is_test` on `GET /api/v1/runs`. A set-up
+            is working once one arrives; the tool's own first run follows it.
+          example: false
     TraceDiagnostics:
       type: object
       description: The body of `GET /api/v1/checks/{id}/trace-diagnostics`.
@@ -2711,8 +2974,8 @@ components:
     AgentSpend:
       type: object
       description: |
-        24-hour cost/token/run rollup for one agent, from `run_span_stats`
-        joined through the checks it owns. See `Agent.spend_24h` and
+        24-hour cost/token/run rollup for one agent, over the traced runs
+        of the checks it owns. See `Agent.spend_24h` and
         `AgentFleet.spend_24h` for when the containing field itself is
         `null` instead of this object.
 
@@ -2781,10 +3044,9 @@ components:
     AgentFleetLastRun:
       type: object
       description: |
-        The run currently armed on a monitor (`checks.last_start_rid`
-        non-empty) — not "the most recently completed run"; that column is
-        cleared back to empty the instant a run terminates, so there is
-        nothing left on the row to name a prior run by.
+        The run currently open on a monitor — not "the most recently
+        completed run": a monitor stops naming a run the instant that run
+        ends, so there is no prior run to report here.
       required: [rid, outcome, started_at, ended_at]
       properties:
         rid:
@@ -2826,7 +3088,7 @@ components:
     AgentFleetMonitor:
       type: object
       description: One monitor this agent owns, as shown on its fleet detail page.
-      required: [check_id, name, slug, state, paused, last_ping_at, last_run, current_step]
+      required: [check_id, name, slug, state, paused, last_ping_at, last_run, current_step, parent_monitor_id, repo, spend_24h]
       properties:
         check_id:
           type: string
@@ -2855,7 +3117,7 @@ components:
         paused:
           type: boolean
           description: |
-            The monitor's own `paused` column, independent of `state` (an
+            Whether the monitor itself is paused, independent of `state` (an
             in-maintenance, unpaused monitor can also read state "paused").
           example: false
         last_ping_at:
@@ -2872,6 +3134,19 @@ components:
             - $ref: "#/components/schemas/AgentFleetCurrentStep"
           nullable: true
           description: Null when no run is currently armed, or the armed run has not declared a step yet.
+        parent_monitor_id:
+          type: [string, "null"]
+          format: uuid
+          description: For a repository's monitor, the agent monitor it was split from (see the Check schema's `parent_monitor_id`); null otherwise.
+        repo:
+          type: [string, "null"]
+          description: For a repository's monitor, the repository's name; null otherwise. Plain text.
+          example: lastping-outreach
+        spend_24h:
+          oneOf:
+            - $ref: "#/components/schemas/AgentSpend"
+            - type: "null"
+          description: This monitor's traced spend over the last 24 hours; null when it had no traced run in the window.
     AgentFleet:
       type: object
       description: The body of `GET /api/v1/agents/{id}/fleet`.
@@ -2892,7 +3167,7 @@ components:
           description: |
             The same 24-hour rollup as `agent.spend_24h`, carried here too
             as a convenience for the fleet header stat — both fields come
-            from the same query call, so they can never disagree. `null`
+            from the same read, so they can never disagree. `null`
             when the agent has no traced run in the window. See
             `AgentSpend` for the window's last-span-in, not first-span-in,
             corollary.
@@ -2982,7 +3257,7 @@ components:
           type: string
           description: |
             The failure output the run reported: the body of the ping that
-            opened the incident, or — for an incident the detector opened,
+            opened the incident, or — for an incident opened by a missed deadline,
             where no ping coincides with `opened_at` — the latest `fail`
             reported while the incident has been open.
 
@@ -3008,7 +3283,7 @@ components:
             **Omitted means no exit code was reported. It never means
             "exited cleanly".** A job reports a status only through the numeric
             form; the word forms (`/fail`, `/start`, …) carry none, an incident
-            the detector opened has no ping at all, and pings recorded before
+            opened by a missed deadline has no ping at all, and pings recorded before
             this field existed did not keep the number and cannot be
             backfilled. A clean exit is the **present** value `0` — which does
             occur on an incident, since an `assertion` incident opens on a run
@@ -3226,7 +3501,10 @@ components:
         belong to `kind` are present; every other field is omitted, never
         null or zero. Nothing here is inferred: runs are matched to the
         incident by the run id recorded when it opened, alerts by the
-        incident's own delivery key.
+        incident's own delivery key, and the closing side by the instant
+        it closed: `recovery_ping` is the success ping that closed it and
+        the `recovery` alerts are the all-clear that ping sent. An incident
+        closed any other way has neither.
       required: [at, kind]
       properties:
         at:
@@ -3234,10 +3512,10 @@ components:
           format: date-time
         kind:
           type: string
-          enum: [run_started, step, run_failed, run_cancelled, run_blocked, incident_opened, alert_delivered, alert_failed, alert_suppressed, alert_pending, note, incident_resolved]
+          enum: [run_started, step, run_failed, run_cancelled, run_blocked, incident_opened, alert_delivered, alert_failed, alert_suppressed, alert_pending, note, recovery_ping, incident_resolved]
         rid:
           type: string
-          description: "`run_started` only. The run id the job chose; raw job input."
+          description: "`run_started` and `recovery_ping`. The run id the job chose; raw job input."
         title:
           type: string
           description: "`run_started` only. The body posted with `/start`, when one was; raw job output."
@@ -3253,10 +3531,10 @@ components:
         duration_ms:
           type: integer
           format: int64
-          description: "Terminal run events, when the run paired with its `/start`."
+          description: "Terminal run events and `recovery_ping`, when the run paired with its `/start`."
         body_excerpt:
           type: string
-          description: "Terminal run events. What the run printed; raw job output."
+          description: "Terminal run events and `recovery_ping`. What the run printed; raw job output."
         cause:
           type: string
           description: "`incident_opened` only. Same vocabulary as `Incident.cause`."
@@ -3265,7 +3543,7 @@ components:
           description: "`incident_opened` only. CI failure detail, when captured."
         event_type:
           type: string
-          description: "`alert_*` only. The alert event type delivered. Only alerts keyed to the incident's opening appear here (`down`, `fail`); the recovery notification is keyed to the closing ping and is not yet attributed to the incident."
+          description: "`alert_*` only. The alert event type delivered: the alert sent when the incident opened (for example `down` or `fail`) or `recovery`, the all-clear sent when the incident closed."
         channel_id:
           type: string
           format: uuid
@@ -3437,8 +3715,23 @@ components:
         and any routes pointing at this channel.  To change kind, delete the
         destination and create a new one.
 
-        `config`, when present, replaces the channel's config wholesale and is
-        validated with the same per-kind rules as POST /api/v1/channels
+        `config`, when present, replaces the channel's config, with one
+        exception: **write-only (secret) fields are merged.**  A secret field
+        omitted from `config` keeps its stored value, so a destination can be
+        edited without re-sending a credential that is never returned, but
+        only while the destination still points where it did: the `webhook`
+        `url` and the `ntfy` `topic_url` must be unchanged (host and scheme
+        compared case-insensitively, everything else exactly).  A `config`
+        that changes either of them and leaves out a stored secret is refused
+        with 400 (`code` `DESTINATION_SECRET_REQUIRED`), so a stored secret is
+        never carried to a new destination; send it again with the new URL.
+        An explicit empty string (or `null`) clears a secret, which is
+        accepted only where the field is optional (the ntfy `token`).  The
+        secret fields are the ones listed at the end of this description.
+        Every other field is replaced: omitting it from a supplied `config`
+        removes it.
+
+        The resulting config is validated with the same per-kind rules as POST /api/v1/channels
         (`webhook` requires `url`+`secret`, `slack`/`discord`/`msteams`/`googlechat`
         require `webhook_url`, `telegram` requires `bot_token`+`chat_id`, `ntfy`
         requires `topic_url`, `pushover` requires `token`+`user_key`, `email`
@@ -3471,7 +3764,10 @@ components:
           example: "Ops webhook (renamed)"
         config:
           type: object
-          description: Replacement kind-specific configuration object (see description above).
+          description: |
+            Replacement kind-specific configuration object (see description above).  A
+            secret field left out keeps its stored value while the webhook `url` /
+            ntfy `topic_url` is unchanged; `""` clears an optional one.
           additionalProperties: true
           example: {"url": "https://example.com/hook", "secret": "new-s3cr3t"}
     Channel:
@@ -3673,14 +3969,18 @@ components:
           example: "2026-08-01T09:30:00Z"
         last_used_surface:
           type: string
-          enum: ["mcp", "terraform", "api"]
+          enum: ["mcp", "terraform", "api", "ingest"]
           description: |
             Which client surface last used this key, omitted if unknown.
-            Best-effort and spoofable: derived from the caller-controlled
-            `User-Agent` header on the authenticating request, not from any
-            cryptographic or protocol-level signal. Useful for an honest "did
-            my client ever successfully authenticate?" indicator — never use
-            it for authorization or access control.
+            `ingest` means the latest use was sending telemetry (traces,
+            metrics or logs); telemetry use is recorded about once a minute
+            per key, so `last_used_at` can trail the newest export by up to a
+            minute. For `mcp`, `terraform` and `api` the value is best-effort
+            and spoofable: derived from the caller-controlled `User-Agent`
+            header on the authenticating request, not from any cryptographic
+            or protocol-level signal. Useful for an honest "did my client ever
+            successfully authenticate?" indicator — never use it for
+            authorization or access control.
           example: "mcp"
         scope:
           type: string
@@ -3707,8 +4007,8 @@ components:
             been deleted.
 
             **Revoking a key revokes every key below it in this chain.** A key
-            minted by a key minted by the key you delete goes with it, in one
-            transaction. A key created from the dashboard is never below
+            minted by a key minted by the key you delete goes with it, all at
+            once. A key created from the dashboard is never below
             anything and is unaffected.
           example: "e1d2c3b4-0000-0000-0000-000000000002"
     ApiKeyCreated:
@@ -3789,7 +4089,10 @@ components:
             `blocked`, `note`. `blocked` marks the run as waiting on a human
             (pauses run-clock detection until cleared); `note` is a labelled
             informational signal that carries free text in the request body,
-            visible here via `body_excerpt`.
+            visible here via `body_excerpt`. A `success` whose body failed an
+            output assertion (one set on the monitor, or an expectation the
+            run declared) is stored and returned as `fail`: it ended its run
+            as a failure.
           example: "success"
         rid:
           type: string
@@ -3810,6 +4113,12 @@ components:
           description: >-
             Wall-clock duration in milliseconds of the run this ping completed. Present only when this ping is a `success` that paired with a preceding `start` on the same `rid`; omitted otherwise (never `0` or `null` as a stand-in for "absent").
           example: 1523
+        fail_cause:
+          type: string
+          enum: [assertion]
+          description: >-
+            Why this ping reads `fail` although its sender did not send a fail. `assertion`: it arrived as a `success` and an output assertion (one set on the monitor, or an expectation the run declared) failed it. Omitted on every other ping, including a `fail` the job sent itself.
+          example: "assertion"
     Incident:
       type: object
       description: A single downtime incident for a check.
@@ -3887,16 +4196,15 @@ components:
         title:
           type: string
           description: |
-            Title for this run: `pings.title`, a dedicated column on the
-            run's `/start` ping — distinct
-            from `body_excerpt`, which is a separate column. Matched on `rid`
+            Title for this run, stored on the run's `/start` ping — distinct
+            from `body_excerpt`. Matched on `rid`
             the same way `steps` is — both pings of a run (its start and its
             terminal ping) carry it. Set by whichever call reaches it FIRST
             with a non-empty title: the body of the run's own `/start` call,
             or a later `POST .../title?rid=<run-id>` sent any time while the
             run is still open — same request shape as `/blocked` and `/note`,
-            but (unlike them) it writes no `pings` row of its own: it only
-            ever updates `title` on the run's existing `/start` row, so it
+            but (unlike them) it records no ping of its own: it only
+            ever sets `title` on the run's existing `/start` ping, so it
             never appears as a `kind` in the `Ping` schema. Only the first
             non-empty write counts; neither a later `/start` body nor a
             later `/title` call can change a title once one is set. Omitted
@@ -4136,16 +4444,19 @@ components:
         failure_cause:
           type: string
           description: |
-            Why a failed run failed, when it was not the agent's own work. Its
-            values today are an empty string (every run that did not end on
-            an upstream API error) and `upstream`: the run ended on an API
-            error that is the model provider's rather than the agent's
-            (`server_error`, `overloaded` or `rate_limit`, named in
-            `upstream_error`). Such a run is `failed`, but it pages only once
-            3 runs in a row (or the monitor's `failure_threshold`, when that
-            is higher) have ended that way, as an incident with cause
-            `upstream`. A plain string rather than an enum: treat a value you
-            do not recognise as an empty string.
+            Why a failed run failed, when the reason is known. Its values
+            today are an empty string (every other run), `assertion` and
+            `upstream`. `assertion`: the run sent a success, but its output
+            failed an output assertion (one configured on the monitor, or an
+            expectation the run declared), so the run is `failed` and opens
+            an incident with cause `assertion` like any failure. `upstream`:
+            the run ended on an API error that is the model provider's rather
+            than the agent's (`server_error`, `overloaded` or `rate_limit`,
+            named in `upstream_error`). Such a run is `failed`, but it pages
+            only once 3 runs in a row (or the monitor's `failure_threshold`,
+            when that is higher) have ended that way, as an incident with
+            cause `upstream`. A plain string rather than an enum: treat a
+            value you do not recognise as an empty string.
           example: "upstream"
         upstream_error:
           type: string
@@ -4243,8 +4554,7 @@ components:
           description: |
             Number of OTLP spans recorded for this run. Null when
             the run was never traced — distinct from `0`, which cannot occur
-            (a `run_span_stats` row is created only on the first span
-            insert).
+            (a run's span totals start with its first span).
 
             This and the other three stats fields below survive for 90 days,
             longer than the individual spans they summarise (30 days) — see
@@ -4309,9 +4619,8 @@ components:
         `?outcome=failed` still learns how many succeeded runs the same window
         holds, and a caller on page 4 gets the same numbers it got on page 1.
 
-        Computed by the same single query that builds the page, in the same
-        pass, so the numbers and the rows describe one read of the table
-        rather than two.
+        Computed in the same read that builds the page, so the numbers and
+        the rows can never disagree.
 
         **Absent, never zeroed, when the page carries no run at all.** The
         totals ride the returned rows, so a request that matched nothing has
@@ -4354,7 +4663,8 @@ components:
           description: |
             Runs that started and never ended: no terminal ping, no incident,
             not blocked, and a start older than the monitor's `max_runtime_s`
-            (24 hours when unset). Never counted in `failed`.
+            (24 hours when unset), plus, for the monitor's current run, the
+            time that run spent blocked. Never counted in `failed`.
           example: 0
     RunsByMonitorRow:
       type: object
@@ -4400,7 +4710,7 @@ components:
           description: |
             Includes a run an incident closed with no terminal ping of its
             own, exactly as the run list's own `failed` outcome does: both
-            are computed by the same rule, in the same SQL, so a rate
+            are computed by the same rule, so a rate
             derived here can never contradict that list.
           example: 8
         avg_duration_ms:
@@ -4664,9 +4974,8 @@ components:
           format: int64
           description: |
             How many alert deliveries LastPing recorded for this incident.
-            Deliveries are correlated with an incident on
-            `(check_id, incident_opened_at)` rather than by a foreign key, so
-            this counts the attempts LastPing made: it is not a promise that a
+            Deliveries are correlated with an incident by its monitor and
+            opening time, so this counts the attempts LastPing made: it is not a promise that a
             person read one. Zero is a real answer (no destination was routed
             for the event), never a missing one.
           example: 2
@@ -4740,8 +5049,8 @@ components:
           type: [integer, "null"]
           format: int64
           description: |
-            The incident this delivery correlates with, matched by
-            `(check_id, incident_opened_at)` — not a foreign key. Null once
+            The incident this delivery correlates with, matched by its
+            monitor and opening time. Null once
             the parent incident has aged out of the 1-year incidents
             retention window, or for an event type with no incident to
             correlate with (e.g. `every-run`).
@@ -4841,7 +5150,7 @@ components:
           type: string
           enum: [start, step, log, note, blocked, success, fail, cancel, incident_opened]
           description: |
-            The ping kind this event came from, `step` for a run_steps entry,
+            The ping kind this event came from, `step` for a declared step,
             or the synthetic `incident_opened`.
           example: "fail"
         at:
@@ -4932,10 +5241,12 @@ components:
     RunCI:
       type: object
       description: |
-        `RunDetail`'s CI-provider metadata, decoded from the first `ci_meta`
-        any ping on this run carried. The `RunDetail.ci` field itself is
-        `null` (this schema never appears) for an agent/heartbeat run with no
-        CI provider attached.
+        `RunDetail`'s CI-provider metadata, merged field by field across every
+        ping on this run that carried `ci_meta`, a later non-empty value
+        winning: the start ping supplies the run URL, commit, branch and
+        actor, the terminal ping the failing stage and duration. The
+        `RunDetail.ci` field itself is `null` (this schema never appears) for
+        an agent/heartbeat run with no CI provider attached.
       properties:
         run_url:
           type: string
@@ -5049,9 +5360,9 @@ components:
               type: boolean
               description: |
                 `true` when this run had more than 2,000 recorded spans and
-                `spans` therefore does not show every one of them (the read
-                query's own backstop cap — see `spans_dropped` for the
-                separate, more common write-time cap). Always `false` once a
+                `spans` therefore does not show every one of them (this
+                endpoint's own display cap — see `spans_dropped` for the
+                separate, more common storage cap). Always `false` once a
                 run's spans have aged out at the 30-day retention cutoff
                 described on `spans` above, since an empty `spans[]` from
                 retention is not "too many", it is "none left to show".
@@ -5060,8 +5371,8 @@ components:
               type: [integer, "null"]
               format: int64
               description: |
-                Spans the processor declined to write because this run had
-                already reached its 2,000-span write-time cap. Null (not
+                Spans not stored because this run had
+                already reached its 2,000-span storage cap. Null (not
                 `0`) when the run has no span stats at all — distinct from a
                 traced run that dropped none.
               example: 0
@@ -5248,7 +5559,8 @@ components:
           description: |
             Machine-readable, SCREAMING_SNAKE_CASE error code (e.g.
             `MONITOR_NOT_FOUND`, `SESSION_ONLY`, `CSRF_REQUIRED`,
-            `INVALID_SCHEDULE`). Omitted for the small set of errors that
+            `READ_ONLY_IMPERSONATION`, `IMPERSONATION_UNAVAILABLE`,
+            `VIEW_AS_CHANGED`, `INVALID_SCHEDULE`). Omitted for the small set of errors that
             predate this convention and never got one. A client should branch
             on `code`, not on `detail`'s prose, which may change wording
             without notice.
@@ -5419,7 +5731,7 @@ components:
           description: The `lastping run` command-wrapper snippet. Fits anything launched as a command; cannot send `blocked` or `note`.
         hook_install:
           type: string
-          description: The one-time hook install, Claude Code's by default or Codex's with `hook_tool=codex`. Specific to that tool; the only mechanism that can send every state this product models.
+          description: The one-time hook install, Claude Code's by default, or Codex's or Antigravity CLI's with `hook_tool`. Specific to that tool; installed once, it reports runs from the tool's own hooks.
         how_to:
           type: string
           description: The manual protocol prompt — the universal path, fitting any agent, any language, any tool.
@@ -5482,7 +5794,7 @@ components:
           example: "claude-code"
         blocks:
           type: array
-          description: One block when `tool` was given, otherwise all eight, in a fixed order.
+          description: One block when `tool` was given, otherwise every block, in a fixed order.
           items:
             $ref: "#/components/schemas/TraceSetupBlock"
         prompt:
@@ -5497,7 +5809,7 @@ components:
       properties:
         tool:
           type: string
-          enum: [claude-code, codex, gemini, cursor, python, node, otel-sdk, collector]
+          enum: [claude-code, codex, gemini, antigravity, cursor, python, node, otel-sdk, collector]
         title:
           type: string
           example: "Claude Code"
@@ -5618,7 +5930,7 @@ components:
           minimum: 1
           maximum: 604800
           description: >-
-            Trailing window in seconds. Capped at 604800 (7 days), and the cap is cost rather than policy: a guard re-aggregates every ping body in its window on every ping, so the work is linear in the window (measured: 4.2 ms per ping at a 1-hour window against 390 ms at 30 days). A window longer than the 90-day ping retention would also aggregate over rows the pruner has already deleted and quietly report a number lower than the truth.
+            Trailing window in seconds. Capped at 604800 (7 days), and the cap is cost rather than policy: a guard re-aggregates every ping body in its window on every ping, so the work grows with the window. A window longer than the 90-day ping retention would also aggregate over pings that are no longer kept and quietly report a number lower than the truth.
           example: 86400
         ceiling:
           type: number
@@ -5824,8 +6136,10 @@ components:
           type: string
           description: |
             The account's current password. Ignored (any value accepted) for
-            an OAuth-only account with no password set yet — the valid
-            session cookie is itself sufficient proof of identity.
+            an OAuth-only account with no password set yet. Such an account
+            proves itself with a recent sign-in instead: it can set its first
+            password only within 15 minutes of signing in (403
+            `REAUTH_REQUIRED` otherwise).
           example: "correct horse battery staple"
         new_password:
           type: string
@@ -5900,24 +6214,53 @@ paths:
     get:
       operationId: getWhoami
       summary: Auth smoke-test
-      description: Returns the authenticated project_id.  Useful for verifying the API key is valid.
+      description: |
+        Returns the authenticated project_id, and for an API key its kind,
+        scope and expiry. Useful for verifying the API key is valid and what
+        it may do. `kind`, `scope` and `expires_at` are null for a console
+        session. `resource` is present only for an OAuth access token, which
+        is usable only through the LastPing MCP server.
       tags: [Auth]
       security:
         - ApiKeyAuth: []
+        - SessionCookie: []
       responses:
         "200":
-          description: API key is valid; returns the associated project_id.
+          description: API key is valid; returns the associated project_id and the key's kind, scope and expiry.
           content:
             application/json:
               schema:
                 type: object
+                required: [project_id, kind, scope, expires_at]
                 properties:
                   project_id:
                     type: string
                     format: uuid
                     example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+                  kind:
+                    type: [string, "null"]
+                    enum: [key, oauth, null]
+                    description: "`key` for an API key, `oauth` for an OAuth access token made by connecting an app; null for a console session."
+                    example: key
+                  scope:
+                    type: [string, "null"]
+                    enum: [read, write, admin, ingest, null]
+                    description: The credential's scope; null for a console session.
+                    example: write
+                  expires_at:
+                    type: [string, "null"]
+                    format: date-time
+                    description: When the credential expires; null when it never does, and for a console session.
+                    example: null
+                  resource:
+                    type: string
+                    description: The MCP resource an OAuth access token was issued for. Present only when kind is oauth.
+                    example: "https://mcp.lastping.dev/mcp"
               example:
                 project_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+                kind: key
+                scope: write
+                expires_at: null
         "401":
           description: Missing or invalid API key.
           content:
@@ -5985,7 +6328,12 @@ paths:
               schema:
                 $ref: "#/components/schemas/Check"
         "400":
-          description: Invalid request body or schedule validation failed.
+          description: |
+            Invalid request body or schedule validation failed. For an `http`
+            monitor, `SSRF_BLOCKED_URL` means the `probe_url` host does not
+            resolve to a publicly routable address (it resolves only to
+            private, loopback or otherwise blocked addresses, or it could not
+            be resolved); check the URL and try again.
           content:
             application/problem+json:
               schema:
@@ -6019,6 +6367,23 @@ paths:
           description: |
             `If-None-Match: *` was sent and a check with the given `slug`
             already exists. The existing check is left unmodified.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "503":
+          description: |
+            `MONITOR_BUSY` — an upsert of an existing `slug` could not get the
+            monitor in time: another update or a ping was in progress for
+            longer than the request will wait, or the monitor was deleted
+            while the request ran. Nothing was changed; retry after the
+            `Retry-After` interval (a retry after a deletion creates the
+            monitor).
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying.
+              schema:
+                type: integer
           content:
             application/problem+json:
               schema:
@@ -6120,8 +6485,8 @@ paths:
           for the source pair, `null` must be sent on **both** keys, since a
           half-cleared discovery identity reconciles against nothing and is
           rejected with 400 (`SOURCE_INCOMPLETE`).
-          `failure_threshold` is NOT clearable (the column is `NOT NULL DEFAULT
-          1`); a `null` there is treated as omission.
+          `failure_threshold` is NOT clearable (it always has a value,
+          default 1); a `null` there is treated as omission.
         - **Any other value** — replaces the stored value.
 
         Changing `failure_threshold` does **not** reset `consecutive_failures`:
@@ -6167,7 +6532,12 @@ paths:
               schema:
                 $ref: "#/components/schemas/Check"
         "400":
-          description: Invalid request body or schedule validation failed.
+          description: |
+            Invalid request body or schedule validation failed. For an `http`
+            monitor, `SSRF_BLOCKED_URL` means the `probe_url` host does not
+            resolve to a publicly routable address (it resolves only to
+            private, loopback or otherwise blocked addresses, or it could not
+            be resolved); check the URL and try again.
           content:
             application/problem+json:
               schema:
@@ -6191,6 +6561,24 @@ paths:
             Two monitors reconciling to one source would make every later
             discovery run ambiguous, so the PATCH is refused and the monitor
             is left completely unmodified.
+
+            `CONCURRENT_UPDATE` — on an `http` monitor, another update changed
+            the stored `probe_url` while this one was in flight. Nothing was
+            changed; retry the request.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "503":
+          description: |
+            `MONITOR_BUSY` — the monitor is busy (another update or a ping is
+            in progress) for longer than the request will wait. Nothing was
+            changed; retry after the `Retry-After` interval.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying.
+              schema:
+                type: integer
           content:
             application/problem+json:
               schema:
@@ -6252,8 +6640,8 @@ paths:
         traces alongside its pings — see those fields' own descriptions on
         `PingInstructions`.
 
-        `hook_tool=codex` makes `hook_install` Codex's install instead of
-        Claude Code's; nothing else in the response changes.
+        `hook_tool=codex` or `hook_tool=antigravity` makes `hook_install` that
+        tool's install instead of Claude Code's; nothing else in the response changes.
 
         404 if the check does not exist in the authenticated project (no
         existence oracle).
@@ -6267,7 +6655,7 @@ paths:
           description: Which tool's one-time install `hook_install` carries. Omit for Claude Code's.
           schema:
             type: string
-            enum: [claude-code, codex]
+            enum: [claude-code, codex, antigravity]
             default: claude-code
       responses:
         "200":
@@ -6476,9 +6864,9 @@ paths:
       description: |
         **Session-only console convenience** — proves the ping pipeline works
         end to end before the monitored job is wired up. Enqueues a
-        synthetic success ping through the exact same SQS → processor path a
-        real ping takes; the response returns before the processor has
-        necessarily consumed it, so `last_ping_at` on `GET
+        synthetic success ping through the exact same path a
+        real ping takes; the response returns before the ping has
+        necessarily been processed, so `last_ping_at` on `GET
         /api/v1/checks/{id}` may take a moment to update.
 
         On a monitor that is currently down, this success ping resolves the
@@ -6498,7 +6886,7 @@ paths:
 
         Rate-limited to **one test ping per check per 5 seconds** — a repeat
         within the window gets 429 with `Retry-After: 5`, and the earlier
-        call's enqueue still stands (the retry never reaches the queue). 503
+        call still stands (the retry is not accepted). 503
         `PING_QUEUE_UNAVAILABLE` when the ping queue could not be reached at
         all.
       tags: [Checks]
@@ -6804,8 +7192,8 @@ paths:
         whichever ping tripped the rate ceiling for cause `runaway`), and
         `recovery` (the closing success ping's body) — from that ping's own
         `body_excerpt`, and renders empty when that ping had none. It always
-        renders empty for `down`: that event comes from the absence
-        detector's wall-clock sweep (`silence`, `overrun`, `stalled`,
+        renders empty for `down`: that event comes from a missed
+        deadline (`silence`, `overrun`, `stalled`,
         `never_started`, or a `blocked_timeout_s` expiry), which has no
         incoming ping to read a body from. It also always renders empty for
         the destinations page's
@@ -6830,7 +7218,7 @@ paths:
         `/step` leaves `{last_step}` and `{step_count}` empty rather than `0`.
 
         `{title}` is the title of the run the alert is about: whichever text
-        reached `pings.title` FIRST for that run's `rid` — the free-text body
+        set the run's title FIRST for that run's `rid` — the free-text body
         posted with the run's `/start` ping, or a later
         `POST .../title?rid=<run-id>` sent any time while the run was still
         open (see the `CIRun` schema's `title` field). Populated for a `fail`
@@ -7048,7 +7436,7 @@ paths:
         its entirety; assertions absent from the body are deleted.
 
         Every assertion is validated before any write, using the exact
-        evaluator the processor calls on every successful ping
+        evaluator that runs on every successful ping
         (the same validation everywhere): an uncompilable regexp, a `matches`
         pattern over 1000 bytes, a missing required field for the given
         `kind`, or a `json_path` containing `[`, `*` or `$` all fail the
@@ -7159,9 +7547,7 @@ paths:
       description: |
         Returns the metric guards configured for the check. Returns an empty
         `guards` array when none are set — the overwhelmingly common case, and
-        the case that costs zero extra queries on the ping-processing path
-        (the "has any guard" test rides on the row the processor already
-        fetched).
+        one that adds no cost to processing a ping.
 
         See the `MetricGuard` schema for how a guard is evaluated and why a
         tripped guard opens a `runaway` incident rather than introducing a new
@@ -7216,14 +7602,13 @@ paths:
         Two caps apply, and both are measured cost rather than taste:
 
         - **`window_s` at most 604800 seconds (7 days).** A guard re-reads
-          every ping body in its window on every ping, so the work is linear
-          in the window: 4.2 ms per ping at one hour, 390 ms at 30 days. Seven
-          days is also comfortably inside the 90-day ping retention, past
-          which a guard would aggregate over already-pruned rows and quietly
-          under-report.
+          every ping body in its window on every ping, so the work grows
+          with the window. Seven days is also comfortably inside the 90-day
+          ping retention, past which a guard would aggregate over pings no
+          longer kept and quietly under-report.
         - **At most 5 guards per check**, against 20 for assertions. An
           assertion is a string match over a set already in hand; a guard is
-          its own query, because each carries its own window — so N guards
+          its own lookup, because each carries its own window — so N guards
           multiply the per-ping cost by N.
 
         Returns the resulting set (same shape as `GET`) on success.
@@ -7561,7 +7946,8 @@ paths:
           description: |
             Only usage from the traced runs of this project: runs whose Claude
             Code hook start carried this label (`Run.project`, the name of the
-            folder the session worked in). `days` is then read from those
+            folder that holds the git repository the session worked in, or the
+            folder's name when it is not in a repository; a name, never a path). `days` is then read from those
             runs' own totals (each run's tokens and cost, as the Runs list
             shows them): ONE row per UTC day of the run's start, with `model`
             and `provider` empty (a run's totals are not split by model), and
@@ -7819,7 +8205,7 @@ paths:
 
         - **Omitted field** — the stored value is left unchanged.
         - **Explicit `null`** — clears the value. Only `description` accepts
-          `null` (the column is `NOT NULL DEFAULT ''`, so an explicit `null`
+          `null` (it is never null, so an explicit `null`
           maps to `""`).
         - **Any other value** — replaces the stored value.
 
@@ -7884,7 +8270,7 @@ paths:
         Content.
 
         **This does NOT delete the agent's monitors.** Every monitor it owned
-        has its `agent_id` set to null (`ON DELETE SET NULL`) and keeps
+        has its `agent_id` set to null and keeps
         running, keeps its ping history and incidents, and keeps alerting
         exactly as before — it simply becomes unowned. To remove the
         monitors themselves, delete them individually via
@@ -8033,18 +8419,18 @@ paths:
         with nothing else wrong) reads as `up` rather than raising a false
         alarm on a monitor's first run.
 
-        `monitors[].last_run` is the run **currently armed** on that
-        monitor (`checks.last_start_rid` non-empty) — not "the most recently
-        completed run": the column is cleared back to empty the instant a
-        run terminates, so there is nothing left to name a prior run by.
+        `monitors[].last_run` is the run **currently open** on that
+        monitor — not "the most recently completed run": a monitor stops
+        naming a run the instant that run ends, so there is no prior run
+        to report here.
         `null` when no run is currently in flight.
 
         `monitors[].current_step` is the latest declared step of that same
         armed run, present only while it has no terminal ping yet (which a
         currently-armed run always satisfies, by construction).
 
-        `spend_24h` is the agent's 24-hour cost/token/run rollup from
-        `run_span_stats`, across every monitor it owns — see the
+        `spend_24h` is the agent's 24-hour cost/token/run rollup
+        across every monitor it owns — see the
         `AgentSpend` schema. `null` when the agent has no traced run in the
         trailing 24 hours.
 
@@ -8298,7 +8684,8 @@ paths:
           description: |
             Only usage from the traced runs of this project: runs whose Claude
             Code hook start carried this label (`Run.project`, the name of the
-            folder the session worked in). `days` is then read from those
+            folder that holds the git repository the session worked in, or the
+            folder's name when it is not in a repository; a name, never a path). `days` is then read from those
             runs' own totals (each run's tokens and cost, as the Runs list
             shows them): ONE row per UTC day of the run's start, with `model`
             and `provider` empty (a run's totals are not split by model), and
@@ -8458,7 +8845,7 @@ paths:
   /api/v1/incidents:
     get:
       operationId: listAllIncidents
-      summary: List incidents across every check in the project (console SPA Incidents page)
+      summary: List incidents across every check in the project
       description: |
         Returns incidents project-wide, newest-opened first, keyset-paged —
         the console's Incidents page and any automation that wants a single
@@ -8476,8 +8863,8 @@ paths:
 
         **`?since=`** is unbounded by default: incidents are already
         retention-bound at 1 year (see `/privacy`), so there is no
-        unbounded-scan risk in leaving it open the way `GET /api/v1/runs`
-        must bound its own `?since=` against the pings table.
+        reason to bound it the way `GET /api/v1/runs` bounds its own
+        `?since=`.
 
         **`?state=`** defaults to `all`; `open` returns incidents with a
         null `closed_at`, `resolved` returns the rest.
@@ -8554,7 +8941,7 @@ paths:
   /api/v1/deliveries:
     get:
       operationId: listDeliveries
-      summary: List alert delivery records across every check in the project (console SPA Alerts > Delivery log tab)
+      summary: List alert delivery records across every check in the project
       description: |
         Returns delivery records project-wide, newest-id first, keyset-paged
         — the console's Delivery log tab and any automation that wants to
@@ -8563,7 +8950,9 @@ paths:
         A `deliveries` row is one (incident event, channel) outcome:
         `pending` while a delivery attempt is in flight, `delivered` on
         success, `dead` once the per-channel attempt ceiling is reached, or
-        `suppressed` when the channel's rate cap dropped it. `incident_id`
+        `suppressed` when it was deliberately not sent: the channel's rate
+        cap dropped it, or it is a `blocked` alert whose run was answered
+        within the hold (reason in `last_error`). `incident_id`
         correlates the row to `GET /api/v1/incidents/{id}` by matching
         `(check_id, incident_opened_at)` — it is `null` once the parent
         incident has aged out of the 1-year incidents retention window (see
@@ -8689,8 +9078,8 @@ paths:
         to delete one, by design: a diagnosis that can be rewritten is not
         evidence, and a reader has to be able to trust that a note still says
         what it said when it was written. Corrections are made by appending
-        another note. The database enforces this too — an `UPDATE` against the
-        underlying table is refused outright.
+        another note. Storage enforces this too: a stored note cannot be
+        changed.
 
         **Authorship is not yours to choose.** The request body has no
         `author` field. Authorship is derived from how the caller
@@ -9383,7 +9772,7 @@ paths:
   /api/v1/routes:
     get:
       operationId: listAllRoutes
-      summary: The project-wide routing grid (console SPA Alerts > Routing tab)
+      summary: The project-wide routing grid
       description: |
         Returns one row per (check, event_type) pair that has ever been
         routed — the same rows `GET /api/v1/checks/{id}/routes` would return
@@ -9525,7 +9914,7 @@ paths:
                     example: "user@example.com"
                   provider:
                     type: string
-                    description: "OAuth provider or empty string for email/password (session-authenticated only)."
+                    description: "How the account was created: `local` (email and password), `github` or `google` (session-authenticated only). It records the sign-up, not how the account signs in now: removing that GitHub or Google sign-in later leaves this value unchanged."
                     example: "github"
                   theme:
                     type: string
@@ -9535,13 +9924,30 @@ paths:
                   console:
                     type: string
                     enum: [templates, spa]
-                    description: "Which console /app serves this user (session-authenticated only)."
-                    example: "templates"
+                    description: "Always `spa` since the console cut-over; kept so existing clients do not break. Read-only (session-authenticated only)."
+                    example: "spa"
                   last_seen_at:
                     type: [string, "null"]
                     format: date-time
                     description: "When this user last called POST /api/v1/me/seen (session-authenticated only). Null until then."
                     example: "2026-09-12T10:00:00Z"
+                  viewing_as:
+                    type: [object, "null"]
+                    description: |
+                      Session-authenticated only. Set while an admin is viewing this
+                      account read only (the fields above then describe the account
+                      being viewed); null otherwise. Every write made in that state
+                      is refused 403 `READ_ONLY_IMPERSONATION`.
+                    required: [email, expires_at]
+                    properties:
+                      email:
+                        type: string
+                        format: email
+                        description: The account being viewed.
+                      expires_at:
+                        type: string
+                        format: date-time
+                        description: When the view-as session ends on its own.
               examples:
                 apikey:
                   summary: API key authentication
@@ -9557,10 +9963,21 @@ paths:
                     email: "user@example.com"
                     provider: "github"
                     theme: "light"
-                    console: "templates"
+                    console: "spa"
                     last_seen_at: null
+                    viewing_as: null
         "401":
           description: Missing or invalid credentials.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "503":
+          description: |
+            Session-authenticated only. An admin's view-as session is active
+            but the viewed account cannot be read (it has no project, or the
+            view-as state could not be looked up), so nothing is served. Code
+            `IMPERSONATION_UNAVAILABLE`. POST /admin/view-as/end still works.
           content:
             application/problem+json:
               schema:
@@ -9578,6 +9995,11 @@ paths:
         issues a fresh one for this request's cookie — a password change is
         how a user locks out anyone else holding a live session for the
         account.
+
+        An account with no password yet can set one only within 15 minutes
+        of signing in; changing a password does not count as signing in.
+        Outside that window the answer is 403 `REAUTH_REQUIRED` and nothing
+        is saved.
 
         This does **not** revoke API keys: a key holder keeps full API
         access across a password change. Revoking keys on password change is
@@ -9611,8 +10033,10 @@ paths:
         "403":
           description: |
             The request used an API key rather than a session cookie
-            (`SESSION_ONLY`), or the session request was missing a valid
-            `X-CSRF-Token` header (`CSRF_REQUIRED`).
+            (`SESSION_ONLY`), the session request was missing a valid
+            `X-CSRF-Token` header (`CSRF_REQUIRED`), or the account has no
+            password yet and this session carries no sign-in within the last
+            15 minutes (`REAUTH_REQUIRED`; sign in again, then set it).
           content:
             application/problem+json:
               schema:
@@ -9680,9 +10104,9 @@ paths:
         **Session-only.** `email` must exactly match (case-insensitive,
         trimmed) the account's own email — typed confirmation, the same
         guard the dashboard's delete-account form uses. On success, deletes
-        the account and every row an `ON DELETE CASCADE` foreign key hangs
-        off it (projects, checks, channels, pings, incidents, deliveries,
-        api_keys, status_pages, sessions and more) and clears this request's
+        the account and everything that belongs to it (projects, monitors,
+        destinations, pings, incidents, deliveries, API keys, status pages,
+        sessions and more) and clears this request's
         session cookie.
 
         The delete target is ALWAYS the session's own user — never a
@@ -9980,7 +10404,7 @@ paths:
           description: One tool's block and the prompt tailored to it. Omit for every block.
           schema:
             type: string
-            enum: [claude-code, codex, gemini, cursor, python, node, otel-sdk, collector]
+            enum: [claude-code, codex, gemini, antigravity, cursor, python, node, otel-sdk, collector]
       responses:
         "200":
           description: The set-up for this monitor.
@@ -10175,8 +10599,8 @@ paths:
 
             A fourth case has no `expires_at` in the request at all, and
             arises only where an omitted expiry is inherited: if the
-            authenticating key's own expiry has passed between authentication
-            and this handler, the expiry it would hand down is already dead,
+            authenticating key's own expiry passed while the request was being
+            handled, the expiry it would hand down is already dead,
             and the request is refused with
             `the creating key has expired` rather than minting a key that
             could never be used.
@@ -10349,8 +10773,8 @@ paths:
         **Non-cascading**: unlike `DELETE /api/v1/api-keys/{id}`, this does
         NOT revoke keys the original minted. Regenerating is "same key, new
         secret", not "this credential and everything descended from it is
-        dead" — the FK's `ON DELETE SET NULL` leaves descendants alive with
-        a null `created_by_key_id`.
+        dead": keys the original minted stay alive with a null
+        `created_by_key_id`.
 
         A key belonging to another project is indistinguishable from a
         missing one — both return 404.
@@ -10393,8 +10817,8 @@ paths:
         "401":
           description: |
             Missing or invalid API key, or (a narrow race) the API key that
-            authenticated this request was itself revoked in the gap before
-            its own row could be re-read for the caller-scope/expiry check.
+            authenticated this request was itself revoked while the request
+            was being handled.
           content:
             application/problem+json:
               schema:
@@ -10403,7 +10827,7 @@ paths:
           description: |
             Either the authenticating key's scope tier does not reach this
             route at all (see `InsufficientScope`, `required_scope` in the
-            problem body), or — reaching the handler — the target key's
+            problem body), or the target key's
             scope outranks the CALLING key's own scope. The latter carries
             the same detail text and `max_scope` extension member as
             `POST /api/v1/api-keys`'s identical create-time refusal: `scope
@@ -10459,7 +10883,7 @@ paths:
         secrets (webhook URLs, bot tokens, etc.), so the corresponding HCL
         attribute is emitted as a `var.<kind>_<attr>_<label>` reference
         instead of an empty string, together with a matching `variable`
-        block (`sensitive = true`) and a `# TODO` comment. Omitting the
+        block (`sensitive = true`) and a `# Set this` comment. Omitting the
         secret silently would ship a broken destination; the variable
         indirection makes the gap visible and forces it to be filled in
         before `terraform apply`.
@@ -10758,10 +11182,10 @@ paths:
   /api/v1/runs:
     get:
       operationId: listRuns
-      summary: List runs across every check in the project (console SPA Runs page)
+      summary: List runs across every check in the project
       description: |
         Returns runs project-wide, one row per run rather than per ping,
-        newest-started first — the console's Runs page and any automation
+        newest-started first by default (see `sort`): the console's Runs page and any automation
         that wants a single feed across every monitor instead of walking
         `GET /api/v1/checks/{id}/runs` per check.
 
@@ -10774,7 +11198,8 @@ paths:
         `failed` — this covers a `silence`/`stalled`/`overrun` incident that
         aborts a run without a fail ping of its own; a last-seen `blocked`
         ping means `blocked`; with none of those, a run whose start is older
-        than its monitor's `max_runtime_s` (24 hours when unset) is
+        than its monitor's `max_runtime_s` (24 hours when unset), plus, for
+        the monitor's current run, the time that run spent blocked, is
         `unfinished`: it started and never ended, which is not a failure and
         pages no one, and it is derived when read, so an old orphaned start
         is named this way with no change to stored data; otherwise
@@ -10792,14 +11217,24 @@ paths:
         set-up's test span is listed with `is_test: true` and the title
         `LastPing test span`, and is left out of `counts`.
 
-        **Pagination** is keyset, on `(started_at, check_id, rid)` descending
-        — not offset-based, so a run written while a caller is mid-page can
-        never shift another run into or out of the page it already fetched.
-        `next_cursor` is an opaque token; pass it back as `cursor` verbatim
-        to fetch the next page, and stop when `next_cursor` is `null`. A
-        `cursor` this API did not issue (or one that has been altered) is
-        rejected with 400 `INVALID_CURSOR` rather than silently starting
-        over.
+        **Pagination** is keyset: on `(started_at, check_id, rid)` descending
+        by default, and under another `sort` on that sort's value with the same
+        tie-break, so a run written while a caller is mid-page can never shift
+        another run into or out of the page it already fetched. `next_cursor`
+        is an opaque token; pass it back as `cursor` verbatim, with the same
+        `sort` and `dir`, to fetch the next page, and stop when `next_cursor`
+        is `null`. A `cursor` this API did not issue (or one that has been
+        altered), or one issued for a different `sort` or `dir`, is rejected
+        with 400 `INVALID_CURSOR` rather than silently starting over.
+
+        **`?sort=`** orders the list. `cost`, `tokens` and `spans` order by the
+        run's total cost, its tokens in and out together, or its span count,
+        and list only runs that hold spans: a run with no spans has none of the
+        three. Under them a run is in the window when its latest span is at or
+        after `since`, and `counts` describes the runs they list. A run whose
+        cost is unknown (`cost_usd` null) is last in both directions. Ties are
+        broken by `check_id`, then `rid`, both descending, so every run has
+        exactly one place in the order.
 
         **`?since=`** bounds the scan and defaults to the last 7 days;
         it is clamped to 90 days back regardless of what is asked for,
@@ -10811,7 +11246,7 @@ paths:
 
         Every filter — `monitor`, `outcome` (all six values, including the
         incident-without-a-terminal-ping case described above), `since`,
-        `until` and `cursor` — is applied by the database, so the page size
+        `until` and `cursor` — is applied before paging, so the page size
         is exact: a page shorter than `?limit=` means there are no more
         matching runs, and `next_cursor` is `null` on exactly that page.
 
@@ -10885,7 +11320,9 @@ paths:
           required: false
           description: |
             Restrict to runs whose Claude Code hook start carried this project
-            label: the name of the folder the session worked in, as each run
+            label: the name of the folder that holds the git repository the
+            session worked in, or the folder's name when it is not in a
+            repository, as each run
             reports it in `project`. The value is cleaned by the rule the
             label was stored by (a path is reduced to its last element), and a
             value that cleans to nothing (`.`) is refused with 400
@@ -10987,6 +11424,29 @@ paths:
             type: string
             maxLength: 200
           example: "nightly-2026-09-20"
+        - name: sort
+          in: query
+          required: false
+          description: |
+            The order of the list. `started` (the default) is newest-started
+            first. `cost`, `tokens` and `spans` list only runs that hold spans,
+            ordered by that figure (see the endpoint description).
+          schema:
+            type: string
+            enum: [started, cost, tokens, spans]
+            default: started
+          example: "cost"
+        - name: dir
+          in: query
+          required: false
+          description: |
+            `desc` (the default) is highest first; `asc` is lowest first.
+            `sort=started` is newest first only and refuses `dir=asc`.
+          schema:
+            type: string
+            enum: [desc, asc]
+            default: desc
+          example: "desc"
         - name: limit
           in: query
           required: false
@@ -11005,13 +11465,13 @@ paths:
             type: string
       responses:
         "200":
-          description: A page of runs (may be empty), newest-started first.
+          description: A page of runs (may be empty), in the order `sort` and `dir` name (newest-started first by default).
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/RunPage"
         "400":
-          description: An invalid `monitor`, `outcome`, `since`, `until`, `cursor` or Traced filter (`INVALID_FILTER` or `INVALID_CURSOR`).
+          description: An invalid `monitor`, `outcome`, `since`, `until`, `sort`, `dir`, `cursor` or Traced filter (`INVALID_FILTER`, `INVALID_SORT` or `INVALID_CURSOR`).
           content:
             application/problem+json:
               schema:
@@ -11034,7 +11494,7 @@ paths:
         succeeded, how often it failed, and how long it takes on average.
 
         **The outcome rule is the one rule.** `succeeded` and `failed` here
-        are computed by the same SQL that decides `outcome` on
+        are computed by the same rule that decides `outcome` on
         `GET /api/v1/runs` — a terminal `success`/`fail`/`cancel` ping
         decides, an incident opened on a run with no terminal ping of its own
         means `failed`, a last-seen `blocked` ping means `blocked`, and
@@ -11122,7 +11582,7 @@ paths:
         example: "run-2026-08-23-001"
     get:
       operationId: getRun
-      summary: One run's full detail (console SPA run detail page)
+      summary: One run's full detail
       description: |
         One run's complete timeline, declared expectations judged against its
         outcome, output excerpt and, for a CI run, provider metadata — the
@@ -11131,14 +11591,12 @@ paths:
 
         **`events`** is the single time axis: every ping this run recorded
         (`start`, `log`, `note`, `blocked`, `success`, `fail`, `cancel`),
-        interleaved with its `step` progress markers from `run_steps`, plus
+        interleaved with its `step` progress markers, plus
         one synthetic `incident_opened` event when an incident correlates
         with this `rid`. Ordered by `at` ascending; two events that tie on
         timestamp keep a stable source order (a run's own `fail` ping always
         precedes the `incident_opened` event it triggered, never the
-        reverse). A `step` ping row, were the ingest path ever to write one,
-        is dropped in favor of its `run_steps` row rather than rendered
-        twice.
+        reverse). A step is listed once, as its step event, never twice.
 
         **`events` is capped at 200 entries.** A run with more pings than
         that (a verbose CI job streaming per-line `log` pings is the
@@ -11164,14 +11622,17 @@ paths:
 
         **`assertions`** reports every expectation declared via
         `POST .../expectations`, each judged against the run's terminal ping
-        body using the same evaluator the
-        processor itself calls at run close. `verdict` is `not_evaluated`
+        body using the same evaluator that judges
+        the run when it closes. `verdict` is `not_evaluated`
         when the run has no terminal ping yet (there is no body to judge
         against), else `pass` or `fail`; `failure` carries the evaluator's
         one-line reason on `fail` and is `null` otherwise.
 
-        **`ci`** decodes the first `ci_meta` any ping on this run carried —
-        `null` for an agent/heartbeat run with no CI provider attached.
+        **`ci`** merges the `ci_meta` of every ping on this run, field by
+        field, a later non-empty value winning, so the terminal ping's
+        failing stage and duration sit beside the start ping's commit and
+        run URL. `null` for an agent/heartbeat run with no CI provider
+        attached.
 
         **`newer_rid` and `older_rid`** are this MONITOR's runs either side of
         this one in time: the run that started just after it, and the one just
@@ -11187,8 +11648,8 @@ paths:
         sent them, in tree order: parents before children, siblings ordered
         by start time, and an orphan (a span whose `parent_span_id` matches
         no span in this same run) appended after every real root's subtree.
-        Capped at 2,000 (`spans_truncated`); the processor's own separate
-        write-time cap surfaces as `spans_dropped`, null when the run has no
+        Capped at 2,000 (`spans_truncated`); the separate per-run storage
+        cap surfaces as `spans_dropped`, null when the run has no
         span stats at all. `span_count`, `tokens_in`, `tokens_out` and
         `cost_usd` (inherited from `Run`) are null the same way when the run
         was never traced.
@@ -11620,9 +12081,10 @@ paths:
         heartbeat" card. `received` becomes `true` once the monitor has
         reported in any way — including an outstanding `/start` that was
         later cancelled or consumed by detection — using the same predicate
-        the dashboard's own card polls against (the checks row alone cannot
-        tell a cancelled start from a monitor that was truly never pinged;
-        this endpoint also checks the pings table, same as the dashboard).
+        the dashboard's own card polls against (the monitor's state alone
+        cannot tell a cancelled start from a monitor that was truly never
+        pinged, so this endpoint also looks at its pings, same as the
+        dashboard).
 
         `signal_word`/`instruction`/`command` are a pure function of the
         monitor's own configuration (`monitor_type`, `ci_provider`), never of
@@ -11868,7 +12330,7 @@ paths:
       summary: Ingest OTLP traces for a run (Bearer-authenticated)
       description: |
         Accepts one OTLP `ExportTraceServiceRequest` (protobuf or its JSON
-        mapping) and enqueues its spans for the processor to write. Model
+        mapping) and enqueues its spans to be stored. Model
         and provider names are stored up to 200 bytes. This is
         the documented path: a project API key with `ingest`,
         `write` or `admin` scope in the `Authorization: Bearer` header names
@@ -11914,13 +12376,13 @@ paths:
         name ≤ 256 bytes (truncated, not rejected); attributes ≤ 32 KiB per
         span (excess dropped, `truncated` set on the span, not rejected); ≤
         2,000 spans per run across every request (further spans dropped and
-        counted in `spans_dropped`, not rejected — this cap is enforced by
-        the processor at write time, downstream of this endpoint). A span
+        counted in `spans_dropped`, not rejected — this cap is enforced when
+        the spans are stored, after this endpoint answers). A span
         that starts more than an hour after ingest received it is dropped
         and counted in `dropped`; the rest of the request is kept. Rate
         limit: 3,600 requests/hour/project, a bucket entirely separate from
         the ping rate limits, so a chatty tracer cannot starve heartbeats
-        (429 with `Retry-After: 60`). Each ingest task reads a few OTLP
+        (429 with `Retry-After: 60`). LastPing reads a few OTLP
         exports at once; past that an export is refused 429 with `code:
         "OTLP_BUSY"` and `Retry-After: 5` before its body is read. Pings
         are never refused this way.
@@ -11987,9 +12449,9 @@ paths:
                       Spans of this request that were discarded because they
                       start more than an hour after ingest received the
                       request. An over-cap request is rejected outright
-                      (400/413), never partially admitted. The processor's
-                      per-run 2,000-span write-time cap drops further spans
-                      into `run_span_stats.spans_dropped`, after this answer.
+                      (400/413), never partially admitted. The per-run
+                      2,000-span storage cap drops further spans, counted in
+                      the run's `spans_dropped`, after this answer.
                     example: 0
         "400":
           description: |
@@ -12037,7 +12499,7 @@ paths:
             project's daily span budget is used up (default 2,000,000 spans
             per UTC day): the problem body carries `code:
             "SPAN_BUDGET_EXCEEDED"` and `Retry-After` runs to 00:00 UTC. Or
-            the ingest task is already reading as many OTLP exports as it
+            LastPing is already reading as many OTLP exports as it
             takes at once: `code: "OTLP_BUSY"`, `Retry-After: 5`.
           headers:
             Retry-After:
@@ -12170,7 +12632,7 @@ paths:
             project's daily span budget is used up (default 2,000,000 spans
             per UTC day): the problem body carries `code:
             "SPAN_BUDGET_EXCEEDED"` and `Retry-After` runs to 00:00 UTC. Or
-            the ingest task is already reading as many OTLP exports as it
+            LastPing is already reading as many OTLP exports as it
             takes at once: `code: "OTLP_BUSY"`, `Retry-After: 5`.
           headers:
             Retry-After:

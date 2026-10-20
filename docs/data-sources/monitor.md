@@ -111,6 +111,7 @@ Use it to tell apart the monitors a scan owns from the ones you wrote by hand, w
 - `source_ref` (String) **Discovery source identity, part 2 of 2.** The stable path within `source_kind` that identifies exactly what was found, such as `.github/workflows/nightly.yml#build`. Together with `source_kind` and the project it is the discovery reconcile key.
 
 Always either both present or both null with `source_kind`: a database CHECK constraint makes a half-set identity unrepresentable.
+- `split_by_repo` (Boolean) Whether hook runs (Claude Code, Codex, Antigravity) are filed under one monitor per git repository. True by default; false on a repository's own monitor, which never splits.
 - `status` (String) Current status: `new`, `up`, `late`, or `down`.
 - `step_timeout_s` (Number) How long an armed run may go without reporting a step before a `stalled` incident opens, in seconds. Null when unset, in which case stall detection is off. Always strictly below the effective run budget (`max_runtime_s`, or `grace_s` when that is unset), and never set on an `http` monitor.
 - `tags` (Set of String) Labels attached to this monitor. Empty when it has none.

@@ -360,7 +360,40 @@ var knownModellingGaps = map[string]string{
 	// lists incidents without a way to address any one of them.
 	"data.lastping_incidents.incidents.incident_id": "the incident's identity, needed to address one " +
 		"incident (GET /api/v1/incidents/{id}); the data source lists incidents but does not expose it yet",
+
+	// Read-only fields the API added to Check alongside split_by_repo, and
+	// ci_ignored before them. split_by_repo itself is modelled; these are
+	// not yet, on any monitor surface.
+	"resource.lastping_monitor.parent_monitor_id":       repoMonitorGap,
+	"resource.lastping_monitor.repo":                    repoMonitorGap,
+	"resource.lastping_monitor.repos":                   repoMonitorGap,
+	"resource.lastping_monitor.ci_ignored":              ciIgnoredGap,
+	"data.lastping_monitor.parent_monitor_id":           repoMonitorGap,
+	"data.lastping_monitor.repo":                        repoMonitorGap,
+	"data.lastping_monitor.repos":                       repoMonitorGap,
+	"data.lastping_monitor.ci_ignored":                  ciIgnoredGap,
+	"data.lastping_monitors.monitors.parent_monitor_id": repoMonitorGap,
+	"data.lastping_monitors.monitors.repo":              repoMonitorGap,
+	"data.lastping_monitors.monitors.repos":             repoMonitorGap,
+	"data.lastping_monitors.monitors.ci_ignored":        ciIgnoredGap,
+
+	// whoami now describes the credential as well as the project.
+	"data.lastping_project.kind":       whoamiCredentialGap,
+	"data.lastping_project.scope":      whoamiCredentialGap,
+	"data.lastping_project.expires_at": whoamiCredentialGap,
+	"data.lastping_project.resource":   whoamiCredentialGap,
 }
+
+// repoMonitorGap is the reason for the per-repository monitor entries above.
+const repoMonitorGap = "a read-only field describing per-repository monitors (the repository a " +
+	"monitor holds, the monitor it was split from, or the repositories it split into); not modelled yet"
+
+// ciIgnoredGap is the reason for the ci_ignored entries above.
+const ciIgnoredGap = "a read-only count of finished CI runs the CI filters skipped; not modelled yet"
+
+// whoamiCredentialGap is the reason for the lastping_project entries above.
+const whoamiCredentialGap = "a read-only description of the calling credential that GET /api/v1/whoami " +
+	"now returns; the project data source does not expose it yet"
 
 // ciFilterDataSourceGap is the reason for the CI filter entries above.
 const ciFilterDataSourceGap = "a monitor configuration field lastping_monitor already models and the " +
@@ -451,6 +484,8 @@ func contractCases() map[string]contractCase {
 			response: schema("Check"),
 			sendExempt: map[string]string{
 				"paused": "maps onto POST /checks/{id}/pause and /resume, not a body field",
+				"split_by_repo": "POST /api/v1/checks does not take it; the provider sets it with a " +
+					"PATCH (CheckPatch) after the create, see TestOpenAPIContract_SplitByRepo",
 			},
 			readExempt: map[string]string{
 				"ci_workflow": ciFilterWriteOnly,
@@ -1233,4 +1268,18 @@ func sortedKeys(m map[string]bool) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// TestOpenAPIContract_SplitByRepo pins the shape the monitor resource's
+// split_by_repo mapping depends on: the field is on Check (read back) and on
+// CheckPatch (written), and NOT on CheckCreate, which is why Create follows up
+// with a PATCH. If the create body ever takes it, the follow-up can go.
+func TestOpenAPIContract_SplitByRepo(t *testing.T) {
+	doc := loadSpec(t)
+	for _, name := range []string{"Check", "CheckPatch"} {
+		require.True(t, propsAt(t, doc, []string{"components", "schemas", name})["split_by_repo"],
+			"components.schemas.%s must declare split_by_repo", name)
+	}
+	require.False(t, propsAt(t, doc, []string{"components", "schemas", "CheckCreate"})["split_by_repo"],
+		"CheckCreate declares split_by_repo now: send it on create instead of the follow-up PATCH")
 }

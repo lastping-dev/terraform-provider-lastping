@@ -17,6 +17,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/boolplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringdefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
@@ -157,6 +158,7 @@ type monitorResourceModel struct {
 	SourceKind           types.String `tfsdk:"source_kind"`
 	SourceRef            types.String `tfsdk:"source_ref"`
 	TraceContent         types.String `tfsdk:"trace_content"`
+	SplitByRepo          types.Bool   `tfsdk:"split_by_repo"`
 	ProbeURL             types.String `tfsdk:"probe_url"`
 	ProbeMethod          types.String `tfsdk:"probe_method"`
 	ProbeIntervalS       types.Int64  `tfsdk:"probe_interval_s"`
@@ -595,6 +597,20 @@ func (r *monitorResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 					stringvalidator.OneOf(traceContentDropped, traceContentRedacted),
 				},
 				PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
+			},
+			// No Default, on purpose: the server grandfathers every existing
+			// monitor at true, and a provider-side Default would plan a change
+			// on a bare provider upgrade over state that predates the
+			// attribute. Optional+Computed with UseStateForUnknown takes the
+			// value from the API instead.
+			"split_by_repo": schema.BoolAttribute{
+				Optional: true,
+				Computed: true,
+				MarkdownDescription: "Whether hook runs (Claude Code, Codex, Antigravity) are filed under one " +
+					"monitor per git repository, created on the first run from each and named after this " +
+					"monitor and the repository. Defaults to true on the server. Not settable on a " +
+					"repository's own monitor.",
+				PlanModifiers: []planmodifier.Bool{boolplanmodifier.UseStateForUnknown()},
 			},
 			"probe_url": schema.StringAttribute{
 				Optional:            true,
@@ -1316,6 +1332,14 @@ func monitorPatchFromModel(ctx context.Context, desired, cfg monitorResourceMode
 		}
 	}
 
+	// split_by_repo is sent whenever the plan knows it. Unconfigured, it
+	// resolves to the stored value through UseStateForUnknown, and the API
+	// always accepts the stored value, so sending it is harmless. It is never
+	// sent as null: the API has no "unset" for it.
+	if v, ok := splitByRepoPatchValue(desired.SplitByRepo); ok {
+		patch["split_by_repo"] = v
+	}
+
 	if cfg.MonitorFrom.IsNull() || desired.MonitorFrom.ValueString() == "" {
 		patch["monitor_from"] = nil
 	} else {
@@ -1527,6 +1551,10 @@ func modelFromMonitor(ctx context.Context, mon *client.Monitor, prior monitorRes
 		// server too old to know the field, where null is the honest answer.
 		TraceContent: stringOrNull(mon.TraceContent),
 
+		// split_by_repo is on every response; nil only from a server too old
+		// to know the field, where null is the honest answer.
+		SplitByRepo: boolPtrOrNull(mon.SplitByRepo),
+
 		// failure_threshold is NOT NULL DEFAULT 1 server-side and always comes
 		// back, so it is a concrete number rather than an int64OrNull.
 		FailureThreshold: types.Int64Value(mon.FailureThreshold),
@@ -1647,6 +1675,47 @@ func addSourceConflictDiag(diags *diag.Diagnostics, err error, kind, ref string)
 	return false
 }
 
+// splitByRepoPatchValue reports the value a PATCH should carry for
+// split_by_repo: only a known, non-null plan value is sent.
+func splitByRepoPatchValue(v types.Bool) (bool, bool) {
+	if v.IsNull() || v.IsUnknown() {
+		return false, false
+	}
+	return v.ValueBool(), true
+}
+
+// boolPtrOrNull maps an absent boolean response field to null.
+func boolPtrOrNull(v *bool) types.Bool {
+	if v == nil {
+		return types.BoolNull()
+	}
+	return types.BoolValue(*v)
+}
+
+// addSplitByRepoDiag turns the API's two split_by_repo refusals into
+// diagnostics that name the attribute, and reports whether it handled err.
+func addSplitByRepoDiag(diags *diag.Diagnostics, err error) bool {
+	switch client.ProblemCode(err) {
+	case "SPLIT_BY_REPO_ON_CHILD":
+		diags.AddAttributeError(path.Root("split_by_repo"),
+			"split_by_repo cannot be changed on a repository's monitor (SPLIT_BY_REPO_ON_CHILD)",
+			fmt.Sprintf("This monitor holds the runs of one git repository: LastPing created it when "+
+				"its parent monitor split by repository, and it never splits itself. Remove "+
+				"`split_by_repo` from this resource's configuration, or set it on the parent monitor "+
+				"instead.\n\nAPI said: %s", err))
+		return true
+	case "SPLIT_BY_REPO_NOT_ON_DEMAND":
+		diags.AddAttributeError(path.Root("split_by_repo"),
+			"split_by_repo applies only to on_demand monitors (SPLIT_BY_REPO_NOT_ON_DEMAND)",
+			fmt.Sprintf("Only monitors with `schedule_kind = \"on_demand\"` split hook runs by repository, "+
+				"so `split_by_repo` can change only on a monitor that is on_demand before or after this "+
+				"apply. Remove `split_by_repo` from this resource's configuration, or make the monitor "+
+				"on_demand.\n\nAPI said: %s", err))
+		return true
+	}
+	return false
+}
+
 func (r *monitorResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
 	var plan monitorResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
@@ -1680,6 +1749,32 @@ func (r *monitorResource) Create(ctx context.Context, req resource.CreateRequest
 		}
 		resp.Diagnostics.AddError("Unable to create monitor", err.Error())
 		return
+	}
+
+	// split_by_repo is applied after create, the same way: POST does not take
+	// the field, so a planned value that differs from the server's default
+	// is written with a PATCH inside this same Create, and the PATCH response
+	// becomes the monitor this function stores.
+	if want, ok := splitByRepoPatchValue(plan.SplitByRepo); ok &&
+		(out.SplitByRepo == nil || *out.SplitByRepo != want) {
+		patched, err := r.client.UpdateMonitor(ctx, out.ID, client.MonitorPatch{"split_by_repo": want})
+		if err != nil {
+			// The monitor exists. Saving it before the error stops the next
+			// apply from creating it a second time; the stored value is the
+			// server's, so that apply plans the change again.
+			if created, mErr := modelFromMonitor(ctx, out, plan); mErr == nil {
+				created.Assertions = types.SetNull(plan.Assertions.ElementType(ctx))
+				created.Guards = types.SetNull(plan.Guards.ElementType(ctx))
+				resp.Diagnostics.Append(resp.State.Set(ctx, &created)...)
+			}
+			if addSplitByRepoDiag(&resp.Diagnostics, err) {
+				return
+			}
+			resp.Diagnostics.AddError("Unable to set split_by_repo",
+				fmt.Sprintf("The monitor was created, but split_by_repo was not written: %s", err))
+			return
+		}
+		out = patched
 	}
 
 	// paused is applied after create: the create payload has no paused field,
@@ -1873,6 +1968,12 @@ func monitorPatchNeeded(ctx context.Context, plan, state monitorResourceModel) (
 	if err != nil {
 		return false, err
 	}
+	// split_by_repo is not in the create payload monitorFromModel builds, so
+	// it is compared on its own.
+	if v, ok := splitByRepoPatchValue(plan.SplitByRepo); ok &&
+		(state.SplitByRepo.IsNull() || state.SplitByRepo.IsUnknown() || state.SplitByRepo.ValueBool() != v) {
+		return true, nil
+	}
 	// monitorFromModel only populates request fields, so response-only state
 	// (status, deadlines, paused) cannot masquerade as a configuration change.
 	return !reflect.DeepEqual(planPayload, statePayload), nil
@@ -1919,6 +2020,9 @@ func (r *monitorResource) Update(ctx context.Context, req resource.UpdateRequest
 			// a practitioner: two configurations pointed at one scanner path.
 			if addSourceConflictDiag(&resp.Diagnostics, err,
 				desired.SourceKind.ValueString(), desired.SourceRef.ValueString()) {
+				return
+			}
+			if addSplitByRepoDiag(&resp.Diagnostics, err) {
 				return
 			}
 			resp.Diagnostics.AddError("Unable to update monitor", err.Error())
