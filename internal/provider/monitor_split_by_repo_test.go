@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
@@ -109,5 +110,28 @@ resource "lastping_monitor" "sbro" {
 				PlanOnly: true,
 			},
 		},
+	})
+}
+
+// TestAccMonitor_splitByRepoFalseNeedsOnDemand: false on a monitor that is
+// not on_demand is refused at plan time, before a create could fail on its
+// follow-up PATCH and leave a tainted monitor to replace on every apply.
+func TestAccMonitor_splitByRepoFalseNeedsOnDemand(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{{
+			Config: `
+resource "lastping_monitor" "sbrc" {
+  name          = "acc-split-by-repo-cron"
+  slug          = "acc-split-by-repo-cron"
+  schedule_kind = "cron"
+  cron_expr     = "0 3 * * *"
+  grace_s       = 600
+  split_by_repo = false
+}`,
+			PlanOnly:    true,
+			ExpectError: regexp.MustCompile(`split_by_repo = false applies only to on_demand`),
+		}},
 	})
 }

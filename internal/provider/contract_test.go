@@ -111,6 +111,20 @@ var knownSpecGaps = map[string]string{}
 // Keys are "<case name>[.<nested attribute>].<spec property name>", matching
 // knownSpecGaps' key shape — see splitGapKey.
 var deliberatelyUnmodelled = map[string]string{
+	// Runtime fields on Check that change as runs arrive.
+	"resource.lastping_monitor.repos":            monitorRuntimeUnmodelled,
+	"resource.lastping_monitor.ci_ignored":       monitorRuntimeUnmodelled,
+	"data.lastping_monitor.repos":                monitorRuntimeUnmodelled,
+	"data.lastping_monitor.ci_ignored":           monitorRuntimeUnmodelled,
+	"data.lastping_monitors.monitors.repos":      monitorRuntimeUnmodelled,
+	"data.lastping_monitors.monitors.ci_ignored": monitorRuntimeUnmodelled,
+
+	// whoami's description of the calling credential.
+	"data.lastping_project.kind":       whoamiCredentialUnmodelled,
+	"data.lastping_project.scope":      whoamiCredentialUnmodelled,
+	"data.lastping_project.expires_at": whoamiCredentialUnmodelled,
+	"data.lastping_project.resource":   whoamiCredentialUnmodelled,
+
 	// last_used_at is now modelled on the managed resource (see created_at's
 	// neighbour in resource_api_key.go) — a Computed-only attribute whose
 	// server value changes between applies is absorbed silently by
@@ -361,39 +375,31 @@ var knownModellingGaps = map[string]string{
 	"data.lastping_incidents.incidents.incident_id": "the incident's identity, needed to address one " +
 		"incident (GET /api/v1/incidents/{id}); the data source lists incidents but does not expose it yet",
 
-	// Read-only fields the API added to Check alongside split_by_repo, and
-	// ci_ignored before them. split_by_repo itself is modelled; these are
-	// not yet, on any monitor surface.
+	// Read-only identity fields the API added to Check alongside
+	// split_by_repo. split_by_repo itself is modelled; these are not yet, on
+	// any monitor surface.
 	"resource.lastping_monitor.parent_monitor_id":       repoMonitorGap,
 	"resource.lastping_monitor.repo":                    repoMonitorGap,
-	"resource.lastping_monitor.repos":                   repoMonitorGap,
-	"resource.lastping_monitor.ci_ignored":              ciIgnoredGap,
 	"data.lastping_monitor.parent_monitor_id":           repoMonitorGap,
 	"data.lastping_monitor.repo":                        repoMonitorGap,
-	"data.lastping_monitor.repos":                       repoMonitorGap,
-	"data.lastping_monitor.ci_ignored":                  ciIgnoredGap,
 	"data.lastping_monitors.monitors.parent_monitor_id": repoMonitorGap,
 	"data.lastping_monitors.monitors.repo":              repoMonitorGap,
-	"data.lastping_monitors.monitors.repos":             repoMonitorGap,
-	"data.lastping_monitors.monitors.ci_ignored":        ciIgnoredGap,
-
-	// whoami now describes the credential as well as the project.
-	"data.lastping_project.kind":       whoamiCredentialGap,
-	"data.lastping_project.scope":      whoamiCredentialGap,
-	"data.lastping_project.expires_at": whoamiCredentialGap,
-	"data.lastping_project.resource":   whoamiCredentialGap,
 }
 
 // repoMonitorGap is the reason for the per-repository monitor entries above.
-const repoMonitorGap = "a read-only field describing per-repository monitors (the repository a " +
-	"monitor holds, the monitor it was split from, or the repositories it split into); not modelled yet"
+const repoMonitorGap = "a read-only identity of a per-repository monitor (the repository it holds, " +
+	"or the monitor it was split from); not modelled yet"
 
-// ciIgnoredGap is the reason for the ci_ignored entries above.
-const ciIgnoredGap = "a read-only count of finished CI runs the CI filters skipped; not modelled yet"
+// monitorRuntimeUnmodelled is the reason repos and ci_ignored are never
+// Terraform state: both change as runs arrive, not as configuration changes.
+const monitorRuntimeUnmodelled = "runtime state that changes as runs arrive (the repositories a monitor " +
+	"has split into, or the count of CI runs its filters skipped), not configuration to converge toward"
 
-// whoamiCredentialGap is the reason for the lastping_project entries above.
-const whoamiCredentialGap = "a read-only description of the calling credential that GET /api/v1/whoami " +
-	"now returns; the project data source does not expose it yet"
+// whoamiCredentialUnmodelled is the reason whoami's credential fields are
+// not on lastping_project: they describe the key the provider authenticated
+// with, not the project.
+const whoamiCredentialUnmodelled = "describes the credential the provider authenticated with, not the " +
+	"project, and changes with whichever key runs the plan"
 
 // ciFilterDataSourceGap is the reason for the CI filter entries above.
 const ciFilterDataSourceGap = "a monitor configuration field lastping_monitor already models and the " +

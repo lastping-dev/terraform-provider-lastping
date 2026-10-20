@@ -472,6 +472,10 @@ Together with `source_ref` and the project this is the **reconcile key** that ma
 
 ~> **Clearing a source is deliberately not something deleting these lines does.** Delete them and the stored identity is kept, per `source_kind` above. To genuinely un-discover a monitor, clear the pair outside Terraform (`PATCH /api/v1/checks/{id}` with `{"source_kind": null, "source_ref": null}`, the MCP `update_monitor` tool, or the dashboard) and let the next refresh adopt the result — a configuration that does not mention the source will not put it back, and the plan stays empty. Sending `""` does **not** clear it: the API reads an empty string on this pair as "leave it alone", so this provider never puts one on the wire.
 - `split_by_repo` (Boolean) Whether hook runs (Claude Code, Codex, Antigravity) are filed under one monitor per git repository, created on the first run from each and named after this monitor and the repository. Defaults to true on the server. Not settable on a repository's own monitor.
+
+~> **Removing this attribute keeps whatever the monitor already has; it does not return to `true`.** The provider takes the value from the API rather than imposing a default. To split again, set `split_by_repo = true` explicitly.
+
+`false` is accepted only with `schedule_kind = "on_demand"`: only on-demand monitors split, and any other schedule is refused at plan time.
 - `step_timeout_s` (Number) How long an armed run may go without reporting a **step** before a `stalled` incident opens, in seconds. Between 10 and 86400. Opt-in: omit it and stall detection is off, which is how every monitor behaved before this attribute existed; removing it from the configuration turns it back off.
 
 A step is a liveness marker the job posts inside a run it has already started (`POST /ping/{id}/step?rid=…&name=…`). `max_runtime_s` alone only catches a wedged job once its whole run budget is spent; `step_timeout_s` catches it within one step interval and names the last step that did report. A job that never posts steps will therefore open a `stalled` incident on **every** run — set this attribute and instrument the job in the same change.

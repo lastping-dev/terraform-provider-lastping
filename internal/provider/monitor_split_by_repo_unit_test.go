@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
@@ -294,6 +296,60 @@ func TestMonitorSplitByRepoDiagnostics(t *testing.T) {
 			require.Equal(t, "3f7c1f5a-1a2b-4c3d-8e9f-0a1b2c3d4e5f", got.ID.ValueString(),
 				"the created monitor must stay in state")
 			require.Equal(t, types.BoolValue(true), got.SplitByRepo, "state holds the server's value")
+		})
+	}
+}
+
+// splitByRepoError returns the split_by_repo diagnostic of a validated
+// config, or nil.
+func splitByRepoError(t *testing.T, m monitorResourceModel) diag.Diagnostic {
+	t.Helper()
+	for _, d := range monitorValidateConfig(t, m).Errors() {
+		if wp, ok := d.(diag.DiagnosticWithPath); ok && wp.Path().Equal(path.Root("split_by_repo")) {
+			return d
+		}
+	}
+	return nil
+}
+
+// TestMonitorSplitByRepoValidateSchedule: false is refused at plan time on
+// any monitor that is not on_demand, which is what stops a create from
+// failing on its follow-up PATCH and being replaced on every apply.
+func TestMonitorSplitByRepoValidateSchedule(t *testing.T) {
+	cfg := func(kind types.String, split types.Bool) monitorResourceModel {
+		m := monitorResourceModel{Name: types.StringValue("acc"), ScheduleKind: kind, SplitByRepo: split}
+		switch kind.ValueString() {
+		case "cron":
+			m.CronExpr = types.StringValue("0 3 * * *")
+		case "simple":
+			m.PeriodS = types.Int64Value(3600)
+		}
+		return m
+	}
+
+	for name, kind := range map[string]types.String{
+		"cron": types.StringValue("cron"), "simple": types.StringValue("simple"), "null": types.StringNull(),
+	} {
+		t.Run("false refused on "+name, func(t *testing.T) {
+			d := splitByRepoError(t, cfg(kind, types.BoolValue(false)))
+			require.NotNil(t, d, "split_by_repo = false on %s must be a plan-time error", name)
+			require.Contains(t, d.Summary(), "on_demand")
+			require.Contains(t, d.Detail(), "Remove the split_by_repo line")
+		})
+	}
+
+	accepted := map[string]monitorResourceModel{
+		"false on on_demand":      cfg(types.StringValue("on_demand"), types.BoolValue(false)),
+		"true on cron":            cfg(types.StringValue("cron"), types.BoolValue(true)),
+		"true on null schedule":   cfg(types.StringNull(), types.BoolValue(true)),
+		"null on cron":            cfg(types.StringValue("cron"), types.BoolNull()),
+		"unknown on cron":         cfg(types.StringValue("cron"), types.BoolUnknown()),
+		"false on unknown kind":   cfg(types.StringUnknown(), types.BoolValue(false)),
+		"unknown on unknown kind": cfg(types.StringUnknown(), types.BoolUnknown()),
+	}
+	for name, m := range accepted {
+		t.Run(name, func(t *testing.T) {
+			require.Nil(t, splitByRepoError(t, m))
 		})
 	}
 }

@@ -609,7 +609,12 @@ func (r *monitorResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 				MarkdownDescription: "Whether hook runs (Claude Code, Codex, Antigravity) are filed under one " +
 					"monitor per git repository, created on the first run from each and named after this " +
 					"monitor and the repository. Defaults to true on the server. Not settable on a " +
-					"repository's own monitor.",
+					"repository's own monitor.\n\n" +
+					"~> **Removing this attribute keeps whatever the monitor already has; it does not " +
+					"return to `true`.** The provider takes the value from the API rather than imposing a " +
+					"default. To split again, set `split_by_repo = true` explicitly.\n\n" +
+					"`false` is accepted only with `schedule_kind = \"on_demand\"`: only on-demand monitors " +
+					"split, and any other schedule is refused at plan time.",
 				PlanModifiers: []planmodifier.Bool{boolplanmodifier.UseStateForUnknown()},
 			},
 			"probe_url": schema.StringAttribute{
@@ -787,6 +792,13 @@ func (r *monitorResource) ValidateConfig(ctx context.Context, req resource.Valid
 	// failure into a plan-time one.
 	validateOnDemandSchedule(cfg, resp)
 
+	// split_by_repo = false is refused by the API on a monitor that is not
+	// on_demand (400 SPLIT_BY_REPO_NOT_ON_DEMAND). On a create that failure
+	// comes from the follow-up PATCH, after the monitor exists, so Terraform
+	// would taint it and replace it on every apply. Plan time is the only
+	// place that loop can be stopped.
+	validateSplitByRepoSchedule(cfg, resp)
+
 	if cfg.MonitorType.IsUnknown() || cfg.MonitorType.ValueString() != "http" {
 		// Not an http monitor, so step_timeout_s is legal — but it still has to
 		// fit inside the run budget. The check is skipped for http monitors
@@ -864,6 +876,29 @@ func (r *monitorResource) ValidateConfig(ctx context.Context, req resource.Valid
 // persisted on a monitor that never reads either -- silently accepted, silently
 // meaningless. The API refuses it outright; refusing at plan time surfaces the
 // same rule before an apply spends a round trip on it.
+// validateSplitByRepoSchedule refuses split_by_repo = false unless
+// schedule_kind is on_demand. Unknown values pass, and the API is the
+// backstop. A null schedule_kind counts as not on_demand, because the
+// server's default schedule is not on_demand. true is always accepted: it is
+// the server's default, so a create never PATCHes it.
+func validateSplitByRepoSchedule(cfg monitorResourceModel, resp *resource.ValidateConfigResponse) {
+	if cfg.SplitByRepo.IsNull() || cfg.SplitByRepo.IsUnknown() || cfg.SplitByRepo.ValueBool() {
+		return
+	}
+	if cfg.ScheduleKind.IsUnknown() {
+		return
+	}
+	if cfg.ScheduleKind.ValueString() == "on_demand" {
+		return
+	}
+	resp.Diagnostics.AddAttributeError(path.Root("split_by_repo"),
+		"split_by_repo = false applies only to on_demand monitors",
+		"Only monitors with schedule_kind = \"on_demand\" split hook runs by git repository, so "+
+			"switching the split off means nothing on any other monitor, and the API rejects it "+
+			"with 400 SPLIT_BY_REPO_NOT_ON_DEMAND. Remove the split_by_repo line, or set "+
+			"schedule_kind = \"on_demand\".")
+}
+
 func validateOnDemandSchedule(cfg monitorResourceModel, resp *resource.ValidateConfigResponse) {
 	if cfg.ScheduleKind.IsNull() || cfg.ScheduleKind.IsUnknown() {
 		return
@@ -1759,9 +1794,13 @@ func (r *monitorResource) Create(ctx context.Context, req resource.CreateRequest
 		(out.SplitByRepo == nil || *out.SplitByRepo != want) {
 		patched, err := r.client.UpdateMonitor(ctx, out.ID, client.MonitorPatch{"split_by_repo": want})
 		if err != nil {
-			// The monitor exists. Saving it before the error stops the next
-			// apply from creating it a second time; the stored value is the
-			// server's, so that apply plans the change again.
+			// The monitor exists, so it is saved to state before the error,
+			// which keeps it from being orphaned. Terraform taints a resource
+			// whose Create returned an error, so the next apply destroys and
+			// recreates it, which retries the PATCH. The one refusal that
+			// would repeat on every retry, split_by_repo = false on a monitor
+			// that is not on_demand, is refused at plan time by
+			// validateSplitByRepoSchedule before a create is ever attempted.
 			if created, mErr := modelFromMonitor(ctx, out, plan); mErr == nil {
 				created.Assertions = types.SetNull(plan.Assertions.ElementType(ctx))
 				created.Guards = types.SetNull(plan.Guards.ElementType(ctx))
