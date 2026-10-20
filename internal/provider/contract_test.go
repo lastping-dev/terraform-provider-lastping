@@ -111,6 +111,20 @@ var knownSpecGaps = map[string]string{}
 // Keys are "<case name>[.<nested attribute>].<spec property name>", matching
 // knownSpecGaps' key shape — see splitGapKey.
 var deliberatelyUnmodelled = map[string]string{
+	// Runtime fields on Check that change as runs arrive.
+	"resource.lastping_monitor.repos":            monitorRuntimeUnmodelled,
+	"resource.lastping_monitor.ci_ignored":       monitorRuntimeUnmodelled,
+	"data.lastping_monitor.repos":                monitorRuntimeUnmodelled,
+	"data.lastping_monitor.ci_ignored":           monitorRuntimeUnmodelled,
+	"data.lastping_monitors.monitors.repos":      monitorRuntimeUnmodelled,
+	"data.lastping_monitors.monitors.ci_ignored": monitorRuntimeUnmodelled,
+
+	// whoami's description of the calling credential.
+	"data.lastping_project.kind":       whoamiCredentialUnmodelled,
+	"data.lastping_project.scope":      whoamiCredentialUnmodelled,
+	"data.lastping_project.expires_at": whoamiCredentialUnmodelled,
+	"data.lastping_project.resource":   whoamiCredentialUnmodelled,
+
 	// last_used_at is now modelled on the managed resource (see created_at's
 	// neighbour in resource_api_key.go) — a Computed-only attribute whose
 	// server value changes between applies is absorbed silently by
@@ -360,7 +374,32 @@ var knownModellingGaps = map[string]string{
 	// lists incidents without a way to address any one of them.
 	"data.lastping_incidents.incidents.incident_id": "the incident's identity, needed to address one " +
 		"incident (GET /api/v1/incidents/{id}); the data source lists incidents but does not expose it yet",
+
+	// Read-only identity fields the API added to Check alongside
+	// split_by_repo. split_by_repo itself is modelled; these are not yet, on
+	// any monitor surface.
+	"resource.lastping_monitor.parent_monitor_id":       repoMonitorGap,
+	"resource.lastping_monitor.repo":                    repoMonitorGap,
+	"data.lastping_monitor.parent_monitor_id":           repoMonitorGap,
+	"data.lastping_monitor.repo":                        repoMonitorGap,
+	"data.lastping_monitors.monitors.parent_monitor_id": repoMonitorGap,
+	"data.lastping_monitors.monitors.repo":              repoMonitorGap,
 }
+
+// repoMonitorGap is the reason for the per-repository monitor entries above.
+const repoMonitorGap = "a read-only identity of a per-repository monitor (the repository it holds, " +
+	"or the monitor it was split from); not modelled yet"
+
+// monitorRuntimeUnmodelled is the reason repos and ci_ignored are never
+// Terraform state: both change as runs arrive, not as configuration changes.
+const monitorRuntimeUnmodelled = "runtime state that changes as runs arrive (the repositories a monitor " +
+	"has split into, or the count of CI runs its filters skipped), not configuration to converge toward"
+
+// whoamiCredentialUnmodelled is the reason whoami's credential fields are
+// not on lastping_project: they describe the key the provider authenticated
+// with, not the project.
+const whoamiCredentialUnmodelled = "describes the credential the provider authenticated with, not the " +
+	"project, and changes with whichever key runs the plan"
 
 // ciFilterDataSourceGap is the reason for the CI filter entries above.
 const ciFilterDataSourceGap = "a monitor configuration field lastping_monitor already models and the " +
@@ -451,6 +490,8 @@ func contractCases() map[string]contractCase {
 			response: schema("Check"),
 			sendExempt: map[string]string{
 				"paused": "maps onto POST /checks/{id}/pause and /resume, not a body field",
+				"split_by_repo": "POST /api/v1/checks does not take it; the provider sets it with a " +
+					"PATCH (CheckPatch) after the create, see TestOpenAPIContract_SplitByRepo",
 			},
 			readExempt: map[string]string{
 				"ci_workflow": ciFilterWriteOnly,
@@ -1233,4 +1274,18 @@ func sortedKeys(m map[string]bool) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// TestOpenAPIContract_SplitByRepo pins the shape the monitor resource's
+// split_by_repo mapping depends on: the field is on Check (read back) and on
+// CheckPatch (written), and NOT on CheckCreate, which is why Create follows up
+// with a PATCH. If the create body ever takes it, the follow-up can go.
+func TestOpenAPIContract_SplitByRepo(t *testing.T) {
+	doc := loadSpec(t)
+	for _, name := range []string{"Check", "CheckPatch"} {
+		require.True(t, propsAt(t, doc, []string{"components", "schemas", name})["split_by_repo"],
+			"components.schemas.%s must declare split_by_repo", name)
+	}
+	require.False(t, propsAt(t, doc, []string{"components", "schemas", "CheckCreate"})["split_by_repo"],
+		"CheckCreate declares split_by_repo now: send it on create instead of the follow-up PATCH")
 }

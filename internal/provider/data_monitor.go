@@ -44,6 +44,7 @@ type monitorDataModel struct {
 	SourceKind           types.String `tfsdk:"source_kind"`
 	SourceRef            types.String `tfsdk:"source_ref"`
 	TraceContent         types.String `tfsdk:"trace_content"`
+	SplitByRepo          types.Bool   `tfsdk:"split_by_repo"`
 	FailureThreshold     types.Int64  `tfsdk:"failure_threshold"`
 	Tags                 types.Set    `tfsdk:"tags"`
 	RunawayCeiling       types.Int64  `tfsdk:"runaway_ceiling"`
@@ -191,6 +192,12 @@ func monitorDataAttributes() map[string]schema.Attribute {
 			MarkdownDescription: "What this monitor's OpenTelemetry traces keep of prompt, command and tool " +
 				"content: `dropped` (the default) or `redacted` (kept, with secret-shaped values redacted " +
 				"at ingest).",
+		},
+		"split_by_repo": schema.BoolAttribute{
+			Computed: true,
+			MarkdownDescription: "Whether hook runs (Claude Code, Codex, Antigravity) are filed under one " +
+				"monitor per git repository. True by default; false on a repository's own monitor, " +
+				"which never splits.",
 		},
 		"failure_threshold": schema.Int64Attribute{
 			Computed: true,
@@ -345,6 +352,7 @@ func monitorDataFromAPI(ctx context.Context, m *client.Monitor) (monitorDataMode
 		SourceKind:           stringOrNull(m.SourceKind),
 		SourceRef:            stringOrNull(m.SourceRef),
 		TraceContent:         stringOrNull(m.TraceContent),
+		SplitByRepo:          boolPtrOrNull(m.SplitByRepo),
 		ProbeURL:             stringOrNull(m.ProbeURL),
 		ProbeMethod:          stringOrNull(m.ProbeMethod),
 		ProbeIntervalS:       int64OrNull(m.ProbeIntervalS),

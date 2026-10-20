@@ -1181,6 +1181,7 @@ func TestResolveUnknownsFromState_CoversEveryAttribute(t *testing.T) {
 		SourceKind:           types.StringValue("github-actions"),
 		SourceRef:            types.StringValue(".github/workflows/nightly.yml#build"),
 		TraceContent:         types.StringValue("redacted"),
+		SplitByRepo:          types.BoolValue(false),
 		ProbeURL:             types.StringValue("https://example.com/health"),
 		ProbeMethod:          types.StringValue("HEAD"),
 		ProbeIntervalS:       types.Int64Value(120),

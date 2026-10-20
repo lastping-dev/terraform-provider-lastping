@@ -127,6 +127,18 @@ type Monitor struct {
 	// absent key takes the server's default; updates go through MonitorPatch.
 	TraceContent string `json:"trace_content,omitempty"`
 
+	// SplitByRepo is whether hook runs are filed under one monitor per git
+	// repository. Every response carries it (the server defaults it to true),
+	// and nil means a server too old to know the field. It is NEVER part of a
+	// create body: POST /api/v1/checks does not take it, so monitorFromModel
+	// leaves it nil and the provider sets a non-default value with a PATCH
+	// right after the create. A change is refused with 400
+	// SPLIT_BY_REPO_ON_CHILD on a repository's own monitor and with 400
+	// SPLIT_BY_REPO_NOT_ON_DEMAND on a monitor that is on_demand neither before
+	// nor after the request; sending the value already stored is always
+	// accepted.
+	SplitByRepo *bool `json:"split_by_repo,omitempty"`
+
 	// Computed.
 	Paused           bool    `json:"paused,omitempty"`
 	Status           string  `json:"status,omitempty"`
